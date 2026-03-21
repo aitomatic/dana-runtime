@@ -4,6 +4,9 @@ Timeline package — chronological record of agent interactions.
 Exports the core timeline classes and types used across the dana agent.
 """
 
+from .compressed_timeline import CompressedTimeline
+from .compression_engine import CompressionMixin
+from .native_message import NativeMessage, NativeMessageRole, NativeToolCall
 from .timeline import (
     Timeline,
     TimelineConfig,
@@ -11,10 +14,8 @@ from .timeline import (
     TimelineEntryType,
     TimelineProtocol,
 )
-from .compressed_timeline import CompressedTimeline
-from .native_message import NativeMessage, NativeMessageRole, NativeToolCall
 from .token_limiting_helpers import apply_token_limit_to_messages, estimate_messages_tokens
-from .compression_engine import CompressionMixin
+
 
 __all__ = [
     "Timeline",

@@ -11,8 +11,8 @@ from typing import Any
 import structlog
 
 from dana.common.protocols.war import tool_use
-from dana.core.timeline.timeline import TimelineEntry, TimelineEntryType
 from dana.core.resource.base_resource import BaseResource
+from dana.core.timeline.timeline import TimelineEntry, TimelineEntryType
 
 from .client import LlamaStackClientManager
 

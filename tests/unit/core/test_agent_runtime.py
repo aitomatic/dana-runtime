@@ -146,18 +146,19 @@ def test_star_agent_default_runtime():
     assert isinstance(agent._runtime, AgentRuntime)
 
 
-def test_star_agent_deprecated_codec_parameter():
+def test_star_agent_accepts_codec_parameter():
+    """Verify STARAgent still accepts codec param without error."""
     from dana.core.knowledge.prompts.codecs import CSXMLCodec
 
-    with pytest.warns(DeprecationWarning):
-        STARAgent(
-            agent_type="runtime-test",
-            codec=CSXMLCodec,
-            auto_register=False,
-            enable_web_search=False,
-            enable_skills=False,
-            enable_code_execution=False,
-        )
+    agent = STARAgent(
+        agent_type="runtime-test",
+        codec=CSXMLCodec,
+        auto_register=False,
+        enable_web_search=False,
+        enable_skills=False,
+        enable_code_execution=False,
+    )
+    assert agent._codec is CSXMLCodec
 
 
 def test_think_uses_runtime_methods():

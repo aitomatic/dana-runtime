@@ -13,11 +13,26 @@ import httpx
 import structlog
 
 from ...config import config_manager
-from ..multimodal_converter import convert_for_gemini, is_multimodal_content
-from ..types import LLMMessage, LLMProvider, LLMResponse, LLMStreamChunk, LLMTimeoutError
+from ..types import LLMMessage, LLMProvider, LLMResponse, LLMStreamChunk, LLMTimeoutError, is_multimodal_content, unsupported_placeholder
 
 
 logger = structlog.get_logger()
+
+
+def _canonical_to_gemini_part(block: dict) -> genai_types.Part:
+    """Convert a canonical path-based media block to a Gemini Part.
+
+    Reads raw bytes directly from file — no base64 round-trip.
+    Raises FileNotFoundError if the file no longer exists.
+    """
+    from pathlib import Path
+
+    file_path = Path(block["path"])
+    if not file_path.is_file():
+        raise FileNotFoundError(f"Media file not found: {block['path']}")
+    raw_bytes = file_path.read_bytes()
+    media_type = block.get("media_type", "application/octet-stream")
+    return genai_types.Part.from_bytes(data=raw_bytes, mime_type=media_type)
 
 
 class GeminiProvider(LLMProvider):
@@ -45,6 +60,32 @@ class GeminiProvider(LLMProvider):
             http_options=genai_types.HttpOptions(timeout=self.DEFAULT_TIMEOUT_SECONDS * 1000),
         )
 
+    def convert_multimodal_content(self, blocks: list[dict]) -> list:
+        """Convert canonical blocks to Gemini Part objects."""
+        parts: list = []
+        for block in blocks:
+            btype = block.get("type", "text")
+            if btype == "text":
+                parts.append(genai_types.Part(text=block.get("text", "")))
+            elif btype in ("image", "document"):
+                if getattr(self, "supports_vision", True):
+                    parts.append(_canonical_to_gemini_part(block))
+                else:
+                    parts.append(genai_types.Part(text=unsupported_placeholder(block)["text"]))
+            elif btype == "audio":
+                if getattr(self, "supports_audio", True):
+                    parts.append(_canonical_to_gemini_part(block))
+                else:
+                    parts.append(genai_types.Part(text=unsupported_placeholder(block)["text"]))
+            elif btype == "video":
+                if getattr(self, "supports_video", True):
+                    parts.append(_canonical_to_gemini_part(block))
+                else:
+                    parts.append(genai_types.Part(text=unsupported_placeholder(block)["text"]))
+            else:
+                parts.append(genai_types.Part(text=str(block)))
+        return parts
+
     def prepare_messages(self, messages: list[LLMMessage]) -> tuple[str | None, list[genai_types.Content]]:
         """Convert LLMMessage[] to Gemini API format.
 
@@ -61,13 +102,7 @@ class GeminiProvider(LLMProvider):
 
             elif msg.role == "user":
                 if isinstance(msg.content, list) and is_multimodal_content(msg.content):
-                    # Convert canonical multimodal blocks to Gemini Part objects
-                    parts = convert_for_gemini(
-                        msg.content,
-                        supports_vision=getattr(self, "supports_vision", True),
-                        supports_audio=getattr(self, "supports_audio", True),
-                        supports_video=getattr(self, "supports_video", True),
-                    )
+                    parts = self.convert_multimodal_content(msg.content)
                     contents.append(genai_types.Content(role="user", parts=parts))
                 else:
                     text = safe_content if isinstance(safe_content, str) else json.dumps(safe_content)

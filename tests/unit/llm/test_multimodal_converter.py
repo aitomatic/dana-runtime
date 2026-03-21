@@ -1,43 +1,65 @@
-"""Tests for multimodal content converter module."""
+"""Tests for multimodal content conversion via provider methods and shared helpers."""
 
-from dana.common.llm.multimodal_converter import (
-    convert_for_anthropic,
-    convert_for_openai,
-    convert_for_openai_responses,
-    is_multimodal_content,
-)
+import pytest
+
+from dana.common.llm.types import is_multimodal_content, read_media_as_base64
+from dana.common.llm.providers.anthropic import AnthropicProvider
+from dana.common.llm.providers.openai_compatible_base import OpenAICompatibleProvider
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# Fixtures — path-based media blocks using real temp files
 # ---------------------------------------------------------------------------
-
-IMAGE_BLOCK_BASE64 = {
-    "type": "image",
-    "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="},
-}
-
-IMAGE_BLOCK_URL = {
-    "type": "image",
-    "source": {"type": "url", "url": "https://example.com/img.png"},
-}
-
-AUDIO_BLOCK = {
-    "type": "audio",
-    "source": {"type": "base64", "media_type": "audio/wav", "data": "UklGR..."},
-}
-
-VIDEO_BLOCK = {
-    "type": "video",
-    "source": {"type": "base64", "media_type": "video/mp4", "data": "AAAA..."},
-}
-
-DOCUMENT_BLOCK = {
-    "type": "document",
-    "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="},
-}
 
 TEXT_BLOCK = {"type": "text", "text": "Describe this image."}
+
+
+@pytest.fixture
+def image_block(tmp_path):
+    """Create a path-based image block with a real temp file."""
+    f = tmp_path / "test.png"
+    f.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 20)
+    return {"type": "image", "media_type": "image/png", "path": str(f)}
+
+
+@pytest.fixture
+def audio_block(tmp_path):
+    f = tmp_path / "test.wav"
+    f.write_bytes(b"RIFF" + b"\x00" * 20)
+    return {"type": "audio", "media_type": "audio/wav", "path": str(f)}
+
+
+@pytest.fixture
+def video_block(tmp_path):
+    f = tmp_path / "test.mp4"
+    f.write_bytes(b"\x00\x00\x00\x1cftyp" + b"\x00" * 20)
+    return {"type": "video", "media_type": "video/mp4", "path": str(f)}
+
+
+@pytest.fixture
+def document_block(tmp_path):
+    f = tmp_path / "test.pdf"
+    f.write_bytes(b"%PDF-1.4 minimal")
+    return {"type": "document", "media_type": "application/pdf", "path": str(f)}
+
+
+def _make_anthropic_provider(**caps):
+    """Create a bare AnthropicProvider for testing convert_multimodal_content."""
+    p = AnthropicProvider.__new__(AnthropicProvider)
+    p.supports_vision = caps.get("supports_vision", True)
+    p.supports_audio = caps.get("supports_audio", False)
+    p.supports_video = caps.get("supports_video", False)
+    return p
+
+
+def _make_openai_provider(**caps):
+    """Create a bare OpenAICompatibleProvider for testing convert_multimodal_content."""
+    p = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
+    p.model = "gpt-4o"
+    p.supports_vision = caps.get("supports_vision", True)
+    p.supports_audio = caps.get("supports_audio", False)
+    p.supports_video = caps.get("supports_video", False)
+    return p
 
 
 # ---------------------------------------------------------------------------
@@ -52,149 +74,148 @@ class TestIsMultimodalContent:
     def test_text_only_blocks(self):
         assert not is_multimodal_content([TEXT_BLOCK])
 
-    def test_image_blocks(self):
-        assert is_multimodal_content([TEXT_BLOCK, IMAGE_BLOCK_BASE64])
+    def test_image_blocks(self, image_block):
+        assert is_multimodal_content([TEXT_BLOCK, image_block])
 
-    def test_audio_blocks(self):
-        assert is_multimodal_content([AUDIO_BLOCK])
+    def test_audio_blocks(self, audio_block):
+        assert is_multimodal_content([audio_block])
 
-    def test_video_blocks(self):
-        assert is_multimodal_content([VIDEO_BLOCK])
+    def test_video_blocks(self, video_block):
+        assert is_multimodal_content([video_block])
 
-    def test_document_blocks(self):
-        assert is_multimodal_content([DOCUMENT_BLOCK])
+    def test_document_blocks(self, document_block):
+        assert is_multimodal_content([document_block])
 
     def test_empty_list(self):
         assert not is_multimodal_content([])
 
 
 # ---------------------------------------------------------------------------
-# Anthropic converter
+# read_media_as_base64 helper
+# ---------------------------------------------------------------------------
+
+
+class TestReadMediaAsBase64:
+    def test_reads_file_and_encodes(self, tmp_path):
+        f = tmp_path / "data.bin"
+        content = b"hello world"
+        f.write_bytes(content)
+        block = {"type": "image", "media_type": "image/png", "path": str(f)}
+
+        import base64
+        result = read_media_as_base64(block)
+        assert result == base64.b64encode(content).decode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Anthropic converter (via provider method)
 # ---------------------------------------------------------------------------
 
 
 class TestConvertForAnthropic:
-    def test_image_passthrough(self):
-        result = convert_for_anthropic([TEXT_BLOCK, IMAGE_BLOCK_BASE64], supports_vision=True)
+    def test_image_encodes_from_path(self, image_block):
+        p = _make_anthropic_provider()
+        result = p.convert_multimodal_content([TEXT_BLOCK, image_block])
         assert result[0] == TEXT_BLOCK
-        assert result[1] == IMAGE_BLOCK_BASE64
+        assert result[1]["type"] == "image"
+        assert result[1]["source"]["type"] == "base64"
+        assert result[1]["source"]["media_type"] == "image/png"
+        assert len(result[1]["source"]["data"]) > 0
 
-    def test_image_url_passthrough(self):
-        result = convert_for_anthropic([IMAGE_BLOCK_URL], supports_vision=True)
-        assert result[0] == IMAGE_BLOCK_URL
+    def test_document_encodes_from_path(self, document_block):
+        p = _make_anthropic_provider()
+        result = p.convert_multimodal_content([document_block])
+        assert result[0]["type"] == "document"
+        assert result[0]["source"]["type"] == "base64"
+        assert result[0]["source"]["media_type"] == "application/pdf"
 
-    def test_document_passthrough(self):
-        result = convert_for_anthropic([DOCUMENT_BLOCK], supports_vision=True)
-        assert result[0] == DOCUMENT_BLOCK
-
-    def test_audio_unsupported(self):
-        result = convert_for_anthropic([AUDIO_BLOCK], supports_audio=False)
+    def test_audio_unsupported(self, audio_block):
+        p = _make_anthropic_provider(supports_audio=False)
+        result = p.convert_multimodal_content([audio_block])
         assert result[0]["type"] == "text"
         assert "not supported" in result[0]["text"]
 
-    def test_video_unsupported(self):
-        result = convert_for_anthropic([VIDEO_BLOCK], supports_video=False)
+    def test_video_unsupported(self, video_block):
+        p = _make_anthropic_provider(supports_video=False)
+        result = p.convert_multimodal_content([video_block])
         assert result[0]["type"] == "text"
         assert "not supported" in result[0]["text"]
 
-    def test_vision_unsupported_fallback(self):
-        result = convert_for_anthropic([IMAGE_BLOCK_BASE64], supports_vision=False)
+    def test_vision_unsupported_fallback(self, image_block):
+        p = _make_anthropic_provider(supports_vision=False)
+        result = p.convert_multimodal_content([image_block])
         assert result[0]["type"] == "text"
         assert "not supported" in result[0]["text"]
 
-    def test_mixed_content(self):
-        blocks = [TEXT_BLOCK, IMAGE_BLOCK_BASE64, AUDIO_BLOCK, VIDEO_BLOCK]
-        result = convert_for_anthropic(blocks, supports_vision=True, supports_audio=False, supports_video=False)
+    def test_mixed_content(self, image_block, audio_block, video_block):
+        p = _make_anthropic_provider(supports_vision=True, supports_audio=False, supports_video=False)
+        blocks = [TEXT_BLOCK, image_block, audio_block, video_block]
+        result = p.convert_multimodal_content(blocks)
         assert result[0] == TEXT_BLOCK
-        assert result[1] == IMAGE_BLOCK_BASE64  # kept
+        assert result[1]["type"] == "image"  # encoded from path
+        assert result[1]["source"]["type"] == "base64"
         assert result[2]["type"] == "text"  # audio placeholder
         assert result[3]["type"] == "text"  # video placeholder
 
 
 # ---------------------------------------------------------------------------
-# OpenAI Chat Completions converter
+# OpenAI Chat Completions converter (via provider method)
 # ---------------------------------------------------------------------------
 
 
 class TestConvertForOpenAI:
-    def test_image_base64(self):
-        result = convert_for_openai([IMAGE_BLOCK_BASE64], supports_vision=True)
+    def test_image_base64(self, image_block):
+        p = _make_openai_provider()
+        result = p.convert_multimodal_content([image_block])
         assert result[0]["type"] == "image_url"
-        assert result[0]["image_url"]["url"] == "data:image/png;base64,iVBORw0KGgo="
+        assert result[0]["image_url"]["url"].startswith("data:image/png;base64,")
         assert result[0]["image_url"]["detail"] == "auto"
 
-    def test_image_url(self):
-        result = convert_for_openai([IMAGE_BLOCK_URL], supports_vision=True)
-        assert result[0]["type"] == "image_url"
-        assert result[0]["image_url"]["url"] == "https://example.com/img.png"
-
-    def test_audio_supported(self):
-        result = convert_for_openai([AUDIO_BLOCK], supports_audio=True)
+    def test_audio_supported(self, audio_block):
+        p = _make_openai_provider(supports_audio=True)
+        result = p.convert_multimodal_content([audio_block])
         assert result[0]["type"] == "input_audio"
         assert result[0]["input_audio"]["format"] == "wav"
-        assert result[0]["input_audio"]["data"] == "UklGR..."
+        assert len(result[0]["input_audio"]["data"]) > 0
 
-    def test_audio_mp3_format(self):
-        mp3_block = {
-            "type": "audio",
-            "source": {"type": "base64", "media_type": "audio/mp3", "data": "data"},
-        }
-        result = convert_for_openai([mp3_block], supports_audio=True)
+    def test_audio_mp3_format(self, tmp_path):
+        f = tmp_path / "test.mp3"
+        f.write_bytes(b"ID3" + b"\x00" * 20)
+        mp3_block = {"type": "audio", "media_type": "audio/mp3", "path": str(f)}
+        p = _make_openai_provider(supports_audio=True)
+        result = p.convert_multimodal_content([mp3_block])
         assert result[0]["input_audio"]["format"] == "mp3"
 
-    def test_audio_mpeg_format(self):
-        mpeg_block = {
-            "type": "audio",
-            "source": {"type": "base64", "media_type": "audio/mpeg", "data": "data"},
-        }
-        result = convert_for_openai([mpeg_block], supports_audio=True)
+    def test_audio_mpeg_format(self, tmp_path):
+        f = tmp_path / "test.mp3"
+        f.write_bytes(b"\xff\xfb" + b"\x00" * 20)
+        mpeg_block = {"type": "audio", "media_type": "audio/mpeg", "path": str(f)}
+        p = _make_openai_provider(supports_audio=True)
+        result = p.convert_multimodal_content([mpeg_block])
         assert result[0]["input_audio"]["format"] == "mp3"
 
-    def test_video_always_unsupported(self):
-        result = convert_for_openai([VIDEO_BLOCK], supports_video=True)
+    def test_video_always_unsupported(self, video_block):
+        p = _make_openai_provider(supports_video=True)
+        result = p.convert_multimodal_content([video_block])
         assert result[0]["type"] == "text"
         assert "not supported" in result[0]["text"]
 
-    def test_document_supported(self):
-        result = convert_for_openai([DOCUMENT_BLOCK], supports_vision=True)
+    def test_document_supported(self, document_block):
+        p = _make_openai_provider()
+        result = p.convert_multimodal_content([document_block])
         assert result[0]["type"] == "file"
         assert "base64" in result[0]["file"]["file_data"]
 
-    def test_vision_unsupported_fallback(self):
-        result = convert_for_openai([IMAGE_BLOCK_BASE64], supports_vision=False)
+    def test_vision_unsupported_fallback(self, image_block):
+        p = _make_openai_provider(supports_vision=False)
+        result = p.convert_multimodal_content([image_block])
         assert result[0]["type"] == "text"
         assert "not supported" in result[0]["text"]
 
     def test_text_passthrough(self):
-        result = convert_for_openai([TEXT_BLOCK])
+        p = _make_openai_provider()
+        result = p.convert_multimodal_content([TEXT_BLOCK])
         assert result[0] == TEXT_BLOCK
-
-
-# ---------------------------------------------------------------------------
-# OpenAI Responses API converter
-# ---------------------------------------------------------------------------
-
-
-class TestConvertForOpenAIResponses:
-    def test_text_converted(self):
-        result = convert_for_openai_responses([TEXT_BLOCK])
-        assert result[0]["type"] == "input_text"
-        assert result[0]["text"] == "Describe this image."
-
-    def test_image_base64(self):
-        result = convert_for_openai_responses([IMAGE_BLOCK_BASE64], supports_vision=True)
-        assert result[0]["type"] == "input_image"
-        assert "data:image/png;base64," in result[0]["image_url"]
-
-    def test_image_url(self):
-        result = convert_for_openai_responses([IMAGE_BLOCK_URL], supports_vision=True)
-        assert result[0]["type"] == "input_image"
-        assert result[0]["image_url"] == "https://example.com/img.png"
-
-    def test_vision_unsupported(self):
-        result = convert_for_openai_responses([IMAGE_BLOCK_BASE64], supports_vision=False)
-        assert result[0]["type"] == "input_text"
-        assert "not supported" in result[0]["text"]
 
 
 # ---------------------------------------------------------------------------
@@ -203,14 +224,16 @@ class TestConvertForOpenAIResponses:
 
 
 class TestPlaceholder:
-    def test_includes_type_and_media(self):
-        result = convert_for_anthropic([VIDEO_BLOCK], supports_video=False)
+    def test_includes_type_and_media(self, video_block):
+        p = _make_anthropic_provider(supports_video=False)
+        result = p.convert_multimodal_content([video_block])
         text = result[0]["text"]
         assert "video" in text
         assert "video/mp4" in text
 
-    def test_audio_placeholder(self):
-        result = convert_for_openai([AUDIO_BLOCK], supports_audio=False)
+    def test_audio_placeholder(self, audio_block):
+        p = _make_openai_provider(supports_audio=False)
+        result = p.convert_multimodal_content([audio_block])
         text = result[0]["text"]
         assert "audio" in text
         assert "audio/wav" in text

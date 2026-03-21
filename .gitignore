@@ -14,8 +14,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -215,3 +215,5 @@ plans/
 AGENTS.md
 release-manifest.json
 repomix-output.xml
+
+.DS_Store

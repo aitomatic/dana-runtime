@@ -13,6 +13,7 @@ import structlog
 
 from ..config import config_manager
 
+
 # Optional import - llama-stack may not be installed in all environments
 try:
     from llama_stack_client import LlamaStackClient
@@ -50,11 +51,9 @@ class LlamaStackClientManager:
         """
         if LlamaStackClient is None:
             raise ImportError(
-                "llama-stack package is not installed. "
-                "Install it with: pip install llama-stack>=0.3.0 "
-                "or: uv add llama-stack>=0.3.0"
+                "llama-stack package is not installed. Install it with: pip install llama-stack>=0.3.0 or: uv add llama-stack>=0.3.0"
             )
-        
+
         if cls._client is None:
             base_url = config_manager.get_provider_base_url("llamastack")
             if not base_url:

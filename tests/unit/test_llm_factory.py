@@ -94,23 +94,27 @@ class TestCreateProvider:
                 assert provider == mock_provider
 
     def test_create_moonshot_provider(self):
-        """Test creating Moonshot provider via OpenAI-compatible fallback"""
-        with patch("dana.common.llm.providers.factory.config_manager") as mock_config:
-            mock_config.get_provider_config.return_value = {
+        """Test creating Moonshot provider via dedicated MoonshotProvider."""
+        with (
+            patch("dana.common.llm.providers.factory.config_manager") as mock_config,
+            patch("dana.common.llm.providers.moonshot.config_manager") as mock_moonshot_config,
+        ):
+            provider_config = {
                 "api_key_env": "MOONSHOT_API_KEY",
                 "default_model": "moonshot-v1-8k",
                 "base_url": "https://api.moonshot.cn/v1",
             }
-            mock_config.get_provider_api_key.return_value = "moonshot-key"
+            for cfg in (mock_config, mock_moonshot_config):
+                cfg.get_provider_config.return_value = provider_config
+                cfg.get_provider_api_key.return_value = "moonshot-key"
+                cfg.get_provider_base_url.return_value = "https://api.moonshot.cn/v1"
 
-            with patch("dana.common.llm.providers.factory.OpenAIProvider") as mock_openai:
-                mock_provider = Mock()
-                mock_openai.return_value = mock_provider
+            provider = create_provider("moonshot", model="moonshot-v1-32k")
 
-                provider = create_provider("moonshot", model="moonshot-v1-32k")
+            from dana.common.llm.providers.moonshot import MoonshotProvider
 
-                mock_openai.assert_called_once_with(api_key="moonshot-key", model="moonshot-v1-32k", base_url="https://api.moonshot.cn/v1")
-                assert provider == mock_provider
+            assert isinstance(provider, MoonshotProvider)
+            assert provider.model == "moonshot-v1-32k"
 
     def test_create_huggingface_provider(self):
         """Test creating HuggingFace provider via OpenAI-compatible fallback"""

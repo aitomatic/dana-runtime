@@ -4,7 +4,6 @@ Provides read() and write() tools mirroring Claude Code's file I/O signatures.
 Supports text files, images (PNG, JPG, GIF, WebP, BMP), audio, video, and PDFs.
 """
 
-import base64
 from pathlib import Path
 
 from dana.common.protocols.war import named_tool
@@ -175,34 +174,26 @@ class FileIOResource(BaseResource):
             return f"Error reading file: {e}"
 
     def _read_image(self, path: Path, suffix: str) -> str | dict:
-        """Read an image file and return as base64 content block for LLM consumption."""
+        """Read an image file and return path-based content block for LLM consumption."""
         file_size = path.stat().st_size
         if file_size > MAX_IMAGE_SIZE:
             return f"Error: Image too large ({file_size / 1024 / 1024:.1f}MB). Max: 20MB"
 
-        try:
-            image_bytes = path.read_bytes()
-        except PermissionError:
-            return f"Error: Permission denied: {path}"
-        except Exception as e:
-            return f"Error reading image: {e}"
+        if not path.is_file():
+            return f"Error: File not accessible: {path}"
 
-        b64_data = base64.b64encode(image_bytes).decode("ascii")
         media_type = IMAGE_MEDIA_TYPES.get(suffix, "image/png")
 
         return {
             "message": f"Image: {path.name} ({file_size / 1024:.1f}KB, {media_type})",
             "inject_as_user": [
                 {"type": "text", "text": f"Visual contents of {path.name}:"},
-                {
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": media_type, "data": b64_data},
-                },
+                {"type": "image", "media_type": media_type, "path": str(path)},
             ],
         }
 
     def _read_media(self, path: Path, suffix: str, media_types: dict, block_type: str, supported: bool) -> str | dict:
-        """Read an audio or video file and return as base64 content block.
+        """Read an audio or video file and return path-based content block.
 
         Args:
             path: Resolved file path.
@@ -218,29 +209,18 @@ class FileIOResource(BaseResource):
         if not supported:
             return f"[{block_type.title()} file: {path.name} ({file_size / 1024:.1f}KB) — {block_type} not supported by current model]"
 
-        try:
-            raw_bytes = path.read_bytes()
-        except PermissionError:
-            return f"Error: Permission denied: {path}"
-        except Exception as e:
-            return f"Error reading {block_type}: {e}"
-
-        b64_data = base64.b64encode(raw_bytes).decode("ascii")
         media_type = media_types.get(suffix, f"{block_type}/octet-stream")
 
         return {
             "message": f"{block_type.title()}: {path.name} ({file_size / 1024:.1f}KB, {media_type})",
             "inject_as_user": [
                 {"type": "text", "text": f"{block_type.title()} contents of {path.name}:"},
-                {
-                    "type": block_type,
-                    "source": {"type": "base64", "media_type": media_type, "data": b64_data},
-                },
+                {"type": block_type, "media_type": media_type, "path": str(path)},
             ],
         }
 
     def _read_pdf(self, path: Path, pages: str | None) -> str | dict:
-        """Read a PDF file and return as base64 content block for LLM consumption."""
+        """Read a PDF file and return path-based content block for LLM consumption."""
         file_size = path.stat().st_size
 
         if pages:
@@ -261,28 +241,19 @@ class FileIOResource(BaseResource):
         except ImportError:
             pass  # pymupdf not available, send full PDF
 
-        try:
-            pdf_bytes = path.read_bytes()
-        except PermissionError:
-            return f"Error: Permission denied: {path}"
-        except Exception as e:
-            return f"Error reading PDF: {e}"
-
-        b64_data = base64.b64encode(pdf_bytes).decode("ascii")
-
         return {
             "message": f"PDF: {path.name} ({file_size / 1024:.1f}KB)",
             "inject_as_user": [
                 {"type": "text", "text": f"Contents of {path.name}:"},
-                {
-                    "type": "document",
-                    "source": {"type": "base64", "media_type": "application/pdf", "data": b64_data},
-                },
+                {"type": "document", "media_type": "application/pdf", "path": str(path)},
             ],
         }
 
     def _read_pdf_pages(self, path: Path, pages: str) -> str | dict:
-        """Read specific pages from a PDF using pymupdf."""
+        """Read specific pages from a PDF using pymupdf.
+
+        Extracts selected pages into a temp file and returns a path-based block.
+        """
         try:
             import fitz
         except ImportError:
@@ -304,23 +275,27 @@ class FileIOResource(BaseResource):
 
         end = min(end, doc.page_count)
 
-        # Create a new PDF with selected pages
+        # Create a new PDF with selected pages and write to temp file
+        import tempfile
+
         new_doc = fitz.open()
         new_doc.insert_pdf(doc, from_page=start - 1, to_page=end - 1)  # 0-indexed
         pdf_bytes = new_doc.tobytes()
+
+        fd, tmp_name = tempfile.mkstemp(suffix=".pdf", prefix=f"{path.stem}_p{start}-{end}_")
+        import os
+        os.close(fd)
+        tmp_pdf = Path(tmp_name)
+        tmp_pdf.write_bytes(pdf_bytes)
+
         new_doc.close()
         doc.close()
-
-        b64_data = base64.b64encode(pdf_bytes).decode("ascii")
 
         return {
             "message": f"PDF: {path.name} pages {start}-{end} ({len(pdf_bytes) / 1024:.1f}KB)",
             "inject_as_user": [
                 {"type": "text", "text": f"Contents of {path.name} (pages {start}-{end}):"},
-                {
-                    "type": "document",
-                    "source": {"type": "base64", "media_type": "application/pdf", "data": b64_data},
-                },
+                {"type": "document", "media_type": "application/pdf", "path": str(tmp_pdf)},
             ],
         }
 
