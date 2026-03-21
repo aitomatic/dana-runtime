@@ -1,0 +1,41 @@
+name: Enforce branch flow
+on:
+  pull_request:
+    branches:
+      - stable
+      - main
+      - 'main/**'
+
+jobs:
+  check-branch-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate source branch
+        run: |
+          TARGET="${{ github.base_ref }}"
+          SOURCE="${{ github.head_ref }}"
+
+          echo "PR: $SOURCE → $TARGET"
+
+          # stable ← main, main/*, hotfix/*
+          # main   ← develop, hotfix/*
+          # main/* ← develop, hotfix/*
+          if [[ "$TARGET" == "stable" ]]; then
+            PATTERN="^(main(/.*)?|hotfix/.+)$"
+            ALLOWED="main, main/*, hotfix/*"
+          elif [[ "$TARGET" == "main" || "$TARGET" == main/* ]]; then
+            PATTERN="^(develop|hotfix/.+)$"
+            ALLOWED="develop, hotfix/*"
+          else
+            echo "✅ No branch policy for target '$TARGET'"
+            exit 0
+          fi
+
+          if [[ "$SOURCE" =~ $PATTERN ]]; then
+            echo "✅ '$SOURCE' → '$TARGET' is allowed"
+          else
+            echo "❌ '$SOURCE' → '$TARGET' is NOT allowed"
+            echo ""
+            echo "Allowed sources for '$TARGET': $ALLOWED"
+            exit 1
+          fi
