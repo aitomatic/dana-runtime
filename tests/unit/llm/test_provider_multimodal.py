@@ -2,7 +2,7 @@
 
 import pytest
 
-from dana.common.llm.providers.anthropic import AnthropicProvider, prepare_anthropic_messages
+from dana.common.llm.providers.anthropic import AnthropicProvider
 from dana.common.llm.types import LLMMessage, LLMProvider
 from dana.core.timeline.native_message import NativeMessage
 
@@ -52,8 +52,12 @@ class TestAnthropicPrepareMultimodal:
         assert len(content[1]["source"]["data"]) > 0
 
     def test_plain_text_user_message_unchanged(self):
+        p = AnthropicProvider.__new__(AnthropicProvider)
+        p.supports_vision = True
+        p.supports_audio = False
+        p.supports_video = False
         msgs = [LLMMessage(role="user", content="Hello")]
-        _, result = prepare_anthropic_messages(msgs)
+        _, result = p.prepare_messages(msgs)
         assert result[0]["content"] == "Hello"
 
 

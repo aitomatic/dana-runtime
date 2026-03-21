@@ -525,12 +525,16 @@ class TestGeminiProvider:
 
 
 class TestAnthropicMessageConversion:
-    """Unit tests for prepare_anthropic_messages() — pure function, no mocking needed."""
+    """Unit tests for Anthropic message conversion — no mocking needed."""
 
     def _prepare(self, messages):
-        from dana.common.llm.providers.anthropic import prepare_anthropic_messages
+        from dana.common.llm.providers.anthropic import AnthropicProvider
 
-        return prepare_anthropic_messages(messages)
+        p = AnthropicProvider.__new__(AnthropicProvider)
+        p.supports_vision = True
+        p.supports_audio = False
+        p.supports_video = False
+        return p.prepare_messages(messages)
 
     # --- Bug 1: Tool call field name mismatch ---
 

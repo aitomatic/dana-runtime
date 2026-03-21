@@ -38,20 +38,6 @@ def _merge_consecutive_same_role(messages: list[dict]) -> list[dict]:
     return merged
 
 
-def prepare_anthropic_messages(
-    messages: list[LLMMessage],
-) -> tuple[str | list[dict] | None, list[dict]]:
-    """Standalone wrapper for backward compatibility (used by tests).
-
-    Creates a bare AnthropicProvider with default capabilities and delegates.
-    """
-    provider = AnthropicProvider.__new__(AnthropicProvider)
-    provider.supports_vision = True
-    provider.supports_audio = False
-    provider.supports_video = False
-    return provider.prepare_messages(messages)
-
-
 class AnthropicProvider(LLMProvider):
     """Anthropic Claude provider using the official Anthropic library."""
 
@@ -59,6 +45,14 @@ class AnthropicProvider(LLMProvider):
     def supports_native_tools(self) -> bool:
         """Anthropic supports native tool calling."""
         return True
+
+    # Map block type → capability attribute for support checks
+    _BLOCK_CAPABILITY = {
+        "image": "supports_vision",
+        "document": "supports_vision",
+        "audio": "supports_audio",
+        "video": "supports_video",
+    }
 
     def convert_multimodal_content(self, blocks: list[dict]) -> list[dict]:
         """Convert canonical path-based blocks to Anthropic wire format.
@@ -70,18 +64,9 @@ class AnthropicProvider(LLMProvider):
             btype = block.get("type", "text")
             if btype == "text":
                 result.append(block)
-            elif btype in ("image", "document"):
-                if getattr(self, "supports_vision", False):
-                    b64 = read_media_as_base64(block)
-                    result.append({
-                        "type": btype,
-                        "source": {"type": "base64", "media_type": block["media_type"], "data": b64},
-                    })
-                else:
-                    result.append(unsupported_placeholder(block))
-            elif btype in ("audio", "video"):
-                supported_attr = "supports_audio" if btype == "audio" else "supports_video"
-                if getattr(self, supported_attr, False):
+            elif btype in self._BLOCK_CAPABILITY:
+                cap_attr = self._BLOCK_CAPABILITY[btype]
+                if getattr(self, cap_attr, False):
                     b64 = read_media_as_base64(block)
                     result.append({
                         "type": btype,
