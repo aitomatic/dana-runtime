@@ -95,18 +95,24 @@ class TestCreateProvider:
 
     def test_create_moonshot_provider(self):
         """Test creating Moonshot provider via dedicated MoonshotProvider."""
-        with patch("dana.common.llm.providers.factory.config_manager") as mock_config:
-            mock_config.get_provider_config.return_value = {
+        with (
+            patch("dana.common.llm.providers.factory.config_manager") as mock_config,
+            patch("dana.common.llm.providers.moonshot.config_manager") as mock_moonshot_config,
+        ):
+            provider_config = {
                 "api_key_env": "MOONSHOT_API_KEY",
                 "default_model": "moonshot-v1-8k",
                 "base_url": "https://api.moonshot.cn/v1",
             }
-            mock_config.get_provider_api_key.return_value = "moonshot-key"
-            mock_config.get_provider_base_url.return_value = "https://api.moonshot.cn/v1"
+            for cfg in (mock_config, mock_moonshot_config):
+                cfg.get_provider_config.return_value = provider_config
+                cfg.get_provider_api_key.return_value = "moonshot-key"
+                cfg.get_provider_base_url.return_value = "https://api.moonshot.cn/v1"
 
             provider = create_provider("moonshot", model="moonshot-v1-32k")
 
             from dana.common.llm.providers.moonshot import MoonshotProvider
+
             assert isinstance(provider, MoonshotProvider)
             assert provider.model == "moonshot-v1-32k"
 
