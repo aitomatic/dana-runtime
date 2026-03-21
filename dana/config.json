@@ -1,0 +1,80 @@
+{
+  "llm": {
+    "providers": {
+      "openai": {
+        "name": "OpenAI",
+        "priority": 100,
+        "base_url": "https://api.openai.com/v1",
+        "api_key_env": "OPENAI_API_KEY",
+        "base_url_env": "OPENAI_BASE_URL",
+        "default_model": "gpt-4.1",
+        "vision_models": ["gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4o", "gpt-4o-mini", "o3", "o3-mini", "o4-mini"],
+        "models": {
+          "gpt-4.1": "gpt-4.1",
+          "gpt-4.1-mini": "gpt-4.1-mini",
+          "gpt-4.1-nano": "gpt-4.1-nano",
+          "gpt-4o": "gpt-4o",
+          "gpt-4o-mini": "gpt-4o-mini",
+          "o3": "o3",
+          "o3-mini": "o3-mini",
+          "o4-mini": "o4-mini"
+        }
+      },
+      "anthropic": {
+        "name": "Anthropic",
+        "priority": 90,
+        "base_url": "https://api.anthropic.com",
+        "api_key_env": "ANTHROPIC_API_KEY",
+        "base_url_env": "ANTHROPIC_BASE_URL",
+        "default_model": "claude-sonnet-4-6-20250627",
+        "vision_models": ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5", "claude-sonnet-4"],
+        "models": {
+          "claude-sonnet-4-6": "claude-sonnet-4-6-20250627",
+          "claude-opus-4-6": "claude-opus-4-6-20250627",
+          "claude-haiku-4-5": "claude-haiku-4-5-20251001",
+          "claude-sonnet-4": "claude-sonnet-4-20250514"
+        }
+      },
+      "azure": {
+        "name": "Azure OpenAI",
+        "priority": 40,
+        "base_url": "https://your-resource.openai.azure.com/openai/deployments/your-deployment",
+        "api_key_env": "AZURE_OPENAI_API_KEY",
+        "base_url_env": "AZURE_OPENAI_API_URL",
+        "api_version": "2024-10-21",
+        "api_version_env": "AZURE_OPENAI_API_VERSION",
+        "default_model": "gpt-4.1",
+        "vision_models": ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "o3", "o3-mini", "o4-mini"],
+        "models": {
+          "gpt-4.1": "gpt-4.1",
+          "gpt-4.1-mini": "gpt-4.1-mini",
+          "gpt-4o": "gpt-4o",
+          "o3": "o3",
+          "o3-mini": "o3-mini",
+          "o4-mini": "o4-mini"
+        }
+      },
+      "gemini": {
+        "name": "Google Gemini",
+        "priority": 85,
+        "api_key_env": "GEMINI_API_KEY",
+        "default_model": "gemini-2.5-flash",
+        "vision_models": ["gemini-2.5-flash", "gemini-2.5-pro"],
+        "models": {
+          "gemini-2.5-flash": "gemini-2.5-flash",
+          "gemini-2.5-pro": "gemini-2.5-pro"
+        }
+      },
+      "anthropic_like": {
+        "name": "Anthropic-Like",
+        "priority": 85,
+        "base_url": "http://localhost:8080",
+        "api_key_env": "ANTHROPIC_LIKE_API_KEY",
+        "base_url_env": "ANTHROPIC_LIKE_BASE_URL",
+        "default_model": "claude-sonnet-4-6-20250627",
+        "vision_models": [],
+        "models": {}
+      }
+    }
+  }
+}

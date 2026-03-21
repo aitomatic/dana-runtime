@@ -1,0 +1,200 @@
+"""
+Protocols for WAR (Workflow, Agent, Resource) framework.
+"""
+
+from collections.abc import Awaitable, Callable, Sequence
+from typing import Protocol
+
+from .types import DictParams
+
+
+CALL_RESOURCE = "call_resource"
+CALL_AGENT = "call_agent"
+EXECUTE_WORKFLOW = "execute_workflow"
+
+
+class WARProtocol(Protocol):
+    """Protocol for WAR objects."""
+
+    def query(self, **kwargs) -> DictParams:
+        """Query the data source."""
+        ...
+
+    @property
+    def public_description(self) -> str:
+        """Get the public description of the object."""
+        ...
+
+
+# Tool use decorator constants
+IS_TOOL_USE = "_is_tool_use"
+TOOL_NAME = "_tool_name"
+
+
+def tool_use(func):
+    """@tool_use decorator to mark methods as tool-usable by agents."""
+    func.__dict__[IS_TOOL_USE] = True
+    return func
+
+
+def named_tool(name: str):
+    """Decorator to mark a method as a tool with a custom name.
+
+    Use this instead of @tool_use when you want to override the auto-generated
+    tool name (which is normally "object_id__method" for native tools or
+    "object_id:method" for XML codecs).
+
+    Args:
+        name: The custom tool name to use.
+
+    Example:
+        @named_tool(name="web_search")
+        def search(self, query: str):
+            ...
+        # Tool will be exposed as "web_search" instead of "resource_id__search"
+    """
+
+    def decorator(func):
+        func.__dict__[IS_TOOL_USE] = True
+        func.__dict__[TOOL_NAME] = name
+        return func
+
+    return decorator
+
+
+class WorkflowProtocol(WARProtocol):
+    """Protocol for workflows."""
+
+    @property
+    def agent(self) -> "AgentProtocol | None":
+        """Get the agent of the workflow."""
+        ...
+
+    @agent.setter
+    def agent(self, value: "AgentProtocol | None"):
+        """Set the agent of the workflow."""
+        ...
+
+
+class ResourceProtocol(WARProtocol):
+    """Protocol for resources."""
+
+    ...
+
+
+class AgentProtocol(WARProtocol):
+    """Protocol for agents."""
+
+    @property
+    def system_prompt(self) -> str:
+        """Get the system prompt of the agent."""
+        ...
+
+    @property
+    def private_identity(self) -> str:
+        """Get the private identity of the agent."""
+        ...
+
+    @property
+    def available_workflows(self) -> Sequence[WorkflowProtocol]:
+        """Get the available workflows of the agent."""
+        ...
+
+    @property
+    def available_agents(self) -> Sequence["AgentProtocol"]:
+        """Get the available agents of the agent."""
+        ...
+
+    @property
+    def available_resources(self) -> Sequence[ResourceProtocol]:
+        """Get the available resources of the agent."""
+        ...
+
+
+class STARAgentProtocol(AgentProtocol):
+    """Protocol for See-Think-Act-Reflect agents."""
+
+    def _see(self, trace_inputs: DictParams) -> DictParams:
+        """See the inputs and produce percepts.
+        Args:
+            trace_inputs (DictParams): INPUT: any new user/agent inputs
+
+        Returns:
+            - trace_percepts (DictParams): the percepts produced by this SEE phase.
+        """
+        ...
+
+    def _think(self, trace_percepts: DictParams) -> DictParams:
+        """Think about the percepts and produce thoughts.
+        Args:
+            trace_percepts (DictParams): INPUT: the percepts produced by this SEE phase.
+
+        Returns:
+            - trace_thoughts (DictParams): the thoughts produced by this THINK phase.
+        """
+        ...
+
+    def _act(self, trace_thoughts: DictParams) -> DictParams:
+        """Act on the thoughts and produce outputs.
+        Args:
+            trace_thoughts (DictParams): INPUT: the thoughts produced by this THINK phase.
+
+        Returns:
+            - trace_outputs (DictParams): the outputs produced by this ACT phase.
+        """
+        ...
+
+    def _reflect(self, trace_outputs: DictParams) -> DictParams:
+        """Reflect on the outputs for learning.
+        Args:
+            trace_outputs (DictParams): INPUT: the outputs produced by this ACT phase.
+
+        Returns:
+            - trace_learning (DictParams): the learning produced by this REFLECT phase.
+        """
+        ...
+
+    # Async STAR methods
+    async def _think_async(self, trace_percepts: DictParams) -> DictParams:
+        """Async version of _think with native async LLM calls.
+        Args:
+            trace_percepts (DictParams): INPUT: the percepts produced by this SEE phase.
+
+        Returns:
+            - trace_thoughts (DictParams): the thoughts produced by this THINK phase.
+        """
+        ...
+
+    async def _act_async(self, trace_thoughts: DictParams) -> DictParams:
+        """Async version of _act with native async tool execution.
+        Args:
+            trace_thoughts (DictParams): INPUT: the thoughts produced by this THINK phase.
+
+        Returns:
+            - trace_outputs (DictParams): the outputs produced by this ACT phase.
+        """
+        ...
+
+    async def aquery(self, **kwargs) -> DictParams:
+        """Async version of query that uses async STAR methods.
+        Args:
+            **kwargs: Query parameters including message, caller info, etc.
+
+        Returns:
+            - DictParams: Query result with response and metadata.
+        """
+        ...
+
+    async def aconverse(
+        self,
+        initial_message: str | None = None,
+        session_id: str | None = None,
+        input_handler: Callable[[], Awaitable[str]] | None = None,
+    ) -> None:
+        """Async interactive conversation loop with pluggable input handler.
+        Args:
+            initial_message: Optional initial message to start the conversation
+            session_id: Optional session identifier. If None, generates UUID.
+            input_handler: Async callable that returns user input string.
+        """
+        ...
