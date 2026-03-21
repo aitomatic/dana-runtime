@@ -19,6 +19,8 @@ from dana.common.llm import LLM
 from dana.common.observable import observable
 from dana.common.protocols import AgentProtocol, DictParams, Notifiable, ResourceProtocol, WorkflowProtocol
 from dana.common.protocols.types import LearningPhase
+from dana.core.timeline.compressed_timeline import CompressedTimeline
+from dana.core.timeline.timeline import Timeline, TimelineEntry, TimelineEntryType
 from dana.repositories.repository_factory import DEFAULT_REPOSITORY_FACTORY, RepositoryFactory
 
 from ..knowledge.prompts.codecs import AbstractCodec, NativeToolsCodec
@@ -28,8 +30,6 @@ from .base_star_agent import BaseSTARAgent
 from .components import Communicator, LearnerProtocol, State
 from .components.observer import ObserverProtocol
 from .star_agent_streaming import STARAgentStreamingMixin
-from dana.core.timeline.compressed_timeline import CompressedTimeline
-from dana.core.timeline.timeline import Timeline, TimelineEntry, TimelineEntryType
 
 
 logger = structlog.get_logger()
@@ -130,7 +130,10 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             from dana.core.runtime import RuntimeRegistry
 
             runtime = RuntimeRegistry.select_codec_runtime(
-                provider=llm_provider, model=model, codec=codec, use_native_tools=None,
+                provider=llm_provider,
+                model=model,
+                codec=codec,
+                use_native_tools=None,
             )
 
         self._runtime = runtime

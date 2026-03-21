@@ -7,7 +7,16 @@ import httpx
 from openai import APITimeoutError
 import structlog
 
-from ..types import LLMMessage, LLMProvider, LLMResponse, LLMStreamChunk, LLMTimeoutError, is_multimodal_content, read_media_as_base64, unsupported_placeholder
+from ..types import (
+    LLMMessage,
+    LLMProvider,
+    LLMResponse,
+    LLMStreamChunk,
+    LLMTimeoutError,
+    is_multimodal_content,
+    read_media_as_base64,
+    unsupported_placeholder,
+)
 
 
 logger = structlog.get_logger()
@@ -26,6 +35,7 @@ def _extract_audio_format(media_type: str) -> str:
             return "mp3"
         return fmt
     return "wav"
+
 
 # Model families with known parameter restrictions.
 # Key is a model prefix matched against the model name.

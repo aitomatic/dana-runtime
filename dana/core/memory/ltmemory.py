@@ -99,9 +99,9 @@ When using with STARAgent, pass ``ltmemory_path`` to enable cross-session learni
     # - Queries past memories when building context
 """
 
-import re
 from datetime import datetime
 from pathlib import Path
+import re
 
 from dana.common.resource.rlm_resource import RLMResource
 

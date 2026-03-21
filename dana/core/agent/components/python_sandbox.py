@@ -68,12 +68,13 @@ Example
     output = sandbox.execute("print(llm_query('summarize', context))", context="Long text...")
 """
 
+from collections.abc import Callable
 import importlib
 import io
 import signal
 import sys
-from collections.abc import Callable
 from typing import Any
+
 
 # Safe modules that can be imported
 SAFE_MODULES = {

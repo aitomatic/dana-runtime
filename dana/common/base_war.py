@@ -7,8 +7,9 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 import xml.etree.ElementTree as ET
+
 
 if TYPE_CHECKING:
     from .llm import LLM
@@ -29,7 +30,7 @@ class BaseWAR(Notifier, Identifiable, WARProtocol):
         self._llm_client = kwargs.get("llm_client")
         self._resources: list[ResourceProtocol] = kwargs.get("resources") or []
 
-    def with_resources(self, *resources: ResourceProtocol) -> "BaseWAR":
+    def with_resources(self, *resources: ResourceProtocol) -> BaseWAR:
         """
         Any of Agent, Workflow, Resource can add resources to itself.
 
@@ -503,7 +504,7 @@ class BaseWAR(Notifier, Identifiable, WARProtocol):
             return registry.import_registry(data)
         return False
 
-    def ensure_registered(self) -> "BaseWAR":
+    def ensure_registered(self) -> BaseWAR:
         """Ensure this object is registered with the registry."""
         if self.object_id not in self._get_registry()._items:
             self._register_self()

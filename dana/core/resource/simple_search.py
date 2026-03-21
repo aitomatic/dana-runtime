@@ -9,7 +9,7 @@ Uses multiple backends for reliability:
 import logging
 import re
 import time
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import quote_plus
 
 import requests
 
@@ -23,10 +23,12 @@ logger = logging.getLogger(__name__)
 # Try to import ddgs package (preferred) or duckduckgo_search (legacy)
 try:
     from ddgs import DDGS
+
     HAS_DDGS = True
 except ImportError:
     try:
         from duckduckgo_search import DDGS
+
         HAS_DDGS = True
     except ImportError:
         HAS_DDGS = False
@@ -47,15 +49,17 @@ class SimpleWebSearch(BaseResource):
         """
         super().__init__(resource_id=resource_id, **kwargs)
         self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate",
-            "DNT": "1",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-        })
+        self.session.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate",
+                "DNT": "1",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+            }
+        )
 
     @tool_use
     def search(self, query: str, max_results: int = 5) -> DictParams:
@@ -123,11 +127,13 @@ class SimpleWebSearch(BaseResource):
         results = []
         with DDGS() as ddgs:
             for r in ddgs.text(query, max_results=max_results):
-                results.append({
-                    "title": r.get("title", ""),
-                    "url": r.get("href", r.get("link", "")),
-                    "snippet": r.get("body", r.get("snippet", "")),
-                })
+                results.append(
+                    {
+                        "title": r.get("title", ""),
+                        "url": r.get("href", r.get("link", "")),
+                        "snippet": r.get("body", r.get("snippet", "")),
+                    }
+                )
         return results
 
     def _search_with_html(self, query: str, max_results: int) -> list[DictParams]:
@@ -155,16 +161,10 @@ class SimpleWebSearch(BaseResource):
         results = []
 
         # Pattern to find result links
-        link_pattern = re.compile(
-            r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-            re.DOTALL | re.IGNORECASE
-        )
+        link_pattern = re.compile(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.DOTALL | re.IGNORECASE)
 
         # Pattern for snippets
-        snippet_pattern = re.compile(
-            r'class="result__snippet"[^>]*>(.*?)</a>',
-            re.DOTALL | re.IGNORECASE
-        )
+        snippet_pattern = re.compile(r'class="result__snippet"[^>]*>(.*?)</a>', re.DOTALL | re.IGNORECASE)
 
         # Split by result div blocks - use looser pattern
         result_blocks = re.split(r'<div[^>]+class="result\s', html)
@@ -182,7 +182,7 @@ class SimpleWebSearch(BaseResource):
             # DuckDuckGo wraps URLs in redirect - extract actual URL
             # Format: //duckduckgo.com/l/?uddg=<encoded_url>&...
             if "uddg=" in url:
-                url_match = re.search(r'uddg=([^&]+)', url)
+                url_match = re.search(r"uddg=([^&]+)", url)
                 if url_match:
                     url = unquote(url_match.group(1))
 
@@ -204,11 +204,13 @@ class SimpleWebSearch(BaseResource):
             snippet_match = snippet_pattern.search(block)
             snippet = self._clean_html(snippet_match.group(1)) if snippet_match else ""
 
-            results.append({
-                "title": title,
-                "url": url,
-                "snippet": snippet,
-            })
+            results.append(
+                {
+                    "title": title,
+                    "url": url,
+                    "snippet": snippet,
+                }
+            )
 
         return results
 
@@ -217,11 +219,11 @@ class SimpleWebSearch(BaseResource):
         import html
 
         # Remove HTML tags
-        text = re.sub(r'<[^>]+>', '', text)
+        text = re.sub(r"<[^>]+>", "", text)
         # Decode HTML entities (handles &#x27; &#39; &amp; etc.)
         text = html.unescape(text)
         # Clean whitespace
-        text = re.sub(r'\s+', ' ', text).strip()
+        text = re.sub(r"\s+", " ", text).strip()
         return text
 
     @tool_use
@@ -258,16 +260,16 @@ class SimpleWebSearch(BaseResource):
             html = response.text
 
             # Extract title
-            title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
+            title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
             title = self._clean_html(title_match.group(1)) if title_match else ""
 
             # Extract main content (simple approach - get text from body)
-            body_match = re.search(r'<body[^>]*>(.*?)</body>', html, re.IGNORECASE | re.DOTALL)
+            body_match = re.search(r"<body[^>]*>(.*?)</body>", html, re.IGNORECASE | re.DOTALL)
             if body_match:
                 content = body_match.group(1)
                 # Remove script and style tags
-                content = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                content = re.sub(r"<script[^>]*>.*?</script>", "", content, flags=re.DOTALL | re.IGNORECASE)
+                content = re.sub(r"<style[^>]*>.*?</style>", "", content, flags=re.DOTALL | re.IGNORECASE)
                 content = self._clean_html(content)
                 # Limit content length
                 if len(content) > 10000:
@@ -296,7 +298,7 @@ class SimpleWebSearch(BaseResource):
                         "url": url,
                         "title": title,
                         "content": "",
-                        "error": f"Page blocked or requires JavaScript. Try a different URL.",
+                        "error": "Page blocked or requires JavaScript. Try a different URL.",
                     }
 
             return {

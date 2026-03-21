@@ -13,6 +13,7 @@ import functools
 import inspect
 import os
 
+
 try:
     from langfuse import Langfuse
     from langfuse import observe as langfuse_observe
@@ -29,9 +30,7 @@ except ModuleNotFoundError:
 
 
 # Check if Langfuse should be enabled
-LANGFUSE_ENABLED = (
-    Langfuse is not None and os.getenv("LANGFUSE_ENABLED", "false").lower() in ("true", "1", "yes")
-)
+LANGFUSE_ENABLED = Langfuse is not None and os.getenv("LANGFUSE_ENABLED", "false").lower() in ("true", "1", "yes")
 
 if LANGFUSE_ENABLED:
     OBSERVER = Langfuse()

@@ -1,0 +1,41 @@
+# .pre-commit-config.yaml - Pre-commit Hooks Configuration
+
+default_install_hook_types:
+  - pre-commit
+  - post-checkout
+  - post-merge
+  - post-rewrite
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: check-yaml
+      - id: check-added-large-files
+      - id: check-json
+        exclude: \.ipynb$
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.13.0
+    hooks:
+      - id: ruff
+      - id: ruff-format
+        args: [--config=pyproject.toml]
+
+  - repo: local
+    hooks:
+      - id: ruff-critical
+        name: Critical lint checks (E722, F821)
+        entry: uv run ruff check --select=E722,F821
+        language: system
+        types: [python]
+        pass_filenames: true
+
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: 0.7.9
+    hooks:
+      - id: uv-sync
+        stages: [post-checkout, post-merge, post-rewrite]
+        args: [--extra, dev]

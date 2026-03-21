@@ -8,7 +8,16 @@ import anthropic
 import structlog
 
 from ...config import config_manager
-from ..types import LLMMessage, LLMProvider, LLMResponse, LLMStreamChunk, LLMTimeoutError, is_multimodal_content, read_media_as_base64, unsupported_placeholder
+from ..types import (
+    LLMMessage,
+    LLMProvider,
+    LLMResponse,
+    LLMStreamChunk,
+    LLMTimeoutError,
+    is_multimodal_content,
+    read_media_as_base64,
+    unsupported_placeholder,
+)
 
 
 logger = structlog.get_logger()
@@ -68,10 +77,12 @@ class AnthropicProvider(LLMProvider):
                 cap_attr = self._BLOCK_CAPABILITY[btype]
                 if getattr(self, cap_attr, False):
                     b64 = read_media_as_base64(block)
-                    result.append({
-                        "type": btype,
-                        "source": {"type": "base64", "media_type": block["media_type"], "data": b64},
-                    })
+                    result.append(
+                        {
+                            "type": btype,
+                            "source": {"type": "base64", "media_type": block["media_type"], "data": b64},
+                        }
+                    )
                 else:
                     result.append(unsupported_placeholder(block))
             else:

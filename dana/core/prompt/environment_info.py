@@ -14,6 +14,7 @@ import sys
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+
 if TYPE_CHECKING:
     from dana.core.agent.base_agent import BaseAgent
 
