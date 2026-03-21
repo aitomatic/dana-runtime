@@ -7,11 +7,25 @@ import httpx
 from openai import APITimeoutError
 import structlog
 
-from ..multimodal_converter import convert_for_openai, is_multimodal_content
-from ..types import LLMMessage, LLMProvider, LLMResponse, LLMStreamChunk, LLMTimeoutError
+from ..types import LLMMessage, LLMProvider, LLMResponse, LLMStreamChunk, LLMTimeoutError, is_multimodal_content, read_media_as_base64, unsupported_placeholder
 
 
 logger = structlog.get_logger()
+
+
+# ---------------------------------------------------------------------------
+# OpenAI multimodal format helpers
+# ---------------------------------------------------------------------------
+
+
+def _extract_audio_format(media_type: str) -> str:
+    """Extract audio format from media_type (e.g. 'audio/wav' -> 'wav')."""
+    if "/" in media_type:
+        fmt = media_type.split("/", 1)[1]
+        if fmt in ("mpeg", "mp3"):
+            return "mp3"
+        return fmt
+    return "wav"
 
 # Model families with known parameter restrictions.
 # Key is a model prefix matched against the model name.
@@ -77,6 +91,42 @@ class OpenAICompatibleProvider(LLMProvider):
 
         return filtered
 
+    def convert_multimodal_content(self, blocks: list[dict]) -> list[dict]:
+        """Convert canonical path-based blocks to OpenAI Chat Completions wire format."""
+        result: list[dict] = []
+        for block in blocks:
+            btype = block.get("type", "text")
+            if btype == "text":
+                result.append(block)
+            elif btype == "image":
+                if getattr(self, "supports_vision", True):
+                    b64 = read_media_as_base64(block)
+                    media_type = block["media_type"]
+                    url = f"data:{media_type};base64,{b64}"
+                    result.append({"type": "image_url", "image_url": {"url": url, "detail": "auto"}})
+                else:
+                    result.append(unsupported_placeholder(block))
+            elif btype == "audio":
+                if getattr(self, "supports_audio", False):
+                    b64 = read_media_as_base64(block)
+                    fmt = _extract_audio_format(block["media_type"])
+                    result.append({"type": "input_audio", "input_audio": {"data": b64, "format": fmt}})
+                else:
+                    result.append(unsupported_placeholder(block))
+            elif btype == "video":
+                # Standard OpenAI doesn't support video input
+                result.append(unsupported_placeholder(block))
+            elif btype == "document":
+                if getattr(self, "supports_vision", True):
+                    b64 = read_media_as_base64(block)
+                    media_type = block["media_type"]
+                    result.append({"type": "file", "file": {"file_data": f"data:{media_type};base64,{b64}"}})
+                else:
+                    result.append(unsupported_placeholder(block))
+            else:
+                result.append(block)
+        return result
+
     def prepare_messages(self, messages: list[LLMMessage]) -> tuple[str | None, list[dict]]:
         """Convert LLMMessage[] to OpenAI API wire format."""
         system = None
@@ -89,12 +139,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 openai_messages.append({"role": "system", "content": safe_content})
             elif msg.role == "user":
                 if isinstance(msg.content, list) and is_multimodal_content(msg.content):
-                    converted = convert_for_openai(
-                        msg.content,
-                        supports_vision=getattr(self, "supports_vision", True),
-                        supports_audio=getattr(self, "supports_audio", False),
-                        supports_video=getattr(self, "supports_video", False),
-                    )
+                    converted = self.convert_multimodal_content(msg.content)
                     openai_messages.append({"role": "user", "content": converted})
                 else:
                     openai_messages.append({"role": "user", "content": safe_content})

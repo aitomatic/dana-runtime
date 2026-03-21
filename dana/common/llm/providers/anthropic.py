@@ -8,8 +8,7 @@ import anthropic
 import structlog
 
 from ...config import config_manager
-from ..multimodal_converter import convert_for_anthropic, is_multimodal_content
-from ..types import LLMMessage, LLMProvider, LLMResponse, LLMStreamChunk, LLMTimeoutError
+from ..types import LLMMessage, LLMProvider, LLMResponse, LLMStreamChunk, LLMTimeoutError, is_multimodal_content, read_media_as_base64, unsupported_placeholder
 
 
 logger = structlog.get_logger()
@@ -42,95 +41,15 @@ def _merge_consecutive_same_role(messages: list[dict]) -> list[dict]:
 def prepare_anthropic_messages(
     messages: list[LLMMessage],
 ) -> tuple[str | list[dict] | None, list[dict]]:
-    """Convert LLMMessage objects to Anthropic API format.
+    """Standalone wrapper for backward compatibility (used by tests).
 
-    Returns:
-        (system, messages) where system is None, a plain string, or a list
-        of content blocks; and messages is the list of user/assistant dicts.
+    Creates a bare AnthropicProvider with default capabilities and delegates.
     """
-    system_blocks: list[dict] = []
-    anthropic_messages: list[dict] = []
-
-    for msg in messages:
-        if msg.role == "system":
-            block = {"type": "text", "text": msg.content}
-            if msg.cache_control:
-                block["cache_control"] = msg.cache_control
-            system_blocks.append(block)
-
-        elif msg.role == "user":
-            if isinstance(msg.content, list) and is_multimodal_content(msg.content):
-                # Convert canonical multimodal blocks to Anthropic wire format
-                converted = convert_for_anthropic(msg.content)
-                user_msg = {"role": "user", "content": converted}
-            elif msg.cache_control:
-                user_msg = {"role": "user", "content": [{"type": "text", "text": msg.content, "cache_control": msg.cache_control}]}
-            else:
-                user_msg = {"role": "user", "content": msg.content}
-            anthropic_messages.append(user_msg)
-
-        elif msg.role == "tool":
-            tool_result_block = {
-                "type": "tool_result",
-                "tool_use_id": msg.tool_call_id,
-                "content": msg.content,
-            }
-            # Group parallel tool results into one user message
-            if (
-                anthropic_messages
-                and anthropic_messages[-1].get("role") == "user"
-                and isinstance(anthropic_messages[-1].get("content"), list)
-                and anthropic_messages[-1]["content"]
-                and anthropic_messages[-1]["content"][0].get("type") == "tool_result"
-            ):
-                anthropic_messages[-1]["content"].append(tool_result_block)
-            else:
-                anthropic_messages.append({"role": "user", "content": [tool_result_block]})
-
-        elif msg.role == "assistant":
-            if msg.tool_calls:
-                content_blocks = []
-                if msg.content:
-                    content_blocks.append({"type": "text", "text": msg.content})
-                for tc in msg.tool_calls:
-                    tc_id = tc.get("tool_call_id") or tc.get("id", "")
-                    tc_name = tc.get("function") or tc.get("name", "")
-                    content_blocks.append(
-                        {
-                            "type": "tool_use",
-                            "id": tc_id,
-                            "name": tc_name,
-                            "input": tc.get("arguments", {}),
-                        }
-                    )
-                anthropic_messages.append(
-                    {
-                        "role": "assistant",
-                        "content": content_blocks,
-                    }
-                )
-            elif msg.cache_control:
-                anthropic_messages.append(
-                    {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": msg.content, "cache_control": msg.cache_control}],
-                    }
-                )
-            else:
-                anthropic_messages.append({"role": "assistant", "content": msg.content})
-
-    # Merge consecutive same-role messages
-    anthropic_messages = _merge_consecutive_same_role(anthropic_messages)
-
-    # Compute system return value
-    if not system_blocks:
-        system = None
-    elif len(system_blocks) == 1 and "cache_control" not in system_blocks[0]:
-        system = system_blocks[0]["text"]
-    else:
-        system = system_blocks
-
-    return system, anthropic_messages
+    provider = AnthropicProvider.__new__(AnthropicProvider)
+    provider.supports_vision = True
+    provider.supports_audio = False
+    provider.supports_video = False
+    return provider.prepare_messages(messages)
 
 
 class AnthropicProvider(LLMProvider):
@@ -141,13 +60,112 @@ class AnthropicProvider(LLMProvider):
         """Anthropic supports native tool calling."""
         return True
 
-    def prepare_messages(self, messages: list[LLMMessage]) -> tuple[str | list[dict] | None, list[dict]]:
-        """Convert LLMMessage[] to Anthropic API wire format.
+    def convert_multimodal_content(self, blocks: list[dict]) -> list[dict]:
+        """Convert canonical path-based blocks to Anthropic wire format.
 
-        Returns: (system, messages) where system is None, a plain string, or
-        a list of content blocks; messages is the list of user/assistant dicts.
+        Reads files and encodes as base64 for the Anthropic API.
         """
-        return prepare_anthropic_messages(messages)
+        result: list[dict] = []
+        for block in blocks:
+            btype = block.get("type", "text")
+            if btype == "text":
+                result.append(block)
+            elif btype in ("image", "document"):
+                if getattr(self, "supports_vision", False):
+                    b64 = read_media_as_base64(block)
+                    result.append({
+                        "type": btype,
+                        "source": {"type": "base64", "media_type": block["media_type"], "data": b64},
+                    })
+                else:
+                    result.append(unsupported_placeholder(block))
+            elif btype in ("audio", "video"):
+                supported_attr = "supports_audio" if btype == "audio" else "supports_video"
+                if getattr(self, supported_attr, False):
+                    b64 = read_media_as_base64(block)
+                    result.append({
+                        "type": btype,
+                        "source": {"type": "base64", "media_type": block["media_type"], "data": b64},
+                    })
+                else:
+                    result.append(unsupported_placeholder(block))
+            else:
+                result.append(block)
+        return result
+
+    def prepare_messages(self, messages: list[LLMMessage]) -> tuple[str | list[dict] | None, list[dict]]:
+        """Convert LLMMessage[] to Anthropic API wire format."""
+        system_blocks: list[dict] = []
+        anthropic_messages: list[dict] = []
+
+        for msg in messages:
+            if msg.role == "system":
+                block = {"type": "text", "text": msg.content}
+                if msg.cache_control:
+                    block["cache_control"] = msg.cache_control
+                system_blocks.append(block)
+
+            elif msg.role == "user":
+                if isinstance(msg.content, list) and is_multimodal_content(msg.content):
+                    converted = self.convert_multimodal_content(msg.content)
+                    user_msg = {"role": "user", "content": converted}
+                elif msg.cache_control:
+                    user_msg = {"role": "user", "content": [{"type": "text", "text": msg.content, "cache_control": msg.cache_control}]}
+                else:
+                    user_msg = {"role": "user", "content": msg.content}
+                anthropic_messages.append(user_msg)
+
+            elif msg.role == "tool":
+                tool_result_block = {
+                    "type": "tool_result",
+                    "tool_use_id": msg.tool_call_id,
+                    "content": msg.content,
+                }
+                if (
+                    anthropic_messages
+                    and anthropic_messages[-1].get("role") == "user"
+                    and isinstance(anthropic_messages[-1].get("content"), list)
+                    and anthropic_messages[-1]["content"]
+                    and anthropic_messages[-1]["content"][0].get("type") == "tool_result"
+                ):
+                    anthropic_messages[-1]["content"].append(tool_result_block)
+                else:
+                    anthropic_messages.append({"role": "user", "content": [tool_result_block]})
+
+            elif msg.role == "assistant":
+                if msg.tool_calls:
+                    content_blocks = []
+                    if msg.content:
+                        content_blocks.append({"type": "text", "text": msg.content})
+                    for tc in msg.tool_calls:
+                        tc_id = tc.get("tool_call_id") or tc.get("id", "")
+                        tc_name = tc.get("function") or tc.get("name", "")
+                        content_blocks.append(
+                            {
+                                "type": "tool_use",
+                                "id": tc_id,
+                                "name": tc_name,
+                                "input": tc.get("arguments", {}),
+                            }
+                        )
+                    anthropic_messages.append({"role": "assistant", "content": content_blocks})
+                elif msg.cache_control:
+                    anthropic_messages.append(
+                        {"role": "assistant", "content": [{"type": "text", "text": msg.content, "cache_control": msg.cache_control}]}
+                    )
+                else:
+                    anthropic_messages.append({"role": "assistant", "content": msg.content})
+
+        anthropic_messages = _merge_consecutive_same_role(anthropic_messages)
+
+        if not system_blocks:
+            system = None
+        elif len(system_blocks) == 1 and "cache_control" not in system_blocks[0]:
+            system = system_blocks[0]["text"]
+        else:
+            system = system_blocks
+
+        return system, anthropic_messages
 
     def prepare_tools(self, tools) -> list[dict]:
         """Convert tool definitions to Anthropic tool schema format.

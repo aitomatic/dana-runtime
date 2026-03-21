@@ -1,17 +1,26 @@
 """Tests for provider prepare_messages() with multimodal content."""
 
-from dana.common.llm.providers.anthropic import prepare_anthropic_messages
+import pytest
+
+from dana.common.llm.providers.anthropic import AnthropicProvider, prepare_anthropic_messages
 from dana.common.llm.types import LLMMessage, LLMProvider
 from dana.core.timeline.native_message import NativeMessage
 
 
-# Canonical test blocks
-IMAGE_BLOCK = {
-    "type": "image",
-    "source": {"type": "base64", "media_type": "image/png", "data": "abc123"},
-}
 TEXT_BLOCK = {"type": "text", "text": "What is this?"}
-MIXED_CONTENT = [TEXT_BLOCK, IMAGE_BLOCK]
+
+
+@pytest.fixture
+def image_block(tmp_path):
+    """Path-based image block with real temp file."""
+    f = tmp_path / "test.png"
+    f.write_bytes(b"\x89PNG" + b"\x00" * 20)
+    return {"type": "image", "media_type": "image/png", "path": str(f)}
+
+
+@pytest.fixture
+def mixed_content(image_block):
+    return [TEXT_BLOCK, image_block]
 
 
 # ---------------------------------------------------------------------------
@@ -20,17 +29,27 @@ MIXED_CONTENT = [TEXT_BLOCK, IMAGE_BLOCK]
 
 
 class TestAnthropicPrepareMultimodal:
-    def test_multimodal_user_message(self):
-        msgs = [LLMMessage(role="user", content=MIXED_CONTENT)]
-        system, result = prepare_anthropic_messages(msgs)
+    def test_multimodal_user_message(self, mixed_content):
+        """Anthropic prepare_messages converts path-based blocks to wire format."""
+        msgs = [LLMMessage(role="user", content=mixed_content)]
+        # Create provider directly instead of using prepare_anthropic_messages
+        # since that function uses default supports (vision=True)
+        p = AnthropicProvider.__new__(AnthropicProvider)
+        p.supports_vision = True
+        p.supports_audio = False
+        p.supports_video = False
+        system, result = p.prepare_messages(msgs)
         assert system is None
         assert len(result) == 1
         assert result[0]["role"] == "user"
-        # Content should be list of blocks (Anthropic pass-through)
         content = result[0]["content"]
         assert isinstance(content, list)
         assert content[0] == TEXT_BLOCK
+        # Image block should be converted to Anthropic wire format (base64-encoded)
         assert content[1]["type"] == "image"
+        assert content[1]["source"]["type"] == "base64"
+        assert content[1]["source"]["media_type"] == "image/png"
+        assert len(content[1]["source"]["data"]) > 0
 
     def test_plain_text_user_message_unchanged(self):
         msgs = [LLMMessage(role="user", content="Hello")]
@@ -45,7 +64,6 @@ class TestAnthropicPrepareMultimodal:
 
 class TestOpenAIPrepareMultimodal:
     def _make_provider(self):
-        """Create a minimal OpenAI-compatible provider for testing prepare_messages."""
         from dana.common.llm.providers.openai_compatible_base import OpenAICompatibleProvider
 
         p = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
@@ -55,17 +73,16 @@ class TestOpenAIPrepareMultimodal:
         p.supports_video = False
         return p
 
-    def test_multimodal_user_message_converts_to_openai_format(self):
+    def test_multimodal_user_message_converts_to_openai_format(self, mixed_content):
         provider = self._make_provider()
-        msgs = [LLMMessage(role="user", content=MIXED_CONTENT)]
+        msgs = [LLMMessage(role="user", content=mixed_content)]
         _, result = provider.prepare_messages(msgs)
         content = result[0]["content"]
         assert isinstance(content, list)
-        # Text block passed through
         assert content[0] == TEXT_BLOCK
-        # Image converted to OpenAI format
+        # Image converted to OpenAI format with base64 data URL
         assert content[1]["type"] == "image_url"
-        assert "data:image/png;base64,abc123" in content[1]["image_url"]["url"]
+        assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
 
     def test_plain_text_user_message_unchanged(self):
         provider = self._make_provider()
@@ -80,11 +97,10 @@ class TestOpenAIPrepareMultimodal:
 
 
 class TestBaseLLMProviderMultimodalFallback:
-    def test_list_content_extracted_as_text(self):
+    def test_list_content_extracted_as_text(self, mixed_content):
         provider = LLMProvider()
-        msgs = [LLMMessage(role="user", content=MIXED_CONTENT)]
+        msgs = [LLMMessage(role="user", content=mixed_content)]
         _, result = provider.prepare_messages(msgs)
-        # Base class extracts text from blocks
         content = result[0]["content"]
         assert isinstance(content, str)
         assert "What is this?" in content
@@ -97,29 +113,29 @@ class TestBaseLLMProviderMultimodalFallback:
 
 
 class TestNativeMessageMultimodal:
-    def test_list_content_creation(self):
-        nm = NativeMessage(role="user", content=MIXED_CONTENT)
+    def test_list_content_creation(self, mixed_content):
+        nm = NativeMessage(role="user", content=mixed_content)
         assert isinstance(nm.content, list)
         assert len(nm.content) == 2
 
-    def test_list_content_to_dict(self):
-        nm = NativeMessage(role="user", content=MIXED_CONTENT)
+    def test_list_content_to_dict(self, mixed_content):
+        nm = NativeMessage(role="user", content=mixed_content)
         d = nm.to_dict()
-        assert d["content"] == MIXED_CONTENT
+        assert d["content"] == mixed_content
         assert d["role"] == "user"
 
-    def test_list_content_from_dict(self):
+    def test_list_content_from_dict(self, mixed_content):
         data = {
             "role": "user",
-            "content": MIXED_CONTENT,
+            "content": mixed_content,
             "timestamp": "2026-03-20T15:00:00",
         }
         nm = NativeMessage.from_dict(data)
         assert isinstance(nm.content, list)
         assert nm.content[1]["type"] == "image"
 
-    def test_list_content_to_llm_message(self):
-        nm = NativeMessage(role="user", content=MIXED_CONTENT)
+    def test_list_content_to_llm_message(self, mixed_content):
+        nm = NativeMessage(role="user", content=mixed_content)
         lm = nm.to_llm_message()
         assert isinstance(lm.content, list)
         assert lm.role == "user"
