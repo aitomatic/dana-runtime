@@ -29,9 +29,11 @@ def _extract_audio_format(media_type: str) -> str:
 
 # Model families with known parameter restrictions.
 # Key is a model prefix matched against the model name.
+# "rename" remaps the parameter key (e.g. max_tokens → max_completion_tokens).
 MODEL_RESTRICTIONS: dict[str, dict] = {
     "gpt-5": {
         "temperature": {"allowed_values": [1], "default": 1},
+        "max_tokens": {"rename": "max_completion_tokens"},
     },
 }
 
@@ -76,6 +78,14 @@ class OpenAICompatibleProvider(LLMProvider):
             if param_name not in filtered:
                 continue
             current_value = filtered[param_name]
+            # Rename parameter (e.g. max_tokens → max_completion_tokens)
+            rename_to = restriction.get("rename")
+            if rename_to:
+                del filtered[param_name]
+                filtered[rename_to] = current_value
+                adjustments_made.append(f"{param_name} renamed to {rename_to}")
+                continue
+            # Remove disallowed values
             allowed_values = restriction.get("allowed_values")
             if allowed_values is not None and current_value not in allowed_values:
                 del filtered[param_name]

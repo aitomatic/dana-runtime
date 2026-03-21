@@ -55,7 +55,7 @@ PROVIDER_CAPABILITIES = {
 PROVIDER_MODELS = {
     "anthropic": "claude-haiku-4-5-20251001",
     "openai": "gpt-4.1-mini",
-    "azure": "gpt-4.1-mini",
+    "azure": os.getenv("AZURE_MODEL", "gpt-5.4"),
     "gemini": os.getenv("GEMINI_MODEL", "gemini-3-flash-preview"),
     "gemini_openai": os.getenv("GEMINI_MODEL", "gemini-3-flash-preview"),
     "anthropic_like": None,  # uses default
