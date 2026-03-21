@@ -57,6 +57,10 @@ def create_provider(provider_name: str, model: str | None = None, **kwargs) -> L
         from .gemini import GeminiProvider
 
         return GeminiProvider(model=model, **kwargs)
+    elif provider_name == "moonshot":
+        from .moonshot import MoonshotProvider
+
+        return MoonshotProvider(model=model, **kwargs)
     else:
         # For other providers, try OpenAI-compatible client
         base_url = config.get("base_url")

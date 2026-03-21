@@ -208,24 +208,26 @@ class TestOpenAIModelCompatibility:
         assert OpenAIProvider._get_model_family("gpt-50") is None
 
     def test_filter_params_removes_temperature_zero_for_gpt5(self):
-        """Test that temperature=0 is removed for gpt-5 models."""
+        """Test that temperature=0 is removed and max_tokens renamed for gpt-5."""
         from dana.common.llm.providers.openai import OpenAIProvider
 
         params = {"temperature": 0, "max_tokens": 100}
         filtered = OpenAIProvider._filter_params_for_model("gpt-5-mini", params)
 
         assert "temperature" not in filtered
-        assert filtered["max_tokens"] == 100
+        assert "max_tokens" not in filtered
+        assert filtered["max_completion_tokens"] == 100
 
     def test_filter_params_keeps_temperature_one_for_gpt5(self):
-        """Test that temperature=1 is kept for gpt-5 models."""
+        """Test that temperature=1 is kept and max_tokens renamed for gpt-5."""
         from dana.common.llm.providers.openai import OpenAIProvider
 
         params = {"temperature": 1, "max_tokens": 100}
         filtered = OpenAIProvider._filter_params_for_model("gpt-5-mini", params)
 
         assert filtered["temperature"] == 1
-        assert filtered["max_tokens"] == 100
+        assert "max_tokens" not in filtered
+        assert filtered["max_completion_tokens"] == 100
 
     def test_filter_params_removes_temperature_half_for_gpt5(self):
         """Test that temperature=0.5 is removed for gpt-5 models."""
@@ -525,12 +527,16 @@ class TestGeminiProvider:
 
 
 class TestAnthropicMessageConversion:
-    """Unit tests for prepare_anthropic_messages() — pure function, no mocking needed."""
+    """Unit tests for Anthropic message conversion — no mocking needed."""
 
     def _prepare(self, messages):
-        from dana.common.llm.providers.anthropic import prepare_anthropic_messages
+        from dana.common.llm.providers.anthropic import AnthropicProvider
 
-        return prepare_anthropic_messages(messages)
+        p = AnthropicProvider.__new__(AnthropicProvider)
+        p.supports_vision = True
+        p.supports_audio = False
+        p.supports_video = False
+        return p.prepare_messages(messages)
 
     # --- Bug 1: Tool call field name mismatch ---
 

@@ -82,9 +82,9 @@ The PythonSandbox provides:
 - Modules: re, json, math, collections, itertools, functools
 """
 
-import re
 from datetime import datetime
 from pathlib import Path
+import re
 
 from dana.common.llm import LLM, LLMMessage
 from dana.common.protocols.war import tool_use
@@ -172,7 +172,7 @@ class RLMResource(BaseResource):
 
         # Run async in sync context
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
             # We're in an async context, create a task
             import concurrent.futures
 
@@ -258,7 +258,7 @@ class RLMResource(BaseResource):
                 ),
             ]
 
-            for iteration in range(MAX_ITERATIONS):
+            for _iteration in range(MAX_ITERATIONS):
                 # Get LLM response
                 response = await self._llm.chat(messages)
 
@@ -291,7 +291,7 @@ class RLMResource(BaseResource):
 
         # Run async
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
             import concurrent.futures
 
             with concurrent.futures.ThreadPoolExecutor() as executor:

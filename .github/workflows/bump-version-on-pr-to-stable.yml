@@ -1,0 +1,65 @@
+name: Bump version on PR to stable
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches: [stable]
+
+jobs:
+  bump-version:
+    # Only run for main/* branches
+    if: startsWith(github.head_ref, 'main/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout source branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Read versions and compare
+        id: compare
+        run: |
+          # Read version from source branch (main/*)
+          SOURCE_VERSION=$(grep -m1 '^version' pyproject.toml | sed 's/.*"\(.*\)"/\1/')
+          echo "source=$SOURCE_VERSION" >> "$GITHUB_OUTPUT"
+
+          # Read version from stable
+          git fetch origin stable
+          STABLE_VERSION=$(git show origin/stable:pyproject.toml | grep -m1 '^version' | sed 's/.*"\(.*\)"/\1/')
+          echo "stable=$STABLE_VERSION" >> "$GITHUB_OUTPUT"
+
+          echo "Source: $SOURCE_VERSION | Stable: $STABLE_VERSION"
+
+          # Compare using sort -V (version sort)
+          HIGHER=$(printf '%s\n%s' "$SOURCE_VERSION" "$STABLE_VERSION" | sort -V | tail -1)
+          if [ "$SOURCE_VERSION" != "$STABLE_VERSION" ] && [ "$SOURCE_VERSION" = "$HIGHER" ]; then
+            echo "needs_bump=false" >> "$GITHUB_OUTPUT"
+            echo "Source is already ahead, no bump needed"
+          else
+            echo "needs_bump=true" >> "$GITHUB_OUTPUT"
+            echo "Source needs bump"
+          fi
+
+      - name: Compute next version
+        if: steps.compare.outputs.needs_bump == 'true'
+        id: next
+        run: |
+          IFS='.' read -r MAJOR MINOR PATCH <<< "${{ steps.compare.outputs.stable }}"
+          PATCH=$((PATCH + 1))
+          echo "version=$MAJOR.$MINOR.$PATCH" >> "$GITHUB_OUTPUT"
+          echo "Next version: $MAJOR.$MINOR.$PATCH"
+
+      - name: Commit version bump to source branch
+        if: steps.compare.outputs.needs_bump == 'true'
+        run: |
+          NEXT="${{ steps.next.outputs.version }}"
+          sed -i "s/^version = \".*\"/version = \"$NEXT\"/" pyproject.toml
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml
+          git commit -m "chore: bump version to $NEXT"
+          git push origin HEAD:${{ github.head_ref }}

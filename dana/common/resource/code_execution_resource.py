@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from typing import Iterable
+from collections.abc import Iterable
 
 from dana.common.protocols.war import tool_use
 from dana.core.agent.components.python_sandbox import PythonSandbox

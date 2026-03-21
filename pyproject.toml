@@ -15,7 +15,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dana"
-version = "0.1.1"
+version = "0.1.2"
 description = "Dana Agent - Domain-Aware Neurosymbolic Agents"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -36,7 +36,7 @@ dependencies = [
     "anthropic==0.30.1",
     "google-genai>=1.0.0",
     # HTTP client for API calls
-    "httpx>=0.27.0",
+    "httpx>=0.27.0,<0.28.0",
     # Configuration management
     "python-dotenv>=1.0.0",
     "pydantic-settings>=2.11.0",
@@ -48,6 +48,7 @@ dependencies = [
     "beautifulsoup4>=4.12.0",
     "html2text>=2024.2.26",
     "rich>=14.2.0",
+    "langfuse>=4.0.1",
 ]
 
 # Command-line entry points

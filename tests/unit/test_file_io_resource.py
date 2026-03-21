@@ -11,7 +11,6 @@ Covers:
 
 from __future__ import annotations
 
-import base64
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -103,9 +102,8 @@ class TestImageRead:
 
     @pytest.mark.asyncio
     async def test_read_png_returns_dict(self, tmp_resource, tmp_path):
-        """Read a PNG → dict with 'message' and 'inject_as_user'."""
+        """Read a PNG → dict with 'message' and 'inject_as_user' (path-based)."""
         f = tmp_path / "test.png"
-        # Write minimal PNG bytes (1x1 pixel)
         png_bytes = (
             b"\x89PNG\r\n\x1a\n"  # PNG signature
             b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02"
@@ -128,22 +126,19 @@ class TestImageRead:
         assert blocks[0]["type"] == "text"
         assert "test.png" in blocks[0]["text"]
         assert blocks[1]["type"] == "image"
-        assert blocks[1]["source"]["type"] == "base64"
-        assert blocks[1]["source"]["media_type"] == "image/png"
-
-        # Verify base64 decodes back to original bytes
-        decoded = base64.b64decode(blocks[1]["source"]["data"])
-        assert decoded == png_bytes
+        assert blocks[1]["media_type"] == "image/png"
+        assert blocks[1]["path"] == str(f)
 
     @pytest.mark.asyncio
     async def test_read_jpg_returns_jpeg_media_type(self, tmp_resource, tmp_path):
         """Read a .jpg → media_type is image/jpeg."""
         f = tmp_path / "photo.jpg"
-        f.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)  # JPEG header stub
+        f.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
 
         result = await tmp_resource.read(str(f))
         assert isinstance(result, dict)
-        assert result["inject_as_user"][1]["source"]["media_type"] == "image/jpeg"
+        assert result["inject_as_user"][1]["media_type"] == "image/jpeg"
+        assert result["inject_as_user"][1]["path"] == str(f)
 
     @pytest.mark.asyncio
     async def test_read_webp(self, tmp_resource, tmp_path):
@@ -153,7 +148,8 @@ class TestImageRead:
 
         result = await tmp_resource.read(str(f))
         assert isinstance(result, dict)
-        assert result["inject_as_user"][1]["source"]["media_type"] == "image/webp"
+        assert result["inject_as_user"][1]["media_type"] == "image/webp"
+        assert result["inject_as_user"][1]["path"] == str(f)
 
     @pytest.mark.asyncio
     async def test_oversized_image_returns_error(self, tmp_resource, tmp_path):
@@ -177,7 +173,7 @@ class TestPdfRead:
 
     @pytest.mark.asyncio
     async def test_read_small_pdf_without_pymupdf(self, tmp_resource, tmp_path):
-        """Small PDF without pymupdf → full PDF as base64 document block."""
+        """Small PDF without pymupdf → full PDF as path-based document block."""
         f = tmp_path / "small.pdf"
         pdf_bytes = b"%PDF-1.4 minimal pdf content"
         f.write_bytes(pdf_bytes)
@@ -201,10 +197,8 @@ class TestPdfRead:
         assert len(blocks) == 2
         assert blocks[0]["type"] == "text"
         assert blocks[1]["type"] == "document"
-        assert blocks[1]["source"]["media_type"] == "application/pdf"
-
-        decoded = base64.b64decode(blocks[1]["source"]["data"])
-        assert decoded == pdf_bytes
+        assert blocks[1]["media_type"] == "application/pdf"
+        assert blocks[1]["path"] == str(f)
 
     @pytest.mark.asyncio
     async def test_large_pdf_without_pages_returns_error(self, tmp_resource, tmp_path):
@@ -362,7 +356,7 @@ class TestContentBlockPassthrough:
         timeline = Timeline(max_context_tokens=32000)
         multimodal_content = [
             {"type": "text", "text": "Visual contents of image.png:"},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc123"}},
+            {"type": "image", "media_type": "image/png", "path": "/tmp/test.png"},
         ]
         entry = TimelineEntry(
             entry_type=TimelineEntryType.USER_MESSAGE,
@@ -379,7 +373,7 @@ class TestContentBlockPassthrough:
         timeline = Timeline(max_context_tokens=32000)
         multimodal_content = [
             {"type": "text", "text": "Image:"},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}},
+            {"type": "image", "media_type": "image/png", "path": "/tmp/test.png"},
         ]
         timeline.add_entry(
             TimelineEntry(
@@ -403,7 +397,7 @@ class TestContentBlockPassthrough:
             role="user",
             content=[
                 {"type": "text", "text": "hello world this is a test"},
-                {"type": "image", "source": {"type": "base64", "data": "abc"}},
+                {"type": "image", "media_type": "image/png", "path": "/tmp/test.png"},
             ],
         )
         # Should not raise
@@ -445,7 +439,7 @@ class TestInjectAsUserMultimodal:
 
         multimodal_blocks = [
             {"type": "text", "text": "Visual contents of test.png:"},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc123"}},
+            {"type": "image", "media_type": "image/png", "path": "/tmp/test.png"},
         ]
 
         agent._runtime = Mock()
@@ -553,14 +547,15 @@ class TestVisionFallbackImage:
         assert "Error" in result
 
     @pytest.mark.asyncio
-    async def test_vision_true_still_returns_base64(self, tmp_resource, tmp_path):
-        """Default supports_vision=True still returns base64 dict (no regression)."""
+    async def test_vision_true_still_returns_path_block(self, tmp_resource, tmp_path):
+        """Default supports_vision=True returns path-based dict."""
         f = tmp_path / "icon.png"
         f.write_bytes(b"\x89PNG" + b"\x00" * 50)
 
         result = await tmp_resource.read(str(f))
         assert isinstance(result, dict)
         assert "inject_as_user" in result
+        assert result["inject_as_user"][1]["path"] == str(f)
 
 
 class TestVisionFallbackPdf:

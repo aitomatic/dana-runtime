@@ -307,6 +307,7 @@ DANA_MOCK_LLM=true make test
 - **[Codebase Summary](docs/codebase-summary.md)** - Module structure and organization
 - **[Code Standards](docs/code-standards.md)** - Coding conventions and patterns
 - **[System Architecture](docs/system-architecture.md)** - Architecture diagrams and data flows
+- **[Branching Strategy](docs/branching-strategy.md)** - Git branching model and release flow
 - **[Project Roadmap](docs/project-roadmap.md)** - Development timeline and milestones
 
 ## API Reference
