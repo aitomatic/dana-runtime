@@ -1,15 +1,15 @@
-name: Tests
+# Lint + test on pull requests to protected branches
+# Skips live and deep tests — those require API keys and run locally
+
+name: PR Lint & Test
 
 on:
   pull_request:
-    branches:
-      - develop
-      - stable
-      - main
-      - 'main/**'
+    branches: [develop, stable, main, 'main/**']
+  workflow_dispatch:
 
 jobs:
-  test:
+  lint-and-test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -19,12 +19,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v6
         with:
-          version: "latest"
+          enable-cache: true
 
       - name: Set up Python ${{ matrix.python-version }}
-        run: uv python install ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
         run: uv sync
@@ -32,8 +34,8 @@ jobs:
       - name: Lint
         run: uv run ruff check dana/
 
-      - name: Run tests (mocked LLM, no live calls)
+      - name: Run tests (no live, no deep)
         env:
           DANA_MOCK_LLM: "true"
           DANA_USE_REAL_LLM: "false"
-        run: uv run pytest tests/ -v --maxfail=10 --tb=short
+        run: uv run pytest tests/ -m "not live and not deep" -v --maxfail=10 --tb=short --durations=10
