@@ -42,7 +42,7 @@ MEDIA_TYPES = {
 PROVIDER_CAPABILITIES = {
     "anthropic": {"image": True, "audio": False, "video": False},
     "openai": {"image": True, "audio": True, "video": False},
-    "azure": {"image": True, "audio": True, "video": False},
+    "azure": {"image": True, "audio": False, "video": False},
     "gemini": {"image": True, "audio": True, "video": True},
     "gemini_openai": {"image": True, "audio": True, "video": True},  # Gemini via OpenAI-compat endpoint
     "anthropic_like": {"image": True, "audio": False, "video": False},
@@ -65,7 +65,6 @@ PROVIDER_MODELS = {
 # Override model per modality when needed (e.g., audio needs a different model)
 PROVIDER_AUDIO_MODELS = {
     "openai": "gpt-4o-audio-preview",
-    "azure": "gpt-4o-audio-preview",
 }
 
 
