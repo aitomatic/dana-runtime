@@ -215,3 +215,5 @@ plans/
 AGENTS.md
 release-manifest.json
 repomix-output.xml
+
+.DS_Store
