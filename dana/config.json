@@ -18,6 +18,11 @@
           "o3": "o3",
           "o3-mini": "o3-mini",
           "o4-mini": "o4-mini"
+        },
+        "default_embedding_model": "text-embedding-3-small",
+        "embedding_models": {
+          "text-embedding-3-small": "text-embedding-3-small",
+          "text-embedding-3-large": "text-embedding-3-large"
         }
       },
       "anthropic": {
@@ -52,6 +57,11 @@
           "o3": "o3",
           "o3-mini": "o3-mini",
           "o4-mini": "o4-mini"
+        },
+        "default_embedding_model": "text-embedding-3-large",
+        "embedding_models": {
+          "text-embedding-3-small": "text-embedding-3-small",
+          "text-embedding-3-large": "text-embedding-3-large"
         }
       },
       "gemini": {
@@ -63,6 +73,11 @@
         "models": {
           "gemini-2.5-flash": "gemini-2.5-flash",
           "gemini-2.5-pro": "gemini-2.5-pro"
+        },
+        "default_embedding_model": "gemini-embedding-001",
+        "embedding_models": {
+          "gemini-embedding-001": "gemini-embedding-001",
+          "gemini-embedding-2-preview": "gemini-embedding-2-preview"
         }
       },
       "moonshot": {

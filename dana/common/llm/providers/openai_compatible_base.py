@@ -8,6 +8,8 @@ from openai import APITimeoutError
 import structlog
 
 from ..types import (
+    EmbeddingNotSupportedError,
+    EmbeddingResponse,
     LLMMessage,
     LLMProvider,
     LLMResponse,
@@ -289,6 +291,49 @@ class OpenAICompatibleProvider(LLMProvider):
             raise LLMTimeoutError(f"OpenAI-compatible API timeout: {e}") from e
         except Exception as e:
             logger.error("OpenAI-compatible API error", error=str(e))
+            raise
+
+    # --- Embedding methods ---
+
+    # Subclasses that support embeddings set this to the default model name.
+    embedding_model: str | None = None
+
+    @property
+    def supports_embeddings(self) -> bool:
+        return self.embedding_model is not None
+
+    async def embed(self, text: str, model: str | None = None, **kwargs) -> EmbeddingResponse:
+        """Generate embedding for a single text."""
+        return await self.embed_batch([text], model=model, **kwargs)
+
+    async def embed_batch(self, texts: list[str], model: str | None = None, **kwargs) -> EmbeddingResponse:
+        """Generate embeddings for multiple texts using OpenAI embeddings API."""
+        if not self.supports_embeddings:
+            raise EmbeddingNotSupportedError(f"{self.__class__.__name__} does not support embeddings.")
+
+        embed_model = model or self.embedding_model or "text-embedding-3-small"
+        try:
+            response = await self.client.embeddings.create(
+                input=texts,
+                model=embed_model,
+                **kwargs,
+            )
+            embeddings = [item.embedding for item in response.data]
+            dimensions = len(embeddings[0]) if embeddings else 0
+            usage = None
+            if response.usage:
+                usage = {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "total_tokens": response.usage.total_tokens,
+                }
+            return EmbeddingResponse(
+                embeddings=embeddings,
+                model=response.model,
+                usage=usage,
+                dimensions=dimensions,
+            )
+        except Exception as e:
+            logger.error("Embedding API error", error=str(e), model=embed_model)
             raise
 
     # --- Streaming methods (Phases 2-4) ---
