@@ -102,6 +102,27 @@ class ConfigurationError(LLMError):
     pass
 
 
+class EmbeddingNotSupportedError(ProviderError):
+    """Raised when a provider does not support embeddings (e.g. Anthropic, Moonshot)."""
+
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Embedding types
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EmbeddingResponse:
+    """Response from an embedding call."""
+
+    embeddings: list[list[float]]
+    model: str
+    usage: dict[str, int] | None = None
+    dimensions: int = 0
+
+
 @dataclass
 class LLMMessage:
     """A single message in a conversation."""
@@ -304,6 +325,11 @@ class LLMProvider:
             )
         return result
 
+    @property
+    def supports_embeddings(self) -> bool:
+        """Whether this provider supports text embeddings."""
+        return False
+
     async def chat(self, messages: list[LLMMessage], tools: list | None = None, **kwargs) -> LLMResponse:
         """Send messages to the LLM and get a response."""
         raise NotImplementedError
@@ -311,3 +337,11 @@ class LLMProvider:
     async def stream(self, messages: list[LLMMessage], tools: list | None = None, **kwargs):
         """Stream LLMStreamChunk from the LLM."""
         raise NotImplementedError
+
+    async def embed(self, text: str, model: str | None = None, **kwargs) -> EmbeddingResponse:
+        """Generate embedding for a single text. Raises EmbeddingNotSupportedError if not supported."""
+        raise EmbeddingNotSupportedError(f"{self.__class__.__name__} does not support embeddings.")
+
+    async def embed_batch(self, texts: list[str], model: str | None = None, **kwargs) -> EmbeddingResponse:
+        """Generate embeddings for multiple texts. Raises EmbeddingNotSupportedError if not supported."""
+        raise EmbeddingNotSupportedError(f"{self.__class__.__name__} does not support embeddings.")
