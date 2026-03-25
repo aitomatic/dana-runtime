@@ -36,3 +36,6 @@ class OpenAIProvider(OpenAICompatibleProvider):
         # Check for use_responses_api config flag
         provider_config = config_manager.get_provider_config("openai")
         self._use_responses_api = provider_config.get("use_responses_api") if provider_config else None
+
+        # Embedding support — resolve model from config or default
+        self.embedding_model = (provider_config.get("default_embedding_model") if provider_config else None) or "text-embedding-3-small"

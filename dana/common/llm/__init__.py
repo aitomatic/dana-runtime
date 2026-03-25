@@ -1,7 +1,8 @@
 """Adana LLM Library - Public API."""
 
+from .embedder import Embedder
 from .llm import LLM
-from .types import LLMMessage, LLMResponse, LLMStreamChunk, ProviderError
+from .types import EmbeddingNotSupportedError, EmbeddingResponse, LLMMessage, LLMResponse, LLMStreamChunk, ProviderError
 
 
 # Debug logging functions
@@ -21,6 +22,9 @@ try:
         return get_debug_logger().get_log_stats()
 
     __all__ = [
+        "Embedder",
+        "EmbeddingNotSupportedError",
+        "EmbeddingResponse",
         "LLM",
         "LLMMessage",
         "LLMResponse",
@@ -46,6 +50,9 @@ except ImportError:
         return {"error": "Debug logging not available"}
 
     __all__ = [
+        "Embedder",
+        "EmbeddingNotSupportedError",
+        "EmbeddingResponse",
         "LLM",
         "LLMMessage",
         "LLMResponse",

@@ -13,7 +13,17 @@ import httpx
 import structlog
 
 from ...config import config_manager
-from ..types import LLMMessage, LLMProvider, LLMResponse, LLMStreamChunk, LLMTimeoutError, is_multimodal_content, unsupported_placeholder
+from ..types import (
+    EmbeddingNotSupportedError,
+    EmbeddingResponse,
+    LLMMessage,
+    LLMProvider,
+    LLMResponse,
+    LLMStreamChunk,
+    LLMTimeoutError,
+    is_multimodal_content,
+    unsupported_placeholder,
+)
 
 
 logger = structlog.get_logger()
@@ -59,6 +69,10 @@ class GeminiProvider(LLMProvider):
             api_key=self.api_key,
             http_options=genai_types.HttpOptions(timeout=self.DEFAULT_TIMEOUT_SECONDS * 1000),
         )
+
+        # Embedding support
+        provider_config = config_manager.get_provider_config("gemini")
+        self.embedding_model = (provider_config.get("default_embedding_model") if provider_config else None) or "gemini-embedding-001"
 
     def convert_multimodal_content(self, blocks: list[dict]) -> list:
         """Convert canonical blocks to Gemini Part objects."""
@@ -292,6 +306,40 @@ class GeminiProvider(LLMProvider):
             raise LLMTimeoutError(f"Gemini stream timeout: {e}") from e
         except Exception as e:
             logger.error("Gemini stream error", error=str(e))
+            raise
+
+    # --- Embedding methods ---
+
+    @property
+    def supports_embeddings(self) -> bool:
+        return self.embedding_model is not None
+
+    async def embed(self, text: str, model: str | None = None, **kwargs) -> EmbeddingResponse:
+        """Generate embedding for a single text."""
+        return await self.embed_batch([text], model=model, **kwargs)
+
+    async def embed_batch(self, texts: list[str], model: str | None = None, **kwargs) -> EmbeddingResponse:
+        """Generate embeddings for multiple texts using Gemini embedding API."""
+        if not self.supports_embeddings:
+            raise EmbeddingNotSupportedError(f"{self.__class__.__name__} does not support embeddings.")
+
+        embed_model = model or self.embedding_model or "text-embedding-004"
+        try:
+            # google-genai SDK: embed_content accepts a list of texts
+            response = await self.client.aio.models.embed_content(
+                model=embed_model,
+                contents=texts,
+            )
+            embeddings = [list(emb.values) for emb in (response.embeddings or []) if emb.values]
+            dimensions = len(embeddings[0]) if embeddings else 0
+            return EmbeddingResponse(
+                embeddings=embeddings,
+                model=embed_model,
+                usage=None,  # Gemini embed API doesn't return token usage
+                dimensions=dimensions,
+            )
+        except Exception as e:
+            logger.error("Gemini embedding API error", error=str(e), model=embed_model)
             raise
 
     @staticmethod
