@@ -4,7 +4,7 @@ from openai import AsyncAzureOpenAI
 import structlog
 
 from ...config import config_manager
-from .openai_compatible_base import OpenAICompatibleProvider
+from .openai_compatible_base import OpenAICompatibleProvider, make_logging_http_client
 
 
 logger = structlog.get_logger()
@@ -48,6 +48,7 @@ class AzureProvider(OpenAICompatibleProvider):
             api_key=self.api_key,
             azure_endpoint=azure_endpoint,
             api_version=self.api_version,
+            http_client=make_logging_http_client(self.DEFAULT_TIMEOUT_SECONDS),
         )
 
         # Check for use_responses_api config flag

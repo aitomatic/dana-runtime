@@ -254,7 +254,14 @@ class STARAgentStreamingMixin:
                 trace_inputs = {"trace_inputs": trace_outputs.get("trace_outputs", {})}
 
             except Exception as exc:
-                logger.error("Error in aquery_stream", error=str(exc))
+                from dana.core.llm.llm_caller import is_transient_llm_error
+
+                logger.error(
+                    "Error in aquery_stream (transient=%s): %s",
+                    is_transient_llm_error(exc),
+                    exc,
+                    exc_info=True,
+                )
                 yield StreamEvent(
                     event_type=StreamEventType.ERROR,
                     data=str(exc),
