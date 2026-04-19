@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 import httpx
-from openai import APITimeoutError
+from openai import APIConnectionError, APITimeoutError
 import structlog
 
 from ..types import (
@@ -51,6 +51,32 @@ MODEL_RESTRICTIONS: dict[str, dict] = {
 
 # Model prefixes that default to Responses API
 RESPONSES_API_PREFIXES = ("gpt-5", "o3-", "o4-", "o3", "o4")
+
+
+def make_logging_http_client(timeout_seconds: int) -> httpx.AsyncClient:
+    """Build an ``httpx.AsyncClient`` with request/response hooks.
+
+    The OpenAI SDK retries failed requests internally (default ``max_retries=2``).
+    Without these hooks those retry attempts are invisible — a single user-facing
+    "Connection error." can hide ~7+ minutes of silent retrying. Logging each
+    HTTP request surfaces the retry sequence in normal logs.
+    """
+
+    async def _on_request(request: httpx.Request) -> None:
+        logger.info("LLM HTTP request", method=request.method, url=str(request.url))
+
+    async def _on_response(response: httpx.Response) -> None:
+        if response.status_code >= 400:
+            logger.warning(
+                "LLM HTTP non-2xx response",
+                status=response.status_code,
+                url=str(response.request.url),
+            )
+
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout_seconds),
+        event_hooks={"request": [_on_request], "response": [_on_response]},
+    )
 
 
 class OpenAICompatibleProvider(LLMProvider):
@@ -289,8 +315,18 @@ class OpenAICompatibleProvider(LLMProvider):
 
         except (APITimeoutError, httpx.TimeoutException) as e:
             raise LLMTimeoutError(f"OpenAI-compatible API timeout: {e}") from e
+        except APIConnectionError as e:
+            # Network failure — surface explicitly so it's not buried under a generic
+            # "OpenAI-compatible API error" line. Classified transient by LLMCaller.
+            logger.error(
+                "OpenAI-compatible API connection error",
+                error=str(e),
+                error_type=type(e).__name__,
+                exc_info=True,
+            )
+            raise
         except Exception as e:
-            logger.error("OpenAI-compatible API error", error=str(e))
+            logger.error("OpenAI-compatible API error", error=str(e), error_type=type(e).__name__, exc_info=True)
             raise
 
     # --- Embedding methods ---
@@ -564,6 +600,15 @@ class OpenAICompatibleProvider(LLMProvider):
                     yield chunk
         except (APITimeoutError, httpx.TimeoutException) as e:
             raise LLMTimeoutError(f"OpenAI-compatible stream timeout: {e}") from e
+        except APIConnectionError as e:
+            logger.error(
+                "OpenAI-compatible stream connection error",
+                model=self.model,
+                error=str(e),
+                error_type=type(e).__name__,
+                exc_info=True,
+            )
+            raise
         except Exception as e:
-            logger.error("Stream error", model=self.model, error=str(e))
+            logger.error("Stream error", model=self.model, error=str(e), error_type=type(e).__name__, exc_info=True)
             raise

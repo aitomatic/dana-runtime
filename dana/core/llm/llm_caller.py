@@ -32,8 +32,31 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
-# Keywords that indicate a transient (retriable) provider error
-_TRANSIENT_KEYWORDS = ("rate limit", "timeout", "5xx", "503", "502", "429", "overloaded", "down", "unavailable", "unreachable")
+# Keywords that indicate a transient (retriable) provider error.
+# "connection" matches openai.APIConnectionError → wrapped as ProviderError("...: Connection error.").
+_TRANSIENT_KEYWORDS = (
+    "rate limit",
+    "timeout",
+    "5xx",
+    "503",
+    "502",
+    "429",
+    "overloaded",
+    "down",
+    "unavailable",
+    "unreachable",
+    "connection",
+)
+
+# OpenAI SDK exception class names that indicate transient network failures.
+# Checked via class-name match to avoid importing openai here (keeps llm_caller provider-agnostic).
+_TRANSIENT_OPENAI_EXC_NAMES = ("APIConnectionError", "APIConnectionTimeoutError")
+
+
+def is_transient_llm_error(exc: BaseException) -> bool:
+    """Module-level helper so other layers (e.g. STAR loop) can classify errors
+    using the same rules as :class:`LLMCaller`."""
+    return LLMCaller._is_transient_error(exc)
 
 
 @dataclass
@@ -118,17 +141,21 @@ class LLMCaller:
 
     @observable
     def call_llm(self, messages: list[LLMMessage]) -> LLMResponse:
-        """Synchronous LLM call. Returns an :class:`LLMResponse`."""
-        if self._fallback_providers:
-            return self._call_with_failover(messages)
-        return self._invoke_llm_sync(self._resolve_llm(), messages)
+        """Synchronous LLM call with retry + exponential backoff.
+
+        Retry always runs for transient errors on the primary provider.
+        Failover only runs when ``fallback_providers`` is configured.
+        """
+        return self._call_with_failover(messages)
 
     @observable
     async def call_llm_async(self, messages: list[LLMMessage]) -> LLMResponse:
-        """Asynchronous LLM call. Returns an :class:`LLMResponse`."""
-        if self._fallback_providers:
-            return await self._call_with_failover_async(messages)
-        return await self._invoke_llm_async(self._resolve_llm(), messages)
+        """Asynchronous LLM call with retry + exponential backoff.
+
+        Retry always runs for transient errors on the primary provider.
+        Failover only runs when ``fallback_providers`` is configured.
+        """
+        return await self._call_with_failover_async(messages)
 
     async def call_llm_stream(self, messages: list[LLMMessage]) -> AsyncIterator[LLMStreamChunk]:
         """Stream LLM response, yielding typed LLMStreamChunk objects.
@@ -154,7 +181,7 @@ class LLMCaller:
     # ------------------------------------------------------------------
 
     def _call_with_failover(self, messages: list[LLMMessage]) -> LLMResponse:
-        """Sync call with retry + exponential backoff + provider failover."""
+        """Sync call with retry + exponential backoff + optional provider failover."""
         providers: list[ProviderConfig | None] = [None, *(self._fallback_providers or [])]
         last_exc: Exception | None = None
 
@@ -171,15 +198,31 @@ class LLMCaller:
                     last_exc = exc
                     if attempt < self._max_retries:
                         delay = self._base_delay * (2**attempt)
-                        logger.warning("llm_retry", provider=provider_label, attempt=attempt + 1, delay=delay, error=str(exc))
+                        logger.warning(
+                            "llm_retry",
+                            provider=provider_label,
+                            attempt=attempt + 1,
+                            max_attempts=self._max_retries + 1,
+                            delay=delay,
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                        )
                         time.sleep(delay)
+                    elif self._fallback_providers:
+                        logger.warning("llm_failover", from_provider=provider_label, error_type=type(exc).__name__, error=str(exc))
                     else:
-                        logger.warning("llm_failover", from_provider=provider_label, error=str(exc))
+                        logger.error(
+                            "llm_retries_exhausted",
+                            provider=provider_label,
+                            attempts=self._max_retries + 1,
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                        )
 
         raise last_exc  # type: ignore[misc]
 
     async def _call_with_failover_async(self, messages: list[LLMMessage]) -> LLMResponse:
-        """Async call with retry + exponential backoff + provider failover."""
+        """Async call with retry + exponential backoff + optional provider failover."""
         import asyncio
 
         providers: list[ProviderConfig | None] = [None, *(self._fallback_providers or [])]
@@ -198,10 +241,26 @@ class LLMCaller:
                     last_exc = exc
                     if attempt < self._max_retries:
                         delay = self._base_delay * (2**attempt)
-                        logger.warning("llm_retry", provider=provider_label, attempt=attempt + 1, delay=delay, error=str(exc))
+                        logger.warning(
+                            "llm_retry",
+                            provider=provider_label,
+                            attempt=attempt + 1,
+                            max_attempts=self._max_retries + 1,
+                            delay=delay,
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                        )
                         await asyncio.sleep(delay)
+                    elif self._fallback_providers:
+                        logger.warning("llm_failover", from_provider=provider_label, error_type=type(exc).__name__, error=str(exc))
                     else:
-                        logger.warning("llm_failover", from_provider=provider_label, error=str(exc))
+                        logger.error(
+                            "llm_retries_exhausted",
+                            provider=provider_label,
+                            attempts=self._max_retries + 1,
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                        )
 
         raise last_exc  # type: ignore[misc]
 
@@ -238,7 +297,7 @@ class LLMCaller:
         )
 
     @staticmethod
-    def _is_transient_error(exc: Exception) -> bool:
+    def _is_transient_error(exc: BaseException) -> bool:
         """Return True if the error is transient and should trigger a retry."""
         if isinstance(exc, ConfigurationError):
             return False
@@ -247,6 +306,15 @@ class LLMCaller:
             return True
         if isinstance(exc, TimeoutError | ConnectionError):
             return True
+        # Walk the __cause__ chain to detect openai.APIConnectionError without
+        # importing openai here (the SDK exception is preserved via `raise ... from e`).
+        cur: BaseException | None = exc
+        for _ in range(5):
+            if cur is None:
+                break
+            if type(cur).__name__ in _TRANSIENT_OPENAI_EXC_NAMES:
+                return True
+            cur = cur.__cause__
         if isinstance(exc, ProviderError):
             msg = str(exc).lower()
             return any(kw in msg for kw in _TRANSIENT_KEYWORDS)
