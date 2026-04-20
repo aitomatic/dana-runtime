@@ -204,3 +204,54 @@ def test_reload_rehydrates_active_snapshot_so_next_save_does_not_roll(tmp_path):
     folder = _session_folder(agent)
     snapshots = sorted(folder.glob("timeline-after-compress-*.json"))
     assert len(snapshots) == 1, "reload must not roll a new snapshot without a fresh compression"
+
+
+def test_resume_via_load_from_entries_adopts_newest_snapshot_on_save(tmp_path):
+    """Regression: resume through ``load_from_entries`` (bypassing read_since)
+    must not clobber ``timeline.json`` with post-compression state. The save
+    side adopts the newest existing ``timeline-after-compress-*.json``.
+
+    This mirrors the Honeywell Django caller which does:
+        timeline.load_from_entries(session_entries)   # no native_messages
+    after reading entries via the snapshot-aware repository. Prior to the fix,
+    the resumed timeline forgot about the snapshot and overwrote timeline.json
+    on every save.
+    """
+    agent = _Agent(str(tmp_path))
+    tl = _make_timeline(agent)
+    _add_entry(tl, TimelineEntryType.USER_MESSAGE, "u1")
+    tl.save(agent._session_id)
+    pre_compress_timeline_json = (_session_folder(agent) / "timeline.json").read_text()
+
+    # Simulate a compression — roll the first snapshot.
+    tl._last_compression_at = datetime(2026, 4, 20, 13, 54, 13)
+    _add_entry(tl, TimelineEntryType.USER_MESSAGE, "u2-post-compress")
+    tl.save(agent._session_id)
+
+    folder = _session_folder(agent)
+    snapshot_before = folder / "timeline-after-compress-20260420T135413.json"
+    assert snapshot_before.exists()
+
+    # Fresh timeline instance, resume ONLY through load_from_entries (no read_since).
+    tl2 = _make_timeline(agent)
+    # Read entries off disk ourselves (mimics the Honeywell caller reading via
+    # LocalTimelineRepository.read_session_entries which is snapshot-aware).
+    entries = list(tl2._repository.read_session_entries(agent._session_id))
+    tl2.load_from_entries(entries)
+    assert len(tl2.timeline) >= 2
+
+    # Add a new entry after resume and save.
+    _add_entry(tl2, TimelineEntryType.AGENT_RESPONSE, "a3-after-resume")
+    tl2.save(agent._session_id)
+
+    # The new entry must land in the snapshot, not a stale timeline.json.
+    with snapshot_before.open() as f:
+        snap_data = json.load(f)
+    contents = {e["content"] for e in snap_data["entries"]}
+    assert "a3-after-resume" in contents, "post-resume save must target the latest snapshot, not timeline.json"
+
+    # No new snapshot should roll without a fresh compression.
+    assert sorted(folder.glob("timeline-after-compress-*.json")) == [snapshot_before]
+
+    # timeline.json stays frozen at its pre-compression state.
+    assert (folder / "timeline.json").read_text() == pre_compress_timeline_json

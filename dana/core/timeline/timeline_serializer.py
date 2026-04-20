@@ -230,6 +230,15 @@ class TimelineSerializerMixin:
 
         Mutates ``_active_snapshot_path`` / ``_active_snapshot_compression_at``
         when rolling forward.
+
+        Snapshot adoption on resume: if no active snapshot is tracked yet but
+        the session folder already contains one or more
+        ``timeline-after-compress-*.json`` files, adopt the newest as the write
+        target. Without this, callers that resume via ``load_from_entries``
+        (bypassing ``read_since``'s rehydration) would clobber ``timeline.json``
+        with post-compression state, leaving the compressed snapshot frozen.
+        Symmetric with ``LocalTimelineRepository.read_session_entries`` which
+        already prefers newest snapshot for reads.
         """
         # First compression since last save → roll a new snapshot file.
         if self._last_compression_at is not None and self._last_compression_at != self._active_snapshot_compression_at:
@@ -241,6 +250,17 @@ class TimelineSerializerMixin:
                 path=str(self._active_snapshot_path),
                 compression_at=self._last_compression_at.isoformat(),
             )
+
+        # Resume path: adopt newest existing snapshot if no active one tracked.
+        if self._active_snapshot_path is None:
+            existing = sorted(session_folder.glob("timeline-after-compress-*.json"))
+            if existing:
+                self._active_snapshot_path = existing[-1]
+                self._active_snapshot_compression_at = self._extract_timestamp_from_snapshot_name(existing[-1].name)
+                logger.info(
+                    "snapshot_adopted_on_resume",
+                    path=str(self._active_snapshot_path),
+                )
 
         if self._active_snapshot_path is not None:
             return self._active_snapshot_path
