@@ -162,11 +162,15 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
 
         # Initialize timeline: use CompressedTimeline by default unless explicitly injected
         # compress_timeline=False disables LLM-based compression (behaves like plain Timeline)
+        # system/tools callbacks fold system-prompt + tools-schema size into needs_compression()
+        # estimate. Both use the existing len(str)//4 heuristic.
         self._timeline = CompressedTimeline(
             max_tokens_until_compression=max_context_tokens,
             agent=self,
             repository_factory=self._repository_factory,
             compression_enabled=compress_timeline,
+            system_tokens_fn=self._estimate_system_prompt_tokens,
+            tools_tokens_fn=self._estimate_tools_tokens,
         )
 
         # Initialize EventLog API (only if observer AND codec provided)
@@ -474,6 +478,31 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
     # TIMELINE COMPRESSION
     # ============================================================================
 
+    def _estimate_system_prompt_tokens(self) -> int:
+        """Return char/4 estimate of system prompt size for compression trigger."""
+        try:
+            prompt = self.system_prompt
+        except Exception:
+            return 0
+        if not prompt:
+            return 0
+        return len(str(prompt)) // 4
+
+    def _estimate_tools_tokens(self) -> int:
+        """Return char/4 estimate of tools-schema size for compression trigger."""
+        try:
+            tools = None
+            runtime = getattr(self, "_runtime", None)
+            if runtime is not None and hasattr(runtime, "get_tools"):
+                tools = runtime.get_tools(self)
+            if not tools:
+                return 0
+            import json as _json
+
+            return len(_json.dumps(tools, default=str)) // 4
+        except Exception:
+            return 0
+
     def _maybe_compress_timeline(self, timeline: Timeline) -> None:
         """
         Compress timeline if it exceeds the configured threshold.
@@ -513,6 +542,12 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                     summary_length=len(summary),
                 )
         except Exception as e:
+            # PTL must propagate so the caller-layer (llm_caller.py) can trigger
+            # reactive_compact + retry — don't let this summary path swallow it.
+            from dana.common.llm.types import PromptTooLongError
+
+            if isinstance(e, PromptTooLongError):
+                raise
             # Don't fail the main operation if compression fails
             logger.warning("Timeline compression failed", error=str(e))
 
@@ -549,6 +584,10 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                     summary_length=len(summary),
                 )
         except Exception as e:
+            from dana.common.llm.types import PromptTooLongError
+
+            if isinstance(e, PromptTooLongError):
+                raise
             logger.warning("Timeline compression failed", error=str(e))
 
     def _extract_compression_summary(self, content: str) -> str:

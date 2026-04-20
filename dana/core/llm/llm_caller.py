@@ -16,12 +16,14 @@ import structlog
 
 from dana.common.llm.llm import LLM
 from dana.common.llm.types import (
+    CompactCircuitOpenError,
     ConfigurationError,
     LLMError,
     LLMMessage,
     LLMResponse,
     LLMStreamChunk,
     LLMTimeoutError,
+    PromptTooLongError,
     ProviderError,
 )
 from dana.common.observable import observable
@@ -57,6 +59,28 @@ def is_transient_llm_error(exc: BaseException) -> bool:
     """Module-level helper so other layers (e.g. STAR loop) can classify errors
     using the same rules as :class:`LLMCaller`."""
     return LLMCaller._is_transient_error(exc)
+
+
+def _resolve_timeline(agent: Any | None):
+    """Return the agent's timeline if it exposes `reactive_compact`, else None."""
+    if agent is None:
+        return None
+    tl = getattr(agent, "_timeline", None)
+    if tl is None or not hasattr(tl, "reactive_compact"):
+        return None
+    return tl
+
+
+def _reactive_enabled(timeline: Any) -> bool:
+    """Kill switch: env `DANA_DISABLE_REACTIVE_COMPACT=1` OR config flag False."""
+    import os
+
+    if os.getenv("DANA_DISABLE_REACTIVE_COMPACT") == "1":
+        return False
+    cfg = getattr(timeline, "_compressed_config", None)
+    if cfg is None:
+        return False
+    return bool(getattr(cfg, "enable_reactive_compact", True))
 
 
 @dataclass
@@ -269,32 +293,103 @@ class LLMCaller:
     # ------------------------------------------------------------------
 
     def _invoke_llm_sync(self, llm: LLM, messages: list[LLMMessage]) -> LLMResponse:
-        """Execute a single synchronous LLM chat call."""
+        """Execute a single synchronous LLM chat call with PTL reactive retry.
+
+        On `PromptTooLongError`, calls `timeline.reactive_compact(attempt)` and
+        retries up to 3 times with exponential backoff (1s, 3s). After 3
+        failures, `CompactCircuitOpenError` is raised. Kill switch via
+        `DANA_DISABLE_REACTIVE_COMPACT=1` or `timeline.config.enable_reactive_compact=False`.
+        """
         agent = self._agent_getter()
         tools = self._native_tools_getter() or None
-        return llm.chat_response_sync(
-            messages,
-            agent_id=agent.object_id if agent else None,
-            agent_type=agent.agent_type if agent else None,
-            temperature=self._temperature,
-            max_tokens=self._max_tokens,
-            tools=tools,
-            json_mode=self._json_mode,
-        )
+
+        def _do_call() -> LLMResponse:
+            return llm.chat_response_sync(
+                messages,
+                agent_id=agent.object_id if agent else None,
+                agent_type=agent.agent_type if agent else None,
+                temperature=self._temperature,
+                max_tokens=self._max_tokens,
+                tools=tools,
+                json_mode=self._json_mode,
+            )
+
+        timeline = _resolve_timeline(agent)
+        if timeline is None or not _reactive_enabled(timeline):
+            return _do_call()
+
+        backoff = {1: 1.0, 2: 3.0}
+        last_exc: PromptTooLongError | None = None
+        for attempt in range(1, 4):
+            try:
+                return _do_call()
+            except PromptTooLongError as e:
+                last_exc = e
+                logger.warning(
+                    "prompt_too_long_reactive_compact",
+                    attempt=attempt,
+                    error=str(e),
+                )
+                try:
+                    timeline.reactive_compact(attempt)
+                except CompactCircuitOpenError:
+                    raise
+                if attempt < 3:
+                    time.sleep(backoff.get(attempt, 0))
+        # All 3 attempts exhausted — open circuit and surface.
+        timeline._consecutive_compact_failures = max(timeline._consecutive_compact_failures, 3)
+        timeline._compaction_disabled = True
+        from datetime import datetime as _dt
+
+        timeline._circuit_opened_at = _dt.now()
+        raise CompactCircuitOpenError(f"PTL retry exhausted after 3 attempts; last: {last_exc}") from last_exc
 
     async def _invoke_llm_async(self, llm: LLM, messages: list[LLMMessage]) -> LLMResponse:
-        """Execute a single asynchronous LLM chat call."""
+        """Async version of `_invoke_llm_sync` with PTL reactive retry."""
+        import asyncio
+
         agent = self._agent_getter()
         tools = self._native_tools_getter() or None
-        return await llm.chat_response(
-            messages,
-            agent_id=agent.object_id if agent else None,
-            agent_type=agent.agent_type if agent else None,
-            temperature=self._temperature,
-            max_tokens=self._max_tokens,
-            tools=tools,
-            json_mode=self._json_mode,
-        )
+
+        async def _do_call() -> LLMResponse:
+            return await llm.chat_response(
+                messages,
+                agent_id=agent.object_id if agent else None,
+                agent_type=agent.agent_type if agent else None,
+                temperature=self._temperature,
+                max_tokens=self._max_tokens,
+                tools=tools,
+                json_mode=self._json_mode,
+            )
+
+        timeline = _resolve_timeline(agent)
+        if timeline is None or not _reactive_enabled(timeline):
+            return await _do_call()
+
+        backoff = {1: 1.0, 2: 3.0}
+        last_exc: PromptTooLongError | None = None
+        for attempt in range(1, 4):
+            try:
+                return await _do_call()
+            except PromptTooLongError as e:
+                last_exc = e
+                logger.warning(
+                    "prompt_too_long_reactive_compact",
+                    attempt=attempt,
+                    error=str(e),
+                )
+                try:
+                    timeline.reactive_compact(attempt)
+                except CompactCircuitOpenError:
+                    raise
+                if attempt < 3:
+                    await asyncio.sleep(backoff.get(attempt, 0))
+        timeline._consecutive_compact_failures = max(timeline._consecutive_compact_failures, 3)
+        timeline._compaction_disabled = True
+        from datetime import datetime as _dt
+
+        timeline._circuit_opened_at = _dt.now()
+        raise CompactCircuitOpenError(f"PTL retry exhausted after 3 attempts; last: {last_exc}") from last_exc
 
     @staticmethod
     def _is_transient_error(exc: BaseException) -> bool:

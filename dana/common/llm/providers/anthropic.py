@@ -350,6 +350,22 @@ class AnthropicProvider(LLMProvider):
 
         except anthropic.APITimeoutError as e:
             raise LLMTimeoutError(f"Anthropic API timeout: {e}") from e
+        except anthropic.BadRequestError as e:
+            # Map Anthropic prompt-too-long to typed PromptTooLongError so the
+            # caller-layer (llm_caller.py) can trigger reactive_compact + retry.
+            from dana.common.llm.types import PromptTooLongError
+
+            err_body: dict = {}
+            try:
+                err_body = (e.response.json() or {}).get("error", {}) if hasattr(e, "response") else {}
+            except Exception:
+                err_body = {}
+            err_type = err_body.get("type")
+            err_msg = err_body.get("message", "") or str(e)
+            if err_type == "invalid_request_error" and "prompt is too long" in err_msg.lower():
+                raise PromptTooLongError(f"Anthropic: {err_msg}") from e
+            logger.error("Anthropic API error", error=str(e))
+            raise
         except Exception as e:
             logger.error("Anthropic API error", error=str(e))
             raise

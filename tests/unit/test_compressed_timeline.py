@@ -59,13 +59,19 @@ class TestCompressedTimelineConfig:
 class TestCompressedTimelineInitialization:
     """Test CompressedTimeline initialization."""
 
-    def test_initialization_with_defaults(self):
-        """Test initialization with default parameters."""
+    def test_initialization_with_defaults(self, monkeypatch):
+        """Default timeline uses env-resolved trigger (150k) when no explicit value."""
+        from dana.core.timeline import compact_trigger as ct
+
+        monkeypatch.delenv("DANA_COMPACT_TRIGGER_TOKENS", raising=False)
+        ct._reset_cache_for_tests()
         defaults = CompressedTimelineConfig()
         timeline = CompressedTimeline()
-        assert timeline.max_tokens_until_compression == defaults.max_tokens_until_compression
+        # Trigger now comes from env resolver (150k) rather than dataclass default (80k).
+        assert timeline.max_tokens_until_compression == ct.DEFAULT_TRIGGER
         assert timeline.max_recent_entries_to_keep == defaults.max_recent_entries_to_keep
-        assert timeline.cutoff_when_token_reach == int(0.3 * defaults.max_tokens_until_compression)
+        assert timeline.cutoff_when_token_reach == int(0.3 * ct.DEFAULT_TRIGGER)
+        ct._reset_cache_for_tests()
 
     def test_initialization_with_custom_parameters(self):
         """Test initialization with custom parameters."""

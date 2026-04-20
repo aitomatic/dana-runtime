@@ -85,6 +85,29 @@ class ProviderError(LLMError):
     pass
 
 
+class PromptTooLongError(ProviderError):
+    """Raised when a provider signals the prompt exceeds its context window.
+
+    Providers map their native token-limit error to this type (Anthropic
+    `BadRequestError` with "prompt is too long"; OpenAI-compat
+    `APIStatusError` with `error.code='context_length_exceeded'`). Stays
+    OUT of LLMCaller `_TRANSIENT_KEYWORDS` so failover never retries it —
+    the caller-layer catches, calls `timeline.reactive_compact`, and retries.
+    """
+
+    pass
+
+
+class CompactCircuitOpenError(LLMError):
+    """Raised when `reactive_compact` exhausts its retry budget.
+
+    Marks a session's compaction subsystem as temporarily disabled;
+    recovery via time-based cooldown + half-open probe.
+    """
+
+    pass
+
+
 class LLMTimeoutError(ProviderError):
     """Exception raised when an LLM API call times out.
 

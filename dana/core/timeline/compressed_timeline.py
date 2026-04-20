@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from structlog import get_logger
 
 from dana.common.llm.types import LLMMessage
+from dana.core.timeline.compact_trigger import resolve_trigger_tokens
 from dana.core.timeline.compression_engine import CompressionMixin
 from dana.core.timeline.native_message import (
     COMPRESSED_CONTEXT_KEY,
@@ -80,6 +81,16 @@ class CompressedTimelineConfig(TimelineConfig):
     # Set to 0 or None to use the default calculation
     cutoff_when_token_reach: int | None = None
 
+    # Phase 2 (P6) — cheap shrink: stub old tool_result content before full
+    # summary. Off by default (opt-in).
+    enable_cheap_shrink_tool_results: bool = False
+
+    # Number of most-recent entries to exclude from shrink eligibility.
+    cheap_shrink_keep_recent: int = 10
+
+    # Phase 3 (P2) — reactive compaction kill switch.
+    enable_reactive_compact: bool = True
+
     def __post_init__(self) -> None:
         """Calculate default cutoff if not specified."""
         if self.cutoff_when_token_reach is None or self.cutoff_when_token_reach == 0:
@@ -113,7 +124,7 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
 
     def __init__(
         self,
-        max_tokens_until_compression: int = 80000,
+        max_tokens_until_compression: int | None = None,
         max_recent_entries_to_keep: int = 20,
         cutoff_when_token_reach: int | None = None,
         agent: BaseAgent | None = None,
@@ -121,6 +132,8 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
         llm_call_fn: Callable[[str], str] | None = None,
         llm_call_async_fn: Callable[[str], Any] | None = None,
         compression_enabled: bool = True,
+        system_tokens_fn: Callable[[], int] | None = None,
+        tools_tokens_fn: Callable[[], int] | None = None,
     ):
         """
         Initialize the CompressedTimeline.
@@ -136,22 +149,32 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
             compression_enabled: Whether compression is enabled (default True).
                 Set to False to disable compression and behave like plain Timeline.
         """
+        # Resolve threshold: explicit value wins, else env-resolved trigger
+        # (keeps config int for downstream math; _explicit flag preserved for
+        # needs_compression() precedence).
+        explicit_trigger = max_tokens_until_compression
+        effective_trigger = explicit_trigger if explicit_trigger is not None else resolve_trigger_tokens()
+
         # Calculate cutoff if not specified
         if cutoff_when_token_reach is None or cutoff_when_token_reach == 0:
-            cutoff_when_token_reach = int(0.3 * max_tokens_until_compression)
+            cutoff_when_token_reach = int(0.3 * effective_trigger)
 
         # Create config
         self._compressed_config = CompressedTimelineConfig(
-            max_context_tokens=max_tokens_until_compression,
-            max_tokens_until_compression=max_tokens_until_compression,
+            max_context_tokens=effective_trigger,
+            max_tokens_until_compression=effective_trigger,
             max_recent_entries_to_keep=max_recent_entries_to_keep,
             cutoff_when_token_reach=cutoff_when_token_reach,
             compression_enabled=compression_enabled,
         )
 
+        # Track whether threshold was explicitly set so needs_compression()
+        # can prefer env at resolve time when caller deferred.
+        self._explicit_max_tokens_until_compression: int | None = explicit_trigger
+
         # Initialize parent
         super().__init__(
-            max_context_tokens=max_tokens_until_compression,
+            max_context_tokens=effective_trigger,
             agent=agent,
             repository_factory=repository_factory,
             config=self._compressed_config,
@@ -161,8 +184,25 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
         self._llm_call_fn = llm_call_fn
         self._llm_call_async_fn = llm_call_async_fn
 
+        # Optional token-count callbacks folded into needs_compression() estimate.
+        self._system_tokens_fn = system_tokens_fn
+        self._tools_tokens_fn = tools_tokens_fn
+
         # Internal storage for native message format
         self._native_messages: list[NativeMessage] = []
+
+        # Phase 2/3 — all mutators of compression state acquire this lock. A
+        # threading lock mirrors for sync paths that run off-loop.
+        import asyncio
+        import threading
+
+        self._compact_lock: asyncio.Lock = asyncio.Lock()
+        self._compact_sync_lock: threading.Lock = threading.Lock()
+
+        # Phase 3 — circuit breaker state.
+        self._consecutive_compact_failures: int = 0
+        self._compaction_disabled: bool = False
+        self._circuit_opened_at: datetime | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -182,6 +222,21 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
     def cutoff_when_token_reach(self) -> int:
         """Get token cutoff for recent entries."""
         return self._compressed_config.cutoff_when_token_reach or int(0.3 * self._compressed_config.max_tokens_until_compression)
+
+    # ------------------------------------------------------------------
+    # Token-count callback helper (used by needs_compression)
+    # ------------------------------------------------------------------
+
+    def _safe_call_tokens_fn(self, fn: Callable[[], int] | None) -> int:
+        """Invoke a tokens callback safely. Returns 0 on None / raise / invalid."""
+        if fn is None:
+            return 0
+        try:
+            v = fn()
+            return int(v) if v is not None and v >= 0 else 0
+        except Exception:
+            logger.debug("tokens callback raised; treating as 0", exc_info=True)
+            return 0
 
     # ------------------------------------------------------------------
     # LLM call function setters

@@ -1,0 +1,14 @@
+{
+  "candidates": [
+    {
+      "content": {"parts": [{"text": "partial truncated response..."}]},
+      "finish_reason": "MAX_TOKENS",
+      "index": 0
+    }
+  ],
+  "usage_metadata": {
+    "prompt_token_count": 1048576,
+    "candidates_token_count": 8192,
+    "total_token_count": 1056768
+  }
+}

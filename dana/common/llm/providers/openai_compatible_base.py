@@ -326,6 +326,27 @@ class OpenAICompatibleProvider(LLMProvider):
             )
             raise
         except Exception as e:
+            # Map OpenAI-compat context_length_exceeded to typed PromptTooLongError.
+            # Covers OpenAI, Azure, Moonshot uniformly.
+            try:
+                import openai as _openai
+
+                if isinstance(e, _openai.APIStatusError):
+                    from dana.common.llm.types import PromptTooLongError
+
+                    err_body: dict = {}
+                    try:
+                        resp = getattr(e, "response", None)
+                        if resp is not None and hasattr(resp, "json"):
+                            err_body = (resp.json() or {}).get("error", {}) or {}
+                    except Exception:
+                        err_body = {}
+                    err_code = err_body.get("code") or getattr(e, "code", "") or ""
+                    err_msg = err_body.get("message") or str(e)
+                    if err_code == "context_length_exceeded":
+                        raise PromptTooLongError(f"OpenAI-compat: {err_msg}") from e
+            except ImportError:
+                pass
             logger.error("OpenAI-compatible API error", error=str(e), error_type=type(e).__name__, exc_info=True)
             raise
 

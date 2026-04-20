@@ -251,6 +251,17 @@ class GeminiProvider(LLMProvider):
                 if fr:
                     finish_reason = str(fr)
 
+            # Gemini silently truncates over-budget prompts via MAX_TOKENS finish
+            # reason — there is no SDK PTL error. Best-effort WARNING log only;
+            # reactive_compact cannot run here (indistinguishable from output-limit
+            # truncation). Ops must tune DANA_COMPACT_TRIGGER_TOKENS conservatively.
+            if finish_reason and "MAX_TOKENS" in finish_reason:
+                logger.warning(
+                    "gemini_max_tokens_finish",
+                    model=self.model,
+                    note="may indicate context-window overflow; tune DANA_COMPACT_TRIGGER_TOKENS",
+                )
+
             return LLMResponse(
                 content=content,
                 model=self.model,
