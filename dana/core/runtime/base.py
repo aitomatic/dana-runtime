@@ -9,6 +9,7 @@ for different LLM providers.
 from __future__ import annotations
 
 from abc import ABC
+from collections.abc import Callable
 import inspect
 import json
 from typing import TYPE_CHECKING, Any
@@ -256,13 +257,28 @@ When you need to call tools, use the function calling API directly — do NOT in
             runtime_context=runtime_context,
         )
 
-    def call_llm(self, messages: list[LLMMessage]) -> LLMResponse:
-        """Sync LLM call. Delegates to LLMCaller (observable fires there)."""
-        return self._llm_caller.call_llm(messages)
+    def call_llm(
+        self,
+        messages: list[LLMMessage],
+        messages_fn: Callable[[], list[LLMMessage]] | None = None,
+    ) -> LLMResponse:
+        """Sync LLM call. Delegates to LLMCaller (observable fires there).
 
-    async def call_llm_async(self, messages: list[LLMMessage]) -> LLMResponse:
-        """Async LLM call. Delegates to LLMCaller (observable fires there)."""
-        return await self._llm_caller.call_llm_async(messages)
+        ``messages_fn`` is forwarded to :class:`LLMCaller` to rebuild messages
+        between PTL retries after ``reactive_compact`` (CRITICAL-1 fix).
+        """
+        return self._llm_caller.call_llm(messages, messages_fn=messages_fn)
+
+    async def call_llm_async(
+        self,
+        messages: list[LLMMessage],
+        messages_fn: Callable[[], list[LLMMessage]] | None = None,
+    ) -> LLMResponse:
+        """Async LLM call. Delegates to LLMCaller (observable fires there).
+
+        See :meth:`call_llm` for ``messages_fn`` semantics.
+        """
+        return await self._llm_caller.call_llm_async(messages, messages_fn=messages_fn)
 
     @observable
     def parse_response(self, response: LLMResponse) -> ParsedResponse:

@@ -204,6 +204,17 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
         self._compaction_disabled: bool = False
         self._circuit_opened_at: datetime | None = None
 
+        # Snapshot persistence (Phase 5 — "store uncompressed alongside compressed"):
+        # `_last_compression_at` is stamped by ``_apply_compression``. On the next
+        # ``save()``, the mixin detects a new compression event and rolls the
+        # active snapshot file. Until then saves keep updating the same file.
+        # ``timeline.json`` is written only until the first compression fires; after
+        # that, every save targets ``timeline-after-compress-{ISO-ts}.json``. Full
+        # audit retention — no rotation.
+        self._last_compression_at: datetime | None = None
+        self._active_snapshot_path: Any | None = None
+        self._active_snapshot_compression_at: datetime | None = None
+
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------

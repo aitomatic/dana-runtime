@@ -485,6 +485,12 @@ Respond with ONLY a JSON object containing the summary:
         """
         Format timeline entries for the compression prompt.
 
+        HIGH-1 fix: entries whose content was previously replaced by
+        ``SHRINK_STUB_CONTENT`` (from ``cheap_shrink_tool_results``) are
+        rendered as a compact identity-only marker rather than the literal
+        stub string. Summarizing the literal ``"[cleared for context budget]"``
+        produces vacuous summaries on reload after a prior shrink.
+
         Args:
             entries: List of entries to format
 
@@ -506,8 +512,16 @@ Respond with ONLY a JSON object containing the summary:
 
         formatted_parts = []
         for entry in entries:
-            # Truncate very long entries
             content = entry.content
+
+            # HIGH-1: skip or tag already-shrunk tool_result entries so the LLM
+            # doesn't produce a summary consisting of "the agent cleared tool
+            # results". Preserve call identity via tool_call_id when present.
+            if isinstance(content, str) and content == SHRINK_STUB_CONTENT:
+                tc_id = entry.tool_call_id or "unknown"
+                formatted_parts.append(f"[Tool result id={tc_id}: previously cleared — content unavailable]")
+                continue
+
             if isinstance(content, list):
                 # Multimodal content: extract text parts for compression
                 text_parts = [b.get("text", "") for b in content if isinstance(b, dict) and "text" in b]
@@ -685,6 +699,11 @@ Respond with ONLY a JSON object containing the summary:
         """
         compressed_count = len(entries_to_compress)
         compression_timestamp = datetime.now()
+
+        # Stamp so the next save() rolls the active snapshot to a new
+        # `timeline-after-compress-{ts}.json` file. See
+        # ``CompressedTimeline.save`` for the snapshot rollover logic.
+        self._last_compression_at = compression_timestamp
 
         # Calculate how many native messages to keep
         # We need to keep messages corresponding to entries_to_keep

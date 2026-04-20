@@ -326,6 +326,25 @@ class LocalTimelineRepository(LocalRepositoryMixin, TimelineRepositoryProtocol):
         """Return old codec-prefixed events path for backward-compat fallback reads."""
         return self._workspace_folder / self._get_legacy_relative_storage_path(self._agent) / "events"
 
+    @staticmethod
+    def _resolve_timeline_file_for_read(session_folder: Path) -> Path | None:
+        """Pick the timeline file to load for a session.
+
+        Preference order:
+          1. Newest ``timeline-after-compress-<ISO-ts>.json`` (lexicographic sort
+             is correct because ISO timestamps sort naturally).
+          2. ``timeline.json``.
+
+        Returns ``None`` if neither exists (caller handles legacy fallback).
+        """
+        if not session_folder.exists():
+            return None
+        snapshots = sorted(session_folder.glob("timeline-after-compress-*.json"))
+        if snapshots:
+            return snapshots[-1]
+        base = session_folder / "timeline.json"
+        return base if base.exists() else None
+
     def save(self, session_id: str, entries: list[TimelineEntry]) -> None:
         """
         Save timeline entries for a session.
@@ -355,6 +374,12 @@ class LocalTimelineRepository(LocalRepositoryMixin, TimelineRepositoryProtocol):
         """
         Read timeline entries for a specific session.
 
+        Snapshot-aware: if any ``timeline-after-compress-*.json`` files exist,
+        the newest (by filename — ISO timestamps sort lexicographically) is
+        preferred. Falls back to ``timeline.json`` and finally to the legacy
+        codec-prefixed path. This is the read counterpart of the snapshot
+        persistence written by ``CompressedTimeline.save``.
+
         Args:
             session_id: Session identifier
 
@@ -364,10 +389,10 @@ class LocalTimelineRepository(LocalRepositoryMixin, TimelineRepositoryProtocol):
         from dana.core.timeline.timeline import TimelineEntry
 
         session_folder = self._events_path / session_id
-        timeline_file = session_folder / "timeline.json"
+        timeline_file = self._resolve_timeline_file_for_read(session_folder)
 
-        # Backward-compat: fall back to legacy codec-prefixed path if new path doesn't exist
-        if not timeline_file.exists():
+        # Backward-compat: fall back to legacy codec-prefixed path if nothing in new folder
+        if timeline_file is None or not timeline_file.exists():
             legacy_folder = self._get_legacy_events_path() / session_id
             legacy_file = legacy_folder / "timeline.json"
             if legacy_file.exists():

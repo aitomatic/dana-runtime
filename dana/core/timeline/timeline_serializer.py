@@ -81,6 +81,12 @@ class TimelineSerializerMixin:
         """
         Try to load saved native_messages from the repository JSON file.
 
+        Snapshot-aware: prefers the newest ``timeline-after-compress-*.json``
+        if present, else ``timeline.json``. On successful load, also rehydrates
+        ``_active_snapshot_path`` / ``_active_snapshot_compression_at`` so that
+        subsequent saves within this process continue updating the same file
+        instead of rolling a new snapshot.
+
         Returns:
             True if native_messages were loaded, False otherwise.
         """
@@ -99,7 +105,19 @@ class TimelineSerializerMixin:
 
         events_path = self._repository._events_path
         session_folder = Path(events_path) / session_id
-        timeline_file = session_folder / "timeline.json"
+        if not session_folder.exists():
+            return False
+
+        # Prefer newest snapshot; fall back to timeline.json.
+        snapshots = sorted(session_folder.glob("timeline-after-compress-*.json"))
+        if snapshots:
+            timeline_file = snapshots[-1]
+            # Rehydrate snapshot state so subsequent saves keep writing to this file
+            # until the next compression rolls forward.
+            self._active_snapshot_path = timeline_file
+            self._active_snapshot_compression_at = self._extract_timestamp_from_snapshot_name(timeline_file.name)
+        else:
+            timeline_file = session_folder / "timeline.json"
 
         if not timeline_file.exists():
             return False
@@ -113,65 +131,120 @@ class TimelineSerializerMixin:
                 return False
 
             self._native_messages = [NativeMessage.from_dict(msg) for msg in native_data]
-            logger.info(f"Loaded {len(self._native_messages)} native messages from repository")
+            logger.info(
+                "native_messages_loaded",
+                file=timeline_file.name,
+                count=len(self._native_messages),
+                is_snapshot=bool(snapshots),
+            )
             return True
         except Exception as e:
             logger.warning(f"Failed to load native messages from repository: {e}")
             return False
 
+    @staticmethod
+    def _extract_timestamp_from_snapshot_name(name: str):
+        """Parse the timestamp out of ``timeline-after-compress-{ISO-ts}.json``.
+
+        Returns a ``datetime`` on success, or ``None`` on malformed input.
+        Loose parsing — best effort; consumers tolerate ``None``.
+        """
+        from datetime import datetime
+
+        prefix = "timeline-after-compress-"
+        suffix = ".json"
+        if not (name.startswith(prefix) and name.endswith(suffix)):
+            return None
+        raw = name[len(prefix) : -len(suffix)]
+        try:
+            return datetime.strptime(raw, "%Y%m%dT%H%M%S")
+        except ValueError:
+            return None
+
     def save(self: CompressedTimeline, session_id: str) -> None:
         """
-        Save timeline for a session, including native messages.
+        Save timeline for a session with snapshot-aware persistence.
 
-        This override extends the parent save to also persist the native messages
-        in the same JSON file. The native messages are stored in a separate
-        "native_messages" key for backward compatibility.
+        Snapshot rollover rules (Phase 5):
+          * Until the first compression fires, writes go to ``timeline.json``.
+          * When ``_apply_compression`` stamps ``_last_compression_at`` to a
+            new timestamp, the next ``save()`` rolls to a fresh file named
+            ``timeline-after-compress-{ISO-ts}.json``.
+          * Subsequent saves within the same compression generation update
+            that same snapshot file in place.
+          * Full audit retention — older snapshots are never deleted.
 
         Ephemeral entries (like CONTEXT) are excluded from persistence.
+        Native messages are persisted alongside entries in the same JSON
+        file under the ``native_messages`` key.
 
         Args:
             session_id: Session identifier
         """
         if self._repository is None:
             raise ValueError("Cannot save timeline: repository is None. Initialize Timeline with repository or agent.")
+        if not hasattr(self._repository, "_events_path"):
+            # Non-filesystem repository (e.g. in-memory) — fall back to the
+            # parent save and skip the snapshot logic, which is inherently
+            # path-based.
+            super().save(session_id)  # type: ignore[misc]
+            return
 
-        # Filter out ephemeral entries before saving
+        import json
+        from pathlib import Path
+
         persistent_entries = [e for e in self.timeline if not e.ephemeral]
-
-        # Filter out ephemeral native messages (those corresponding to CONTEXT entries)
         persistent_native_messages = [
             msg for msg in self._native_messages if not (msg.role == "system" and msg.metadata.get("ephemeral", False))
         ]
 
-        # Use the repository's save method for TimelineEntry
-        self._repository.save(session_id, persistent_entries)
+        events_path = self._repository._events_path
+        session_folder = Path(events_path) / session_id
+        session_folder.mkdir(parents=True, exist_ok=True)
 
-        # Now also save native messages to the same file
-        # We need to access the repository's internal path to update the JSON
-        if hasattr(self._repository, "_events_path"):
-            import json
-            from pathlib import Path
+        timeline_file = self._resolve_snapshot_write_path(session_folder)
 
-            events_path = self._repository._events_path
-            session_folder = Path(events_path) / session_id
-            timeline_file = session_folder / "timeline.json"
+        payload = {
+            "session_id": session_id,
+            "agent_id": getattr(self._agent, "object_id", None) if self._agent is not None else None,
+            "agent_type": getattr(self._agent, "agent_type", None) if self._agent is not None else None,
+            "entries": [e.to_dict() for e in persistent_entries],
+            "native_messages": [m.to_dict() for m in persistent_native_messages],
+        }
 
-            if timeline_file.exists():
-                # Read existing data and add native_messages
-                with open(timeline_file) as f:
-                    timeline_data = json.load(f)
-
-                # Add native messages to the saved data
-                timeline_data["native_messages"] = [msg.to_dict() for msg in persistent_native_messages]
-
-                # Write back
-                with open(timeline_file, "w") as f:
-                    json.dump(timeline_data, f, indent=2)
+        with open(timeline_file, "w") as f:
+            json.dump(payload, f, indent=2)
 
         logger.info(
-            f"Saved compressed timeline with {len(persistent_entries)} entries "
-            f"and {len(persistent_native_messages)} native messages for session {session_id}"
+            "compressed_timeline_saved",
+            session_id=session_id,
+            file=timeline_file.name,
+            entries=len(persistent_entries),
+            native_messages=len(persistent_native_messages),
+            snapshot=self._active_snapshot_path is not None,
         )
+
+    def _resolve_snapshot_write_path(self: CompressedTimeline, session_folder):
+        """Pick the target file for this save, rolling a new snapshot if a
+        compression has fired since the last save.
+
+        Mutates ``_active_snapshot_path`` / ``_active_snapshot_compression_at``
+        when rolling forward.
+        """
+        # First compression since last save → roll a new snapshot file.
+        if self._last_compression_at is not None and self._last_compression_at != self._active_snapshot_compression_at:
+            ts = self._last_compression_at.strftime("%Y%m%dT%H%M%S")
+            self._active_snapshot_path = session_folder / f"timeline-after-compress-{ts}.json"
+            self._active_snapshot_compression_at = self._last_compression_at
+            logger.info(
+                "snapshot_rolled",
+                path=str(self._active_snapshot_path),
+                compression_at=self._last_compression_at.isoformat(),
+            )
+
+        if self._active_snapshot_path is not None:
+            return self._active_snapshot_path
+        return session_folder / "timeline.json"
 
     def load_from_entries(
         self: CompressedTimeline,
