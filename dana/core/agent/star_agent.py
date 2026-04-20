@@ -69,6 +69,7 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         enable_assistant: bool = True,
         identity_override: str | None = None,
         compress_timeline: bool = True,
+        compress_trigger_tokens: int | None = None,
         **kwargs,
     ):
         """
@@ -161,12 +162,20 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
 
         # Determine storage_config for timeline and event_log
 
-        # Initialize timeline: use CompressedTimeline by default unless explicitly injected
-        # compress_timeline=False disables LLM-based compression (behaves like plain Timeline)
+        # Initialize timeline: use CompressedTimeline by default unless explicitly injected.
+        # compress_timeline=False disables LLM-based compression (behaves like plain Timeline).
         # system/tools callbacks fold system-prompt + tools-schema size into needs_compression()
         # estimate. Both use the existing len(str)//4 heuristic.
+        #
+        # Two independent knobs are threaded here:
+        #   - max_context_tokens → LLM context-window BUDGET for to_llm_messages()
+        #   - compress_trigger_tokens → compression TRIGGER (None → DANA_COMPACT_TRIGGER_TOKENS
+        #     env var wins, so ops can retune without code changes).
+        # Historically these were aliased to the same value; the split lets ops set
+        # the trigger via env while agent authors still pick an appropriate context budget.
         self._timeline = CompressedTimeline(
-            max_tokens_until_compression=max_context_tokens,
+            max_context_tokens=max_context_tokens,
+            max_tokens_until_compression=compress_trigger_tokens,
             agent=self,
             repository_factory=self._repository_factory,
             compression_enabled=compress_timeline,

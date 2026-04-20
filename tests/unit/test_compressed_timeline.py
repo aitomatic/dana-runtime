@@ -91,6 +91,65 @@ class TestCompressedTimelineInitialization:
         assert timeline._agent == agent
         assert timeline._repository is not None
 
+    def test_context_tokens_independent_of_trigger(self, monkeypatch):
+        """Explicit max_context_tokens must NOT set the compression trigger.
+
+        Regression guard for the ``max_context_tokens`` ↔ trigger conflation
+        that previously made ``DANA_COMPACT_TRIGGER_TOKENS`` unreachable via the
+        agent path.
+        """
+        from dana.core.timeline import compact_trigger as ct
+
+        monkeypatch.delenv("DANA_COMPACT_TRIGGER_TOKENS", raising=False)
+        ct._reset_cache_for_tests()
+
+        timeline = CompressedTimeline(max_context_tokens=200_000)
+        assert timeline.max_context_tokens == 200_000
+        assert timeline.max_tokens_until_compression == ct.DEFAULT_TRIGGER
+        assert timeline._explicit_max_tokens_until_compression is None
+        ct._reset_cache_for_tests()
+
+    def test_env_trigger_wins_when_only_context_tokens_set(self, monkeypatch):
+        """With context budget explicit but trigger deferred, env governs the trigger."""
+        from dana.core.timeline import compact_trigger as ct
+
+        monkeypatch.setenv("DANA_COMPACT_TRIGGER_TOKENS", "80000")
+        ct._reset_cache_for_tests()
+
+        timeline = CompressedTimeline(max_context_tokens=200_000)
+        assert timeline.max_context_tokens == 200_000
+        assert timeline.max_tokens_until_compression == 80_000
+        assert timeline.cutoff_when_token_reach == int(0.3 * 80_000)
+        ct._reset_cache_for_tests()
+
+    def test_explicit_trigger_still_wins_over_env(self, monkeypatch):
+        """Callers who pin the trigger explicitly keep that contract."""
+        from dana.core.timeline import compact_trigger as ct
+
+        monkeypatch.setenv("DANA_COMPACT_TRIGGER_TOKENS", "80000")
+        ct._reset_cache_for_tests()
+
+        timeline = CompressedTimeline(
+            max_tokens_until_compression=50_000,
+            max_context_tokens=200_000,
+        )
+        assert timeline.max_context_tokens == 200_000
+        assert timeline.max_tokens_until_compression == 50_000
+        ct._reset_cache_for_tests()
+
+    def test_legacy_single_knob_still_aliases(self, monkeypatch):
+        """Backward compat: passing only the trigger still sets context budget to match."""
+        from dana.core.timeline import compact_trigger as ct
+
+        monkeypatch.delenv("DANA_COMPACT_TRIGGER_TOKENS", raising=False)
+        ct._reset_cache_for_tests()
+
+        timeline = CompressedTimeline(max_tokens_until_compression=10_000)
+        # When caller didn't specify max_context_tokens, it falls back to trigger.
+        assert timeline.max_context_tokens == 10_000
+        assert timeline.max_tokens_until_compression == 10_000
+        ct._reset_cache_for_tests()
+
 
 class TestCompressedTimelineNeedsCompression:
     """Test needs_compression method."""

@@ -134,34 +134,56 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
         compression_enabled: bool = True,
         system_tokens_fn: Callable[[], int] | None = None,
         tools_tokens_fn: Callable[[], int] | None = None,
+        max_context_tokens: int | None = None,
     ):
         """
         Initialize the CompressedTimeline.
 
+        Two independent knobs:
+        - ``max_tokens_until_compression`` — the compression TRIGGER. When the
+          estimated token count (messages + system + tools) crosses this, the
+          next ``needs_compression()`` returns True. If None, resolves from the
+          ``DANA_COMPACT_TRIGGER_TOKENS`` env var (default 150k).
+        - ``max_context_tokens`` — the LLM context-window BUDGET used by
+          ``to_llm_messages()`` for sliding-window token limiting. Independent
+          from the trigger. If None, falls back to the resolved trigger (backward
+          compat with the pre-split behavior where they were the same number).
+
         Args:
-            max_tokens_until_compression: Maximum tokens before compression triggers
+            max_tokens_until_compression: Compression trigger threshold. None →
+                env (DANA_COMPACT_TRIGGER_TOKENS) or default.
             max_recent_entries_to_keep: Maximum number of recent entries to preserve
-            cutoff_when_token_reach: Token cutoff for recent entries (default 30% of max)
+            cutoff_when_token_reach: Token cutoff for recent entries (default 30% of trigger)
             agent: Agent instance (can be None, for backward compatibility)
             repository_factory: Repository factory to create the repository
             llm_call_fn: Synchronous function to call LLM for compression
             llm_call_async_fn: Async function to call LLM for compression
             compression_enabled: Whether compression is enabled (default True).
                 Set to False to disable compression and behave like plain Timeline.
+            system_tokens_fn: Optional callback returning system-prompt token estimate.
+            tools_tokens_fn: Optional callback returning tools-schema token estimate.
+            max_context_tokens: LLM context-window budget for ``to_llm_messages()``.
+                None → falls back to the resolved trigger.
         """
-        # Resolve threshold: explicit value wins, else env-resolved trigger
-        # (keeps config int for downstream math; _explicit flag preserved for
-        # needs_compression() precedence).
+        # Resolve trigger: explicit value wins, else env-resolved.
+        # _explicit flag preserved so needs_compression() can re-check env at
+        # resolve time when the caller deferred.
         explicit_trigger = max_tokens_until_compression
         effective_trigger = explicit_trigger if explicit_trigger is not None else resolve_trigger_tokens()
 
-        # Calculate cutoff if not specified
+        # Resolve context-window budget independently. If unspecified, fall back
+        # to the trigger to preserve the legacy "one knob does both" behavior
+        # for callers that haven't been updated yet.
+        effective_context_tokens = max_context_tokens if max_context_tokens is not None else effective_trigger
+
+        # Calculate cutoff if not specified (tied to trigger, not budget —
+        # that's the legitimate coupling).
         if cutoff_when_token_reach is None or cutoff_when_token_reach == 0:
             cutoff_when_token_reach = int(0.3 * effective_trigger)
 
-        # Create config
+        # Create config — context budget and trigger are now stored separately.
         self._compressed_config = CompressedTimelineConfig(
-            max_context_tokens=effective_trigger,
+            max_context_tokens=effective_context_tokens,
             max_tokens_until_compression=effective_trigger,
             max_recent_entries_to_keep=max_recent_entries_to_keep,
             cutoff_when_token_reach=cutoff_when_token_reach,
@@ -172,9 +194,10 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
         # can prefer env at resolve time when caller deferred.
         self._explicit_max_tokens_until_compression: int | None = explicit_trigger
 
-        # Initialize parent
+        # Initialize parent — pass the context budget (not the trigger) so
+        # to_llm_messages() sliding-window limits use the right number.
         super().__init__(
-            max_context_tokens=effective_trigger,
+            max_context_tokens=effective_context_tokens,
             agent=agent,
             repository_factory=repository_factory,
             config=self._compressed_config,
