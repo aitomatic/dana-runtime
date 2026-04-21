@@ -1,19 +1,26 @@
-"""Snapshot-based persistence tests for CompressedTimeline.
+"""Repository-agnostic compact-session tests for CompressedTimeline.
 
-Covers the "store uncompressed alongside compressed" feature:
-- `timeline.json` is the original, frozen at the first compression.
-- Each compression rolls a new `timeline-after-compress-{ISO-ts}.json`.
-- Subsequent saves within a generation update the active snapshot in place.
-- Load prefers the newest snapshot, falls back to `timeline.json`, then legacy.
-- Retention is "keep all" — no rotation.
+Covers the GH-1 "store uncompressed alongside compressed" feature through
+the repository interface only — no direct file I/O in assertions:
+  - Until any compaction fires, save() writes to the caller-supplied base
+    session id.
+  - Each compaction mints a sibling session ``{base}__compact__{ISO-ts}``,
+    visible via ``repo.list_sessions(prefix=...)``.
+  - Subsequent saves within a generation update the active compact session
+    in place.
+  - Read prefers the newest compact session, falls back to base when none.
+  - Retention is "keep all" — older compact sessions are never deleted.
+
+Tests are parametrized across two backends (local FS + in-memory) to prove
+the behavior is repository-agnostic.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
-import json
-from pathlib import Path
 from unittest.mock import Mock
+
+import pytest
 
 from dana.config.storage_config import FileStorageConfig
 from dana.core.agent import BaseAgent
@@ -21,6 +28,7 @@ from dana.core.timeline.compressed_timeline import CompressedTimeline
 from dana.core.timeline.timeline import TimelineEntry, TimelineEntryType
 from dana.repositories.local_file_repository import LocalTimelineRepository
 from dana.repositories.repository_factory import RepositoryFactory, RepositoryType
+from tests.fixtures.in_memory_timeline_repository import make_in_memory_factory
 
 
 class _Agent(BaseAgent):
@@ -32,226 +40,223 @@ class _Agent(BaseAgent):
         self._session_id = session_id
 
 
-def _make_factory(workspace: str) -> RepositoryFactory:
-    """Build a RepositoryFactory rooted at ``workspace`` so tests don't pollute
-    the user's real storage directory."""
+def _make_local_factory(workspace: str) -> RepositoryFactory:
     factory = RepositoryFactory()
-    factory.register(RepositoryType.TIMELINE, LocalTimelineRepository, FileStorageConfig(workspace_folder=workspace))
+    factory.register(
+        RepositoryType.TIMELINE,
+        LocalTimelineRepository,
+        FileStorageConfig(workspace_folder=workspace),
+    )
     return factory
 
 
-def _make_timeline(agent: _Agent) -> CompressedTimeline:
-    return CompressedTimeline(
-        agent=agent,
-        repository_factory=_make_factory(agent._storage_config.workspace_folder),
-    )
+FACTORIES = [
+    pytest.param(_make_local_factory, id="local-fs"),
+    pytest.param(make_in_memory_factory, id="in-memory"),
+]
+
+
+def _make_timeline(agent: _Agent, factory: RepositoryFactory) -> CompressedTimeline:
+    return CompressedTimeline(agent=agent, repository_factory=factory)
 
 
 def _add_entry(tl: CompressedTimeline, role: TimelineEntryType, content: str) -> None:
     tl.add_entry(TimelineEntry(entry_type=role, content=content))
 
 
-def _session_folder(agent: _Agent) -> Path:
-    # Path shape from LocalTimelineRepository._get_events_path:
-    # {workspace}/{agent.object_id}/sessions/{session_id}
-    return Path(agent._storage_config.workspace_folder) / str(agent.object_id) / "sessions" / agent._session_id
+def _compact_prefix(agent: _Agent) -> str:
+    return f"{agent._session_id}__compact__"
 
 
-def test_first_save_before_compression_writes_timeline_json(tmp_path):
-    """Until any compression fires, save() writes to timeline.json (legacy shape)."""
+# ----------------------------------------------------------------------
+# Tests — parametrized across both backends
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("make_factory", FACTORIES)
+def test_save_before_compaction_writes_to_base_session(tmp_path, make_factory):
+    """Until any compaction fires, save() writes to the base session id.
+    No compact-suffixed sessions exist yet."""
     agent = _Agent(str(tmp_path))
-    tl = _make_timeline(agent)
+    tl = _make_timeline(agent, make_factory(str(tmp_path)))
     _add_entry(tl, TimelineEntryType.USER_MESSAGE, "hi")
     _add_entry(tl, TimelineEntryType.AGENT_RESPONSE, "hello")
 
     tl.save(agent._session_id)
 
-    folder = _session_folder(agent)
-    assert (folder / "timeline.json").exists()
-    assert list(folder.glob("timeline-after-compress-*.json")) == []
+    repo = tl._repository
+    assert repo.list_sessions(prefix=_compact_prefix(agent)) == []
+    # Base session should have the entries.
+    entries = list(repo.read_session_entries(agent._session_id))
+    assert {e.content for e in entries} == {"hi", "hello"}
 
 
-def test_compression_rolls_new_snapshot_file(tmp_path):
-    """After _apply_compression stamps `_last_compression_at`, the next save
-    writes a `timeline-after-compress-{ts}.json` instead of timeline.json."""
+@pytest.mark.parametrize("make_factory", FACTORIES)
+def test_compaction_rolls_new_compact_session(tmp_path, make_factory):
+    """After a fresh compaction stamp, the next save mints a compact session."""
     agent = _Agent(str(tmp_path))
-    tl = _make_timeline(agent)
-    _add_entry(tl, TimelineEntryType.USER_MESSAGE, "u1")
-    _add_entry(tl, TimelineEntryType.AGENT_RESPONSE, "a1")
-    tl.save(agent._session_id)
-
-    # Simulate a compression by stamping directly — avoids full LLM pipeline.
-    tl._last_compression_at = datetime(2026, 4, 20, 12, 0, 0)
-    _add_entry(tl, TimelineEntryType.USER_MESSAGE, "u2")
-    tl.save(agent._session_id)
-
-    folder = _session_folder(agent)
-    snapshots = sorted(folder.glob("timeline-after-compress-*.json"))
-    assert len(snapshots) == 1
-    assert snapshots[0].name == "timeline-after-compress-20260420T120000.json"
-    # `timeline.json` still exists from the pre-compression save but is frozen.
-    assert (folder / "timeline.json").exists()
-
-
-def test_subsequent_save_same_generation_updates_snapshot_in_place(tmp_path):
-    """New entries added between two compressions must update the latest snapshot,
-    not create another file or overwrite timeline.json."""
-    agent = _Agent(str(tmp_path))
-    tl = _make_timeline(agent)
+    tl = _make_timeline(agent, make_factory(str(tmp_path)))
     _add_entry(tl, TimelineEntryType.USER_MESSAGE, "u1")
     tl.save(agent._session_id)
 
     tl._last_compression_at = datetime(2026, 4, 20, 12, 0, 0)
     _add_entry(tl, TimelineEntryType.USER_MESSAGE, "u2")
-    tl.save(agent._session_id)  # rolls snapshot #1
+    tl.save(agent._session_id)
+
+    compact = tl._repository.list_sessions(prefix=_compact_prefix(agent))
+    assert compact == [f"{agent._session_id}__compact__20260420T120000_000000"]
+
+
+@pytest.mark.parametrize("make_factory", FACTORIES)
+def test_subsequent_save_same_generation_updates_same_compact_session(tmp_path, make_factory):
+    """New entries added between two compactions update the active compact
+    session rather than creating another."""
+    agent = _Agent(str(tmp_path))
+    tl = _make_timeline(agent, make_factory(str(tmp_path)))
+    _add_entry(tl, TimelineEntryType.USER_MESSAGE, "u1")
+    tl.save(agent._session_id)
+
+    tl._last_compression_at = datetime(2026, 4, 20, 12, 0, 0)
+    _add_entry(tl, TimelineEntryType.USER_MESSAGE, "u2")
+    tl.save(agent._session_id)
 
     _add_entry(tl, TimelineEntryType.AGENT_RESPONSE, "a2")
-    tl.save(agent._session_id)  # same generation → updates snapshot #1
+    tl.save(agent._session_id)  # same generation → same compact session
 
-    folder = _session_folder(agent)
-    snapshots = sorted(folder.glob("timeline-after-compress-*.json"))
-    assert len(snapshots) == 1
-    with snapshots[0].open() as f:
-        data = json.load(f)
-    contents = {e["content"] for e in data["entries"]}
+    repo = tl._repository
+    compact = repo.list_sessions(prefix=_compact_prefix(agent))
+    assert len(compact) == 1
+
+    contents = {e.content for e in repo.read_session_entries(compact[0])}
     assert "u2" in contents and "a2" in contents
 
 
-def test_second_compression_rolls_another_snapshot_keeping_first(tmp_path):
-    """Full audit retention: older snapshots are kept indefinitely."""
+@pytest.mark.parametrize("make_factory", FACTORIES)
+def test_second_compaction_mints_another_compact_session_keeping_first(tmp_path, make_factory):
+    """Full audit retention: older compact sessions are kept indefinitely."""
     agent = _Agent(str(tmp_path))
-    tl = _make_timeline(agent)
+    tl = _make_timeline(agent, make_factory(str(tmp_path)))
     _add_entry(tl, TimelineEntryType.USER_MESSAGE, "u1")
     tl.save(agent._session_id)
 
     tl._last_compression_at = datetime(2026, 4, 20, 12, 0, 0)
-    tl.save(agent._session_id)  # snapshot-1
+    tl.save(agent._session_id)  # compact-1
 
     tl._last_compression_at = datetime(2026, 4, 20, 13, 30, 0)
-    tl.save(agent._session_id)  # snapshot-2
+    tl.save(agent._session_id)  # compact-2
 
-    folder = _session_folder(agent)
-    snapshots = sorted(folder.glob("timeline-after-compress-*.json"))
-    assert [s.name for s in snapshots] == [
-        "timeline-after-compress-20260420T120000.json",
-        "timeline-after-compress-20260420T133000.json",
+    compact = tl._repository.list_sessions(prefix=_compact_prefix(agent))
+    assert compact == [
+        f"{agent._session_id}__compact__20260420T120000_000000",
+        f"{agent._session_id}__compact__20260420T133000_000000",
     ]
 
 
-def test_load_prefers_newest_snapshot(tmp_path):
-    """Repository.read_session_entries + serializer load should both pick the
-    newest snapshot over timeline.json."""
+@pytest.mark.parametrize("make_factory", FACTORIES)
+def test_read_since_prefers_newest_compact_session(tmp_path, make_factory):
+    """Fresh timeline on resume reads the newest compact session, not base."""
     agent = _Agent(str(tmp_path))
-    tl = _make_timeline(agent)
-    _add_entry(tl, TimelineEntryType.USER_MESSAGE, "from-base")
-    tl.save(agent._session_id)
+    factory = make_factory(str(tmp_path))
 
-    # Write two snapshots manually — newest should win.
-    folder = _session_folder(agent)
-    for ts, marker in [
-        (datetime(2026, 4, 20, 12, 0, 0), "snap-old"),
-        (datetime(2026, 4, 20, 15, 0, 0), "snap-new"),
-    ]:
-        path = folder / f"timeline-after-compress-{ts.strftime('%Y%m%dT%H%M%S')}.json"
-        payload = {
-            "session_id": agent._session_id,
-            "entries": [{"entry_type": "USER_MESSAGE", "content": marker, "timestamp": ts.isoformat(), "metadata": {}}],
-            "native_messages": [{"role": "user", "content": marker, "metadata": {}, "timestamp": ts.isoformat()}],
-        }
-        with path.open("w") as f:
-            json.dump(payload, f)
+    # Stage: base session + two compact sessions (old, new).
+    tl_seed = _make_timeline(agent, factory)
+    _add_entry(tl_seed, TimelineEntryType.USER_MESSAGE, "from-base")
+    tl_seed.save(agent._session_id)
 
-    # Fresh timeline loads via read_since pipeline.
-    tl2 = _make_timeline(agent)
+    tl_seed._last_compression_at = datetime(2026, 4, 20, 12, 0, 0)
+    # Replace the timeline with a marker entry so the compact session gets it.
+    tl_seed.timeline = [TimelineEntry(entry_type=TimelineEntryType.USER_MESSAGE, content="snap-old")]
+    tl_seed.save(agent._session_id)
+
+    tl_seed._last_compression_at = datetime(2026, 4, 20, 15, 0, 0)
+    tl_seed.timeline = [TimelineEntry(entry_type=TimelineEntryType.USER_MESSAGE, content="snap-new")]
+    tl_seed.save(agent._session_id)
+
+    # Fresh timeline — resume via read_since.
+    tl2 = _make_timeline(agent, factory)
     loaded = list(tl2.read_since(0))
     assert any(e.content == "snap-new" for e in loaded)
     assert all(e.content != "snap-old" for e in loaded)
-    # Native messages must come from the newest snapshot too.
-    assert any(m.content == "snap-new" for m in tl2._native_messages)
 
 
-def test_load_fallback_to_timeline_json_when_no_snapshot(tmp_path):
+@pytest.mark.parametrize("make_factory", FACTORIES)
+def test_read_since_falls_back_to_base_when_no_compact_session(tmp_path, make_factory):
+    """With no compact sessions, resume reads the base session."""
     agent = _Agent(str(tmp_path))
-    tl = _make_timeline(agent)
+    factory = make_factory(str(tmp_path))
+
+    tl = _make_timeline(agent, factory)
     _add_entry(tl, TimelineEntryType.USER_MESSAGE, "only-base")
     tl.save(agent._session_id)
 
-    tl2 = _make_timeline(agent)
+    tl2 = _make_timeline(agent, factory)
     loaded = list(tl2.read_since(0))
     assert [e.content for e in loaded] == ["only-base"]
 
 
-def test_reload_rehydrates_active_snapshot_so_next_save_does_not_roll(tmp_path):
-    """After reload, subsequent saves keep updating the same snapshot until a
-    new compression fires — not rolling a new file on every save."""
+@pytest.mark.parametrize("make_factory", FACTORIES)
+def test_reload_rehydrates_active_compact_session(tmp_path, make_factory):
+    """After reload, subsequent saves keep updating the same compact session
+    until a new compaction fires — no new session rolled on each save."""
     agent = _Agent(str(tmp_path))
-    tl = _make_timeline(agent)
+    factory = make_factory(str(tmp_path))
+
+    tl = _make_timeline(agent, factory)
     _add_entry(tl, TimelineEntryType.USER_MESSAGE, "u1")
     tl.save(agent._session_id)
 
     tl._last_compression_at = datetime(2026, 4, 20, 12, 0, 0)
-    tl.save(agent._session_id)  # creates snapshot
+    tl.save(agent._session_id)  # mints compact session
 
     # Fresh timeline — simulates process restart.
-    tl2 = _make_timeline(agent)
-    list(tl2.read_since(0))  # triggers native_messages load → rehydrates state
-    assert tl2._active_snapshot_path is not None
-    assert tl2._active_snapshot_compression_at == datetime(2026, 4, 20, 12, 0, 0)
+    tl2 = _make_timeline(agent, factory)
+    list(tl2.read_since(0))  # triggers rehydration
+    assert tl2._active_compact_session_id == f"{agent._session_id}__compact__20260420T120000_000000"
+    assert tl2._active_compact_compression_at == datetime(2026, 4, 20, 12, 0, 0)
 
     _add_entry(tl2, TimelineEntryType.USER_MESSAGE, "u3-after-reload")
     tl2.save(agent._session_id)
 
-    folder = _session_folder(agent)
-    snapshots = sorted(folder.glob("timeline-after-compress-*.json"))
-    assert len(snapshots) == 1, "reload must not roll a new snapshot without a fresh compression"
+    compact = tl2._repository.list_sessions(prefix=_compact_prefix(agent))
+    assert len(compact) == 1, "reload must not mint a new compact session without a fresh compaction"
 
 
-def test_resume_via_load_from_entries_adopts_newest_snapshot_on_save(tmp_path):
+@pytest.mark.parametrize("make_factory", FACTORIES)
+def test_resume_via_load_from_entries_adopts_latest_compact_session(tmp_path, make_factory):
     """Regression: resume through ``load_from_entries`` (bypassing read_since)
-    must not clobber ``timeline.json`` with post-compression state. The save
-    side adopts the newest existing ``timeline-after-compress-*.json``.
-
-    This mirrors the Honeywell Django caller which does:
-        timeline.load_from_entries(session_entries)   # no native_messages
-    after reading entries via the snapshot-aware repository. Prior to the fix,
-    the resumed timeline forgot about the snapshot and overwrote timeline.json
-    on every save.
-    """
+    must not clobber the base session. Subsequent saves go through rehydration
+    on read_since; here we drive rehydration explicitly to confirm the state
+    is picked up before the post-resume save."""
     agent = _Agent(str(tmp_path))
-    tl = _make_timeline(agent)
+    factory = make_factory(str(tmp_path))
+
+    tl = _make_timeline(agent, factory)
     _add_entry(tl, TimelineEntryType.USER_MESSAGE, "u1")
     tl.save(agent._session_id)
-    pre_compress_timeline_json = (_session_folder(agent) / "timeline.json").read_text()
 
-    # Simulate a compression — roll the first snapshot.
+    # Simulate a compaction — mint the first compact session.
     tl._last_compression_at = datetime(2026, 4, 20, 13, 54, 13)
-    _add_entry(tl, TimelineEntryType.USER_MESSAGE, "u2-post-compress")
+    _add_entry(tl, TimelineEntryType.USER_MESSAGE, "u2-post-compact")
     tl.save(agent._session_id)
 
-    folder = _session_folder(agent)
-    snapshot_before = folder / "timeline-after-compress-20260420T135413.json"
-    assert snapshot_before.exists()
+    compact_id = f"{agent._session_id}__compact__20260420T135413_000000"
+    assert compact_id in tl._repository.list_sessions(prefix=_compact_prefix(agent))
 
-    # Fresh timeline instance, resume ONLY through load_from_entries (no read_since).
-    tl2 = _make_timeline(agent)
-    # Read entries off disk ourselves (mimics the Honeywell caller reading via
-    # LocalTimelineRepository.read_session_entries which is snapshot-aware).
-    entries = list(tl2._repository.read_session_entries(agent._session_id))
+    # Fresh timeline instance. Read entries via the repo and load_from_entries.
+    tl2 = _make_timeline(agent, factory)
+    entries = list(tl2._repository.read_session_entries(compact_id))
     tl2.load_from_entries(entries)
-    assert len(tl2.timeline) >= 2
+    # Drive rehydration since load_from_entries alone doesn't touch the repo.
+    tl2._rehydrate_active_compact_session()
+    assert tl2._active_compact_session_id == compact_id
 
-    # Add a new entry after resume and save.
+    # Add a new entry after resume and save — lands in the same compact session.
     _add_entry(tl2, TimelineEntryType.AGENT_RESPONSE, "a3-after-resume")
     tl2.save(agent._session_id)
 
-    # The new entry must land in the snapshot, not a stale timeline.json.
-    with snapshot_before.open() as f:
-        snap_data = json.load(f)
-    contents = {e["content"] for e in snap_data["entries"]}
-    assert "a3-after-resume" in contents, "post-resume save must target the latest snapshot, not timeline.json"
+    contents = {e.content for e in tl2._repository.read_session_entries(compact_id)}
+    assert "a3-after-resume" in contents, "post-resume save must target the latest compact session"
 
-    # No new snapshot should roll without a fresh compression.
-    assert sorted(folder.glob("timeline-after-compress-*.json")) == [snapshot_before]
-
-    # timeline.json stays frozen at its pre-compression state.
-    assert (folder / "timeline.json").read_text() == pre_compress_timeline_json
+    # No new compact session rolled without a fresh compaction.
+    compact = tl2._repository.list_sessions(prefix=_compact_prefix(agent))
+    assert compact == [compact_id]

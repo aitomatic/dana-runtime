@@ -415,6 +415,23 @@ class LocalTimelineRepository(LocalRepositoryMixin, TimelineRepositoryProtocol):
         except Exception as e:
             logger.warning(f"Failed to read timeline file {timeline_file}: {e}")
 
+    def list_sessions(self, prefix: str = "") -> list[str]:
+        """List session IDs under this repository's events path.
+
+        Args:
+            prefix: If non-empty, only return session IDs starting with prefix.
+
+        Returns:
+            Sorted list of session IDs (folder names). Empty list if
+            events_path does not exist yet.
+        """
+        if not self._events_path.exists():
+            return []
+        sessions = [p.name for p in self._events_path.iterdir() if p.is_dir()]
+        if prefix:
+            sessions = [s for s in sessions if s.startswith(prefix)]
+        return sorted(sessions)
+
 
 class LocalEventRepository(LocalRepositoryMixin, EventRepositoryProtocol):
     def __init__(self, storage_config: FileStorageConfig, agent: BaseAgent):

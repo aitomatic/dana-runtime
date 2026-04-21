@@ -227,16 +227,16 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
         self._compaction_disabled: bool = False
         self._circuit_opened_at: datetime | None = None
 
-        # Snapshot persistence (Phase 5 — "store uncompressed alongside compressed"):
+        # Compact-session persistence (repo-agnostic, post-GH-1):
         # `_last_compression_at` is stamped by ``_apply_compression``. On the next
-        # ``save()``, the mixin detects a new compression event and rolls the
-        # active snapshot file. Until then saves keep updating the same file.
-        # ``timeline.json`` is written only until the first compression fires; after
-        # that, every save targets ``timeline-after-compress-{ISO-ts}.json``. Full
-        # audit retention — no rotation.
+        # ``save()``, the serializer detects a new compression event and mints a
+        # fresh logical session id of the form ``{base}__compact__{ISO-ts}`` which
+        # then receives all writes until the next compaction. Pre-compaction writes
+        # go to the caller-supplied base session id. Full audit retention — old
+        # compact sessions are never deleted.
         self._last_compression_at: datetime | None = None
-        self._active_snapshot_path: Any | None = None
-        self._active_snapshot_compression_at: datetime | None = None
+        self._active_compact_session_id: str | None = None
+        self._active_compact_compression_at: datetime | None = None
 
     # ------------------------------------------------------------------
     # Properties
