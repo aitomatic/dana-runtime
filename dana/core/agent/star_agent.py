@@ -16,6 +16,7 @@ import structlog
 
 from dana.common.config import config_manager
 from dana.common.llm import LLM
+from dana.common.llm.types import LLMMessage
 from dana.common.observable import observable
 from dana.common.protocols import AgentProtocol, DictParams, Notifiable, ResourceProtocol, WorkflowProtocol
 from dana.common.protocols.types import LearningPhase
@@ -68,6 +69,7 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         enable_assistant: bool = True,
         identity_override: str | None = None,
         compress_timeline: bool = True,
+        compress_trigger_tokens: int | None = None,
         **kwargs,
     ):
         """
@@ -160,13 +162,25 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
 
         # Determine storage_config for timeline and event_log
 
-        # Initialize timeline: use CompressedTimeline by default unless explicitly injected
-        # compress_timeline=False disables LLM-based compression (behaves like plain Timeline)
+        # Initialize timeline: use CompressedTimeline by default unless explicitly injected.
+        # compress_timeline=False disables LLM-based compression (behaves like plain Timeline).
+        # system/tools callbacks fold system-prompt + tools-schema size into needs_compression()
+        # estimate. Both use the existing len(str)//4 heuristic.
+        #
+        # Two independent knobs are threaded here:
+        #   - max_context_tokens → LLM context-window BUDGET for to_llm_messages()
+        #   - compress_trigger_tokens → compression TRIGGER (None → DANA_COMPACT_TRIGGER_TOKENS
+        #     env var wins, so ops can retune without code changes).
+        # Historically these were aliased to the same value; the split lets ops set
+        # the trigger via env while agent authors still pick an appropriate context budget.
         self._timeline = CompressedTimeline(
-            max_tokens_until_compression=max_context_tokens,
+            max_context_tokens=max_context_tokens,
+            max_tokens_until_compression=compress_trigger_tokens,
             agent=self,
             repository_factory=self._repository_factory,
             compression_enabled=compress_timeline,
+            system_tokens_fn=self._estimate_system_prompt_tokens,
+            tools_tokens_fn=self._estimate_tools_tokens,
         )
 
         # Initialize EventLog API (only if observer AND codec provided)
@@ -182,6 +196,19 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         else:
             # No observer or codec = no EventLog (events only come from Observer)
             self._event_log = None
+
+        # CRITICAL-2 companion — auto-wire a resource that lets the LLM read
+        # back tool_results that were dumped to disk at ingest time. Opt out
+        # via env (used in tests that don't need a filesystem repository).
+        import os as _os
+
+        if _os.getenv("DANA_DISABLE_TOOL_RESULT_DUMP_RESOURCE") != "1":
+            try:
+                from dana.core.resource.tool_result_dump_resource import ToolResultDumpResource
+
+                self.with_resources(ToolResultDumpResource(agent=self, auto_register=False))
+            except Exception as _e:  # pragma: no cover — don't block agent boot on resource wiring
+                logger.warning("tool_result_dump_resource_wire_failed", error=str(_e))
 
         if enable_web_search:
             try:
@@ -474,6 +501,31 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
     # TIMELINE COMPRESSION
     # ============================================================================
 
+    def _estimate_system_prompt_tokens(self) -> int:
+        """Return char/4 estimate of system prompt size for compression trigger."""
+        try:
+            prompt = self.system_prompt
+        except Exception:
+            return 0
+        if not prompt:
+            return 0
+        return len(str(prompt)) // 4
+
+    def _estimate_tools_tokens(self) -> int:
+        """Return char/4 estimate of tools-schema size for compression trigger."""
+        try:
+            tools = None
+            runtime = getattr(self, "_runtime", None)
+            if runtime is not None and hasattr(runtime, "get_tools"):
+                tools = runtime.get_tools(self)
+            if not tools:
+                return 0
+            import json as _json
+
+            return len(_json.dumps(tools, default=str)) // 4
+        except Exception:
+            return 0
+
     def _maybe_compress_timeline(self, timeline: Timeline) -> None:
         """
         Compress timeline if it exceeds the configured threshold.
@@ -513,6 +565,12 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                     summary_length=len(summary),
                 )
         except Exception as e:
+            # PTL must propagate so the caller-layer (llm_caller.py) can trigger
+            # reactive_compact + retry — don't let this summary path swallow it.
+            from dana.common.llm.types import PromptTooLongError
+
+            if isinstance(e, PromptTooLongError):
+                raise
             # Don't fail the main operation if compression fails
             logger.warning("Timeline compression failed", error=str(e))
 
@@ -549,6 +607,10 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                     summary_length=len(summary),
                 )
         except Exception as e:
+            from dana.common.llm.types import PromptTooLongError
+
+            if isinstance(e, PromptTooLongError):
+                raise
             logger.warning("Timeline compression failed", error=str(e))
 
     def _extract_compression_summary(self, content: str) -> str:
@@ -813,6 +875,19 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
 
                     result_content = json.dumps(result_content)
 
+                # CRITICAL-2: dump oversized content to a session-scoped file
+                # and leave a compact marker in the timeline. Prevents the
+                # "huge recent tool_result is unreclaimable" wedge where
+                # reactive_compact can't shed the offending entry because it's
+                # within the keep-recent window.
+                from dana.core.agent.tool_result_dump import maybe_dump_oversized_content, resolve_session_folder_for_agent
+
+                result_content = maybe_dump_oversized_content(
+                    result_content,
+                    tool_result.get("tool_call_id"),
+                    resolve_session_folder_for_agent(self),
+                )
+
                 self._timeline.add_entry(
                     TimelineEntry(
                         entry_type=entry_type,
@@ -880,12 +955,19 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         trace_percepts.pop("timeline", None)
 
         self._maybe_compress_timeline(timeline)
-        llm_messages = self._runtime.build_prompt(self, timeline)
+
+        # Factory used by LLMCaller's PTL retry loop to rebuild messages after
+        # each reactive_compact so the retry observes the compacted timeline
+        # (CRITICAL-1 fix). Closes over self + timeline, not the messages list.
+        def _rebuild_llm_messages() -> list[LLMMessage]:
+            return self._runtime.build_prompt(self, timeline)
+
+        llm_messages = _rebuild_llm_messages()
 
         response, reasoning, tool_calls, done, todo_list = None, None, [], None, None
         output_state = "retry"
         for attempt in range(self.MAX_THINK_RETRIES):
-            raw = self._runtime.call_llm(llm_messages)
+            raw = self._runtime.call_llm(llm_messages, messages_fn=_rebuild_llm_messages)
             parsed = self._runtime.parse_response(raw)
             response, reasoning, tool_calls, done, todo_list = (
                 parsed.response,
@@ -1022,17 +1104,28 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         trace_percepts.pop("timeline", None)
 
         await self._maybe_compress_timeline_async(timeline)
-        llm_messages = self._runtime.build_prompt(self, timeline)
+
+        # Factory used by LLMCaller's PTL retry loop to rebuild messages after
+        # each reactive_compact so the retry observes the compacted timeline
+        # (CRITICAL-1 fix).
+        def _rebuild_llm_messages_async() -> list[LLMMessage]:
+            return self._runtime.build_prompt(self, timeline)
+
+        llm_messages = _rebuild_llm_messages_async()
 
         response, reasoning, tool_calls, done, todo_list = None, None, [], None, None
         output_state = "retry"
         for attempt in range(self.MAX_THINK_RETRIES):
             if hasattr(self._runtime, "call_llm_async"):
-                raw = await self._runtime.call_llm_async(llm_messages)
+                raw = await self._runtime.call_llm_async(llm_messages, messages_fn=_rebuild_llm_messages_async)
             else:
                 import asyncio
 
-                raw = await asyncio.to_thread(self._runtime.call_llm, llm_messages)
+                raw = await asyncio.to_thread(
+                    self._runtime.call_llm,
+                    llm_messages,
+                    messages_fn=_rebuild_llm_messages_async,
+                )
             parsed = self._runtime.parse_response(raw)
             response, reasoning, tool_calls, done, todo_list = (
                 parsed.response,

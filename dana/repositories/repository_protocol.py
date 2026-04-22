@@ -58,6 +58,10 @@ class TimelineRepositoryProtocol(Protocol):
         """Read timeline entries for a specific session."""
         ...
 
+    def list_sessions(self, prefix: str = "") -> list[str]:
+        """List session IDs, optionally filtered by prefix, sorted lexicographically."""
+        ...
+
 
 class EventRepositoryProtocol(Protocol):
     def __init__(self, storage_config: StorageConfig, agent: BaseAgent):

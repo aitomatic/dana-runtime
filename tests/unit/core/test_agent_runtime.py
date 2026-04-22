@@ -1,11 +1,9 @@
-import pytest
-
 from dana.common.llm.types import LLMMessage, LLMResponse
 from dana.core.agent.star_agent import STARAgent
-from dana.core.timeline.timeline import Timeline, TimelineEntry, TimelineEntryType
 from dana.core.resource.base_resource import BaseResource
 from dana.core.runtime import AgentRuntime, ParsedResponse, RuntimeRegistry
 from dana.core.runtime.default import DefaultRuntime
+from dana.core.timeline.timeline import Timeline, TimelineEntry, TimelineEntryType
 
 
 def test_parsed_response_dataclass():
@@ -175,7 +173,7 @@ def test_think_uses_runtime_methods():
             self.calls.append("build_prompt")
             return [LLMMessage(role="system", content="system"), LLMMessage(role="user", content="hello")]
 
-        def call_llm(self, messages):
+        def call_llm(self, messages, messages_fn=None):
             self.calls.append("call_llm")
             self._count += 1
             if self._count == 1:

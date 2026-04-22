@@ -1,3 +1,4 @@
+from .defaults import TimelineRepositoryDefaultsMixin
 from .local_file_repository import LocalEventRepository, LocalLearningRepository, LocalPromptRepository, LocalTimelineRepository
 from .repository_factory import RepositoryFactory, RepositoryType
 
@@ -9,6 +10,7 @@ __all__ = [
     "LocalTimelineRepository",
     "RepositoryFactory",
     "RepositoryType",
+    "TimelineRepositoryDefaultsMixin",
 ]
 
 try:

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from structlog import get_logger
 
+from dana.core.timeline.compact_trigger import resolve_trigger_tokens
 from dana.core.timeline.native_message import (
     COMPRESSED_CONTEXT_KEY,
     COMPRESSED_ENTRIES_COUNT_KEY,
@@ -26,6 +27,10 @@ if TYPE_CHECKING:
     from dana.core.timeline.compressed_timeline import CompressedTimeline
 
 logger = get_logger()
+
+# Literal stub content for client-side tool_result shrinking (Phase 2).
+# Idempotency is detected by exact content-string equality — no metadata flag.
+SHRINK_STUB_CONTENT = "[cleared for context budget]"
 
 
 class CompressionMixin:
@@ -75,11 +80,14 @@ class CompressionMixin:
         """
         Check if timeline compression is needed.
 
-        Compression is needed when total tokens exceed max_tokens_until_compression.
-        Uses native message token counts for more accurate estimation.
+        Compression triggers when `(messages_est + system_est + tools_est) >=
+        trigger`. Trigger precedence: explicit `max_tokens_until_compression`
+        passed at construction wins; otherwise fall back to env-resolved
+        `resolve_trigger_tokens()` (default 150000, env DANA_COMPACT_TRIGGER_TOKENS).
 
-        Returns:
-            True if compression should be triggered
+        Optional `system_tokens_fn` / `tools_tokens_fn` callbacks fold system
+        prompt and tools-schema size into the estimate. Callbacks are invoked
+        defensively via `_safe_call_tokens_fn`.
         """
         if not self._compressed_config.compression_enabled:
             return False
@@ -88,9 +96,23 @@ class CompressionMixin:
         if len(self._native_messages) <= self._compressed_config.max_recent_entries_to_keep:
             return False
 
-        # Estimate current token usage using native messages
-        current_tokens = self._estimate_native_messages_list_tokens(self._native_messages)
-        return current_tokens > self._compressed_config.max_tokens_until_compression
+        messages_est = self._estimate_native_messages_list_tokens(self._native_messages)
+        sys_est = self._safe_call_tokens_fn(self._system_tokens_fn)
+        tools_est = self._safe_call_tokens_fn(self._tools_tokens_fn)
+
+        explicit = self._explicit_max_tokens_until_compression
+        trigger = explicit if explicit is not None else resolve_trigger_tokens()
+
+        total = messages_est + sys_est + tools_est
+        if total >= trigger:
+            logger.info(
+                "compression_needed",
+                reason="threshold",
+                tokens_est=total,
+                threshold=trigger,
+            )
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Partition logic: which messages/entries to keep vs. compress
@@ -175,6 +197,138 @@ class CompressionMixin:
                 break
 
         return additional_entries + entries
+
+    def _remove_forward_orphans(self: CompressedTimeline, entries: list[TimelineEntry]) -> list[TimelineEntry]:
+        """Drop any `tool_result` entry whose matching `tool_use` is absent.
+
+        Used after truncation in `reactive_compact` (Phase 3). Matches
+        existing pair-integrity philosophy: drop rather than repair.
+        Returns a new list without the orphaned tool_results.
+        """
+        if not entries:
+            return entries
+
+        tool_use_ids: set[str] = set()
+        for e in entries:
+            if getattr(e, "tool_calls", None):
+                for tc in e.tool_calls or []:
+                    if isinstance(tc, dict):
+                        tc_id = tc.get("id") or tc.get("tool_call_id") or ""
+                    else:
+                        tc_id = getattr(tc, "id", "") or ""
+                    if tc_id:
+                        tool_use_ids.add(tc_id)
+
+        return [e for e in entries if not (e.tool_call_id and e.tool_call_id not in tool_use_ids)]
+
+    # ------------------------------------------------------------------
+    # Phase 2 — cheap shrink of old tool_result content
+    # ------------------------------------------------------------------
+
+    def _is_tool_result_entry(self: CompressedTimeline, entry: TimelineEntry) -> bool:
+        """Return True if entry represents a tool-result carrying a tool_call_id."""
+        if not entry.tool_call_id:
+            return False
+        etv = entry.entry_type.value if hasattr(entry.entry_type, "value") else str(entry.entry_type)
+        return etv in (
+            TimelineEntryType.RESOURCE_RESULT.value,
+            TimelineEntryType.WORKFLOW_RESULT.value,
+            TimelineEntryType.UNKNOWN_TOOL_CALL.value,
+            TimelineEntryType.FAILED_TOOL_CALL.value,
+        )
+
+    def cheap_shrink_tool_results(self: CompressedTimeline) -> bool:
+        """Client-side stub old tool_result bodies to a fixed literal.
+
+        Preserves `tool_call_id` (so tool_use/tool_result pair integrity
+        holds) and leaves recent entries untouched. Guarded by a predictive
+        gate: if stubbing would not drop us below the configured trigger,
+        leave the timeline unmutated and return False (caller falls through
+        to full `compress()`).
+
+        Idempotent via content-string equality — re-running is a no-op.
+
+        Returns:
+            True iff the timeline was mutated AND post-shrink estimate is
+            below the trigger.
+        """
+        keep_recent = self._compressed_config.cheap_shrink_keep_recent
+        trigger = (
+            self._explicit_max_tokens_until_compression
+            if self._explicit_max_tokens_until_compression is not None
+            else resolve_trigger_tokens()
+        )
+
+        if len(self._native_messages) <= keep_recent:
+            return False
+
+        # Pre-shrink tokens (messages only — same estimate as needs_compression).
+        pre_tokens = self._estimate_native_messages_list_tokens(self._native_messages)
+        if pre_tokens < trigger:
+            return False
+
+        # Build set of tool_call_ids referenced by pending tool_use in the
+        # kept-recent window — do NOT stub results of calls still in flight.
+        recent_cutoff = len(self._native_messages) - keep_recent
+        recent_tool_use_ids: set[str] = set()
+        for msg in self._native_messages[recent_cutoff:]:
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    tc_id = getattr(tc, "id", "") or ""
+                    if tc_id:
+                        recent_tool_use_ids.add(tc_id)
+
+        # Identify stub-eligible TimelineEntry objects — older than keep_recent,
+        # tool-result kind, not already stubbed.
+        eligible_indices: list[int] = []
+        predicted_savings = 0
+        if len(self.timeline) > keep_recent:
+            for idx in range(len(self.timeline) - keep_recent):
+                entry = self.timeline[idx]
+                if not self._is_tool_result_entry(entry):
+                    continue
+                if entry.content == SHRINK_STUB_CONTENT:
+                    continue
+                if entry.tool_call_id in recent_tool_use_ids:
+                    # Call still referenced by pending tool_use in kept window.
+                    continue
+                eligible_indices.append(idx)
+                content_len = len(entry.content) if isinstance(entry.content, str) else len(str(entry.content))
+                predicted_savings += content_len // 4
+
+        if not eligible_indices:
+            return False
+
+        # Predictive gate — if shrink alone cannot drop us below trigger,
+        # bail without mutating. Avoids vacuous summary over stubs.
+        if (pre_tokens - predicted_savings) >= trigger:
+            return False
+
+        # Stub eligible TimelineEntry and matching NativeMessage in place.
+        stubbed_ids: set[str] = set()
+        for idx in eligible_indices:
+            entry = self.timeline[idx]
+            entry.content = SHRINK_STUB_CONTENT
+            if entry.tool_call_id:
+                stubbed_ids.add(entry.tool_call_id)
+
+        for nm in self._native_messages:
+            if nm.role == "tool" and nm.tool_call_id and nm.tool_call_id in stubbed_ids and nm.content != SHRINK_STUB_CONTENT:
+                nm.content = SHRINK_STUB_CONTENT
+
+        # Pair integrity safety net — tool_call_ids preserved so this is a no-op
+        # in practice, but runs for defense in depth.
+        self._ensure_tool_pair_integrity(self.timeline)
+
+        post_tokens = self._estimate_native_messages_list_tokens(self._native_messages)
+        logger.info(
+            "cheap_shrink_tool_results",
+            entries_stubbed=len(eligible_indices),
+            tokens_before=pre_tokens,
+            tokens_after=post_tokens,
+            below_threshold=post_tokens < trigger,
+        )
+        return post_tokens < trigger
 
     def get_native_messages_to_keep_and_compress(
         self: CompressedTimeline,
@@ -331,6 +485,12 @@ Respond with ONLY a JSON object containing the summary:
         """
         Format timeline entries for the compression prompt.
 
+        HIGH-1 fix: entries whose content was previously replaced by
+        ``SHRINK_STUB_CONTENT`` (from ``cheap_shrink_tool_results``) are
+        rendered as a compact identity-only marker rather than the literal
+        stub string. Summarizing the literal ``"[cleared for context budget]"``
+        produces vacuous summaries on reload after a prior shrink.
+
         Args:
             entries: List of entries to format
 
@@ -352,8 +512,16 @@ Respond with ONLY a JSON object containing the summary:
 
         formatted_parts = []
         for entry in entries:
-            # Truncate very long entries
             content = entry.content
+
+            # HIGH-1: skip or tag already-shrunk tool_result entries so the LLM
+            # doesn't produce a summary consisting of "the agent cleared tool
+            # results". Preserve call identity via tool_call_id when present.
+            if isinstance(content, str) and content == SHRINK_STUB_CONTENT:
+                tc_id = entry.tool_call_id or "unknown"
+                formatted_parts.append(f"[Tool result id={tc_id}: previously cleared — content unavailable]")
+                continue
+
             if isinstance(content, list):
                 # Multimodal content: extract text parts for compression
                 text_parts = [b.get("text", "") for b in content if isinstance(b, dict) and "text" in b]
@@ -396,6 +564,14 @@ Respond with ONLY a JSON object containing the summary:
 
         if not self.needs_compression():
             return 0
+
+        # Phase 2 — cheap shrink: if enabled and predicted savings are enough,
+        # stub old tool_results and skip full summary. Predictive gate ensures
+        # we never summarize over stubs.
+        if self._compressed_config.enable_cheap_shrink_tool_results:
+            with self._compact_sync_lock:
+                if self.cheap_shrink_tool_results():
+                    return 0
 
         entries_to_keep, entries_to_compress = self.get_entries_to_keep_and_compress()
 
@@ -451,6 +627,12 @@ Respond with ONLY a JSON object containing the summary:
 
         if not self.needs_compression():
             return 0
+
+        # Phase 2 — cheap shrink under async lock.
+        if self._compressed_config.enable_cheap_shrink_tool_results:
+            async with self._compact_lock:
+                if self.cheap_shrink_tool_results():
+                    return 0
 
         entries_to_keep, entries_to_compress = self.get_entries_to_keep_and_compress()
 
@@ -517,6 +699,11 @@ Respond with ONLY a JSON object containing the summary:
         """
         compressed_count = len(entries_to_compress)
         compression_timestamp = datetime.now()
+
+        # Stamp so the next save() rolls the active snapshot to a new
+        # `timeline-after-compress-{ts}.json` file. See
+        # ``CompressedTimeline.save`` for the snapshot rollover logic.
+        self._last_compression_at = compression_timestamp
 
         # Calculate how many native messages to keep
         # We need to keep messages corresponding to entries_to_keep
@@ -679,6 +866,123 @@ Respond with ONLY a JSON object containing the summary:
 
         # Apply compression with the provided summary
         return self._apply_compression(entries_to_keep, entries_to_compress, summary)
+
+    # ------------------------------------------------------------------
+    # Phase 3 — reactive compaction + circuit breaker
+    # ------------------------------------------------------------------
+
+    def _circuit_cooldown_seconds(self: CompressedTimeline) -> int:
+        """Circuit-breaker cooldown from env `DANA_CIRCUIT_COOLDOWN_SECONDS` (default 300)."""
+        import os
+
+        raw = os.getenv("DANA_CIRCUIT_COOLDOWN_SECONDS")
+        if not raw:
+            return 300
+        try:
+            v = int(raw)
+            return max(1, v)
+        except (ValueError, TypeError):
+            return 300
+
+    def reset_circuit(self: CompressedTimeline) -> None:
+        """Force-close the compaction circuit (ops escape hatch)."""
+        self._consecutive_compact_failures = 0
+        self._compaction_disabled = False
+        self._circuit_opened_at = None
+
+    def _check_circuit_and_probe(self: CompressedTimeline) -> None:
+        """Raise `CompactCircuitOpenError` if circuit open and cooldown unexpired.
+
+        If cooldown has elapsed, enter half-open state (disabled=False) so ONE
+        attempt can run. Failure re-opens; success closes via reset_circuit().
+        """
+        from dana.common.llm.types import CompactCircuitOpenError
+
+        if not self._compaction_disabled:
+            return
+        opened_at = self._circuit_opened_at
+        if opened_at is None:
+            return
+        cooldown = self._circuit_cooldown_seconds()
+        elapsed = (datetime.now() - opened_at).total_seconds()
+        if elapsed < cooldown:
+            remaining = cooldown - elapsed
+            raise CompactCircuitOpenError(f"compaction circuit open; cooldown remaining: {remaining:.0f}s")
+        # Half-open: allow one probe.
+        self._compaction_disabled = False
+
+    def reactive_compact(self: CompressedTimeline, attempt: int) -> None:
+        """Drop old kept entries progressively, prune forward orphans, re-summarize.
+
+        Drop counts: attempt 1 → 5, 2 → 10, 3 → 20. Always runs the full
+        summary path (never shrink-bypass). Raises `CompactCircuitOpenError`
+        when the circuit is open and cooldown not elapsed.
+        """
+        from dana.common.llm.types import CompactCircuitOpenError
+
+        with self._compact_sync_lock:
+            self._check_circuit_and_probe()
+
+            drop_count = {1: 5, 2: 10, 3: 20}.get(attempt, 20)
+            if len(self.timeline) <= drop_count:
+                drop_count = max(0, len(self.timeline) - 1)
+
+            if drop_count <= 0:
+                # Nothing useful to drop — treat as attempt failure.
+                self._consecutive_compact_failures += 1
+                if self._consecutive_compact_failures >= 3:
+                    self._compaction_disabled = True
+                    self._circuit_opened_at = datetime.now()
+                    raise CompactCircuitOpenError(f"reactive_compact cannot drop entries; timeline={len(self.timeline)}")
+                return
+
+            # Drop oldest N kept entries, then prune forward-orphans.
+            self.timeline = self.timeline[drop_count:]
+            self.timeline = self._remove_forward_orphans(self.timeline)
+            self._ensure_tool_pair_integrity(self.timeline)
+
+            # Mirror truncation on native messages (keep tail of same length).
+            keep_n = len(self.timeline)
+            if keep_n == 0:
+                self._native_messages = []
+            else:
+                self._native_messages = self._native_messages[-keep_n:] if keep_n <= len(self._native_messages) else self._native_messages
+
+            # Re-summarize via internal primitives so failures propagate into the
+            # circuit-breaker counter (compress() swallows exceptions).
+            try:
+                llm_call_fn = self._llm_call_fn or self._get_default_llm_call_fn()
+                if llm_call_fn is None:
+                    raise RuntimeError("no LLM call function available for reactive_compact")
+                entries_to_keep, entries_to_compress = self.get_entries_to_keep_and_compress()
+                n = 0
+                if entries_to_compress:
+                    prompt = self.build_compression_prompt()
+                    if prompt:
+                        response = llm_call_fn(prompt)
+                        summary = self._extract_summary_from_response(response)
+                        if not summary:
+                            raise RuntimeError("empty summary from LLM")
+                        n = self._apply_compression(entries_to_keep, entries_to_compress, summary)
+                # Success — close circuit and reset counter.
+                self._consecutive_compact_failures = 0
+                self._compaction_disabled = False
+                self._circuit_opened_at = None
+                logger.info(
+                    "reactive_compact_done",
+                    attempt=attempt,
+                    entries_dropped=drop_count,
+                    entries_compressed=n,
+                )
+            except CompactCircuitOpenError:
+                raise
+            except Exception as e:
+                self._consecutive_compact_failures += 1
+                if self._consecutive_compact_failures >= 3:
+                    self._compaction_disabled = True
+                    self._circuit_opened_at = datetime.now()
+                    raise CompactCircuitOpenError(f"reactive_compact failed 3x consecutive; last error: {e}") from e
+                raise
 
     def get_entries_for_compression(self: CompressedTimeline) -> list[TimelineEntry]:
         """

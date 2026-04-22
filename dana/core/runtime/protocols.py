@@ -8,6 +8,7 @@ are @runtime_checkable so isinstance() checks work at runtime.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -92,9 +93,17 @@ class PromptBuilderProtocol(Protocol):
 class LLMCallerProtocol(Protocol):
     """Calls an LLM (sync and async variants)."""
 
-    def call_llm(self, messages: list[LLMMessage]) -> LLMResponse: ...
+    def call_llm(
+        self,
+        messages: list[LLMMessage],
+        messages_fn: Callable[[], list[LLMMessage]] | None = None,
+    ) -> LLMResponse: ...
 
-    async def call_llm_async(self, messages: list[LLMMessage]) -> LLMResponse: ...
+    async def call_llm_async(
+        self,
+        messages: list[LLMMessage],
+        messages_fn: Callable[[], list[LLMMessage]] | None = None,
+    ) -> LLMResponse: ...
 
 
 @runtime_checkable

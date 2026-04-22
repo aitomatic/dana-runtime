@@ -166,7 +166,7 @@ def test_all_providers_fail_raises_last_exception(mock_sleep):
     # Patch _invoke_llm_sync: call 1 = primary (transient), call 2 = fallback (transient)
     call_count = {"n": 0}
 
-    def fake_invoke(llm, messages):
+    def fake_invoke(llm, messages, messages_fn=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
             raise ProviderError("rate limit on primary")

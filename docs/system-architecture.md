@@ -431,6 +431,41 @@ Timeline.add_entry(entry)
 - `compression_threshold`: 0.8 (compress at 80% usage)
 - Compression reduces tokens to ~60% of original
 
+### Compaction Parity Upgrades (Phases 1–4)
+
+The compression pipeline now has three additional layers for parity with
+OpenClaude-style engines:
+
+1. **Single-knob heuristic trigger (P3)** — `DANA_COMPACT_TRIGGER_TOKENS`
+   (default 150000, clamp `[8k, 2M]`) gates `needs_compression()`. Optional
+   `system_tokens_fn` / `tools_tokens_fn` callbacks fold system-prompt and
+   tools-schema size into the estimate. Always `len(str)/4`.
+2. **Cheap client-side shrink (P6)** — `cheap_shrink_tool_results()` stubs
+   old `tool_result` bodies to `"[cleared for context budget]"` while
+   preserving `tool_call_id`. Opt-in via
+   `CompressedTimelineConfig.enable_cheap_shrink_tool_results`. A predictive
+   gate skips shrink when it cannot close the token gap alone — prevents
+   vacuous summaries over stubs.
+3. **Reactive compact + circuit breaker (P2)** — `PromptTooLongError`
+   raised by providers is caught in `llm_caller._invoke_llm_sync/async`,
+   which calls `timeline.reactive_compact(attempt)` (drop 5→10→20 oldest
+   kept entries + forward-orphan pruning + full summary) with exponential
+   backoff 1s/3s. After 3 consecutive failures the circuit opens;
+   cooldown `DANA_CIRCUIT_COOLDOWN_SECONDS` (default 300s) plus half-open
+   probe provide automatic recovery. Kill switch via
+   `DANA_DISABLE_REACTIVE_COMPACT=1`.
+
+**Provider PTL mapping:**
+| Provider | Detection |
+| --- | --- |
+| Anthropic / Anthropic-like | `BadRequestError` body `type="invalid_request_error"` + `"prompt is too long"` in message |
+| OpenAI / Azure / Moonshot | `APIStatusError` body `code="context_length_exceeded"` |
+| Gemini | No SDK error — post-hoc WARNING log on `finish_reason=="MAX_TOKENS"` (reactive compact unavailable; tune `DANA_COMPACT_TRIGGER_TOKENS` conservatively) |
+
+**Telemetry:** `dana/core/timeline/telemetry.py` exposes
+`CompressionLogFields` TypedDict allowlist. An AST-based unit test asserts
+log `extra={...}` keys stay within the allowlist (no prompt-content leakage).
+
 ## Error Handling & Recovery
 
 ```

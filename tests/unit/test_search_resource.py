@@ -184,3 +184,87 @@ class TestGrepPathInteraction:
         )
         assert "No matches found" not in result
         assert "value" in result
+
+
+class TestGrepSingleFileAutoPromotion:
+    """When `path` is a single file, files_with_matches is nearly useless
+    (returns only the path the caller already has, which is easily misread
+    as an empty result). The main Grep tool auto-promotes to content mode
+    with an explanatory header.
+
+    Regression: Forge/Watts session aff85fde-... — agent passed a file path
+    with default output_mode and concluded the YAML "had no VAV entries",
+    when in fact 328 lines matched.
+    """
+
+    def test_single_file_default_mode_auto_promotes_to_content(self, search_resource):
+        """Default output_mode on a file path → content mode with note."""
+        result = asyncio.run(
+            search_resource.grep(
+                pattern="core ontology",
+                path="ontology/core.owl",
+            )
+        )
+        assert "auto-promoted" in result
+        assert "files_with_matches" in result
+        assert "core ontology content" in result
+        # show_line_numbers defaults to True → expect a "1:" prefix on the hit.
+        assert "1:core ontology content" in result
+
+    def test_single_file_explicit_content_no_note(self, search_resource):
+        """Explicit output_mode='content' should not trigger the promotion note."""
+        result = asyncio.run(
+            search_resource.grep(
+                pattern="core ontology",
+                path="ontology/core.owl",
+                output_mode="content",
+            )
+        )
+        assert "auto-promoted" not in result
+        assert "core ontology content" in result
+
+    def test_single_file_explicit_count_no_promotion(self, search_resource):
+        """Explicit output_mode='count' is meaningful for a single file; do not promote."""
+        result = asyncio.run(
+            search_resource.grep(
+                pattern="core ontology",
+                path="ontology/core.owl",
+                output_mode="count",
+            )
+        )
+        assert "auto-promoted" not in result
+
+    def test_directory_path_default_mode_not_promoted(self, search_resource):
+        """files_with_matches on a directory is useful — must not be promoted."""
+        result = asyncio.run(
+            search_resource.grep(
+                pattern="ontology content",
+                path="ontology",
+            )
+        )
+        assert "auto-promoted" not in result
+        assert "core.owl" in result
+
+    def test_single_file_no_matches_still_notes_promotion(self, search_resource):
+        """Even when no matches, the promotion note should appear so the
+        caller understands why the output looks different."""
+        result = asyncio.run(
+            search_resource.grep(
+                pattern="xyznotfoundxyz",
+                path="ontology/core.owl",
+            )
+        )
+        assert "auto-promoted" in result
+        assert "No matches found" in result
+
+    def test_single_file_absolute_path_auto_promotes(self, search_resource, tmp_workspace):
+        """Absolute-path single-file input also triggers auto-promotion."""
+        abs_path = str(tmp_workspace / "ontology" / "core.owl")
+        result = asyncio.run(
+            search_resource.grep(
+                pattern="core ontology",
+                path=abs_path,
+            )
+        )
+        assert "auto-promoted" in result
+        assert "core ontology content" in result
