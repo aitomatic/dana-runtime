@@ -558,6 +558,12 @@ class OpenAICompatibleProvider(LLMProvider):
 
         request_kwargs = {"model": self.model, "input": responses_input, "stream": True, **filtered_kwargs}
 
+        # Default summary="auto" so reasoning summary deltas actually stream. Without it,
+        # Azure/OpenAI emit reasoning internally but no summary_text delta events fire.
+        reasoning_cfg = dict(request_kwargs.get("reasoning") or {})
+        reasoning_cfg.setdefault("summary", "auto")
+        request_kwargs["reasoning"] = reasoning_cfg
+
         if tools:
             request_kwargs["tools"] = self._prepare_tools_for_responses(tools)
 
@@ -586,16 +592,30 @@ class OpenAICompatibleProvider(LLMProvider):
                         },
                     )
 
-            elif event.type == "response.reasoning.delta":
+            elif event.type in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
+                # Both summary deltas (when reasoning.summary="auto") and raw reasoning
+                # text deltas (trusted access) carry .delta strings; surface as "thinking".
                 yield LLMStreamChunk(type="thinking", content=event.delta)
+
+    def _responses_api_supported(self) -> bool:
+        """Whether the underlying endpoint exposes the Responses API at all.
+
+        OpenAI-compatible endpoints support it unconditionally. Azure subclasses
+        override this to gate on api-version (Responses API requires
+        api-version >= 2025-03-01-preview).
+        """
+        return True
 
     def _should_use_responses_api(self) -> bool:
         """Determine whether to use Responses API or Chat Completions.
 
-        Priority: config flag > model prefix > default (Chat Completions).
+        Priority: explicit config flag > endpoint capability + model prefix.
         """
         if self._use_responses_api is not None:
             return self._use_responses_api
+
+        if not self._responses_api_supported():
+            return False
 
         model_lower = self.model.lower()
         for prefix in RESPONSES_API_PREFIXES:
