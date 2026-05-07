@@ -748,6 +748,18 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             output_state = "exit"
 
         if not tool_calls or len(tool_calls) == 0:
+            # Persist reasoning even on direct-answer turns. Without this, the
+            # model's internal reasoning (LLMResponse.reasoning_content for
+            # gpt-5/o3/o4, or <thinking> tags / JSON reasoning fields for other
+            # codecs) is silently dropped whenever the agent answers without
+            # invoking a tool. Same emit pattern as the tool-calls branch below.
+            if reasoning and len(reasoning) > 0:
+                timeline.add_entry(
+                    TimelineEntry(
+                        entry_type=TimelineEntryType.AGENT_THOUGHTS,
+                        content=reasoning,
+                    )
+                )
             response = response if (response and len(response) > 0) else "No response generated"
             timeline.add_entry(
                 TimelineEntry(
