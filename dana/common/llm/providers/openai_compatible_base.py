@@ -378,9 +378,13 @@ class OpenAICompatibleProvider(LLMProvider):
 
         request_kwargs = {"model": self.model, "input": responses_input, **filtered_kwargs}
 
-        # Default summary="auto" so reasoning_content gets populated. If reasoning is
-        # passed without summary, we still merge our default in.
+        # Default reasoning config:
+        #   effort="medium"  — without this, gpt-5* sometimes skips reasoning entirely,
+        #                      making reasoning_content nondeterministic. Callers wanting
+        #                      faster/cheaper turns can override (e.g. effort="low").
+        #   summary="auto"   — required for reasoning summary text to be returned at all.
         reasoning_cfg = dict(request_kwargs.get("reasoning") or {})
+        reasoning_cfg.setdefault("effort", "medium")
         reasoning_cfg.setdefault("summary", "auto")
         request_kwargs["reasoning"] = reasoning_cfg
 
@@ -668,9 +672,12 @@ class OpenAICompatibleProvider(LLMProvider):
 
         request_kwargs = {"model": self.model, "input": responses_input, "stream": True, **filtered_kwargs}
 
-        # Default summary="auto" so reasoning summary deltas actually stream. Without it,
-        # Azure/OpenAI emit reasoning internally but no summary_text delta events fire.
+        # Default reasoning config (mirrors _chat_via_responses):
+        #   effort="medium"  — gpt-5* without explicit effort sometimes skips reasoning,
+        #                      yielding zero thinking deltas. Override for cheaper turns.
+        #   summary="auto"   — required for reasoning summary delta events to fire.
         reasoning_cfg = dict(request_kwargs.get("reasoning") or {})
+        reasoning_cfg.setdefault("effort", "medium")
         reasoning_cfg.setdefault("summary", "auto")
         request_kwargs["reasoning"] = reasoning_cfg
 

@@ -237,6 +237,48 @@ class TestRouting:
         provider.client.chat.completions.create.assert_awaited_once()
 
 
+class TestReasoningDefaults:
+    @pytest.mark.asyncio
+    async def test_defaults_effort_medium_and_summary_auto(self):
+        """Without explicit reasoning kwargs, wrapper sets effort+summary so the
+        model actually reasons and the summary text comes back."""
+        provider = _make_provider()
+        msg = _make_output_item("message", content=[_make_message_content("done")])
+        provider.client.responses.create = AsyncMock(return_value=_make_response([msg]))
+
+        await provider._chat_via_responses([LLMMessage(role="user", content="hi")])
+
+        assert provider.client.responses.create.await_args is not None
+        sent_reasoning = provider.client.responses.create.await_args.kwargs["reasoning"]
+        assert sent_reasoning == {"effort": "medium", "summary": "auto"}
+
+    @pytest.mark.asyncio
+    async def test_caller_effort_overrides_default(self):
+        provider = _make_provider()
+        msg = _make_output_item("message", content=[_make_message_content("done")])
+        provider.client.responses.create = AsyncMock(return_value=_make_response([msg]))
+
+        await provider._chat_via_responses([LLMMessage(role="user", content="hi")], reasoning={"effort": "low"})
+
+        assert provider.client.responses.create.await_args is not None
+        sent_reasoning = provider.client.responses.create.await_args.kwargs["reasoning"]
+        # caller's effort wins, summary still defaulted
+        assert sent_reasoning == {"effort": "low", "summary": "auto"}
+
+    @pytest.mark.asyncio
+    async def test_caller_summary_none_overrides_default(self):
+        """Caller can opt out of summary by passing it explicitly (e.g. summary='detailed')."""
+        provider = _make_provider()
+        msg = _make_output_item("message", content=[_make_message_content("done")])
+        provider.client.responses.create = AsyncMock(return_value=_make_response([msg]))
+
+        await provider._chat_via_responses([LLMMessage(role="user", content="hi")], reasoning={"summary": "detailed"})
+
+        assert provider.client.responses.create.await_args is not None
+        sent_reasoning = provider.client.responses.create.await_args.kwargs["reasoning"]
+        assert sent_reasoning == {"effort": "medium", "summary": "detailed"}
+
+
 class TestJsonMode:
     @pytest.mark.asyncio
     async def test_json_mode_maps_to_text_format(self):
