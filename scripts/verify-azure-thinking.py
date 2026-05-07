@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Verify that dana.common.llm surfaces thinking/reasoning for Azure gpt-5.2.
 
-Checks both:
-  (a) request side — gpt-5.2 routes to Responses API for streaming (where
-      reasoning is exposed); non-streaming chat() stays on Chat Completions
-      where only reasoning_token count is available.
-  (b) response side — at least one streaming chunk with type=="thinking" is
-      yielded, and non-streaming usage carries reasoning_tokens > 0.
+Checks all three surfaces:
+  - streaming: at least one LLMStreamChunk(type="thinking") yielded
+  - non-streaming reasoning_tokens count returned in usage details
+  - non-streaming reasoning_content text populated (Responses API path)
+
+Both stream() and chat() now route to the Responses API for gpt-5/o3/o4
+when api-version supports it.
 
 Run:
     uv run python scripts/verify-azure-thinking.py
@@ -75,18 +76,25 @@ async def check_streaming(provider: AzureProvider) -> dict:
 
 
 async def check_nonstreaming(provider: AzureProvider) -> dict:
-    _hr(f"CHAT: {MODEL} (Chat Completions — only reasoning_tokens exposed)")
-    chat_kwargs = {"reasoning_effort": "medium"}
+    _hr(f"CHAT: {MODEL} (now Responses API — expect reasoning_content populated)")
+    # gpt-5* + supported api-version → wrapper routes chat() to Responses API.
+    # Pass reasoning so the model actually reasons; summary auto-defaults inside the wrapper.
+    chat_kwargs = {"reasoning": {"effort": "medium"}}
     print(f"chat kwargs: {chat_kwargs}")
     resp = await provider.chat(messages=[LLMMessage(role="user", content=PROMPT)], **chat_kwargs)
     print(f"finish_reason={resp.finish_reason}")
     print(f"usage={resp.usage}")
     print(f"reasoning_tokens={resp.reasoning_tokens}")
-    print(f"reasoning_content={'<set>' if resp.reasoning_content else None}")
+    if resp.reasoning_content:
+        preview = resp.reasoning_content[:300].replace("\n", " ")
+        print(f"reasoning_content ({len(resp.reasoning_content)} chars): {preview!r}...")
+    else:
+        print("reasoning_content=None")
     print(f"content[:200]={(resp.content or '')[:200]!r}")
     return {
         "reasoning_tokens": resp.reasoning_tokens,
         "reasoning_content_present": bool(resp.reasoning_content),
+        "reasoning_content_chars": len(resp.reasoning_content or ""),
         "content_chars": len(resp.content or ""),
     }
 
@@ -105,23 +113,18 @@ async def main() -> int:
 
     _hr("VERDICT")
     stream_ok = stream_result["uses_responses_api"] and stream_result["thinking_chunk_count"] > 0
-    chat_ok = (chat_result["reasoning_tokens"] or 0) > 0
+    chat_tokens_ok = (chat_result["reasoning_tokens"] or 0) > 0
+    chat_text_ok = chat_result["reasoning_content_present"]
 
     print(
         f"streaming thinking blocks ............. {'PASS' if stream_ok else 'FAIL'}  "
         f"({stream_result['thinking_chunk_count']} chunks, "
         f"{stream_result['thinking_chars']} chars)"
     )
-    print(f"non-streaming reasoning_tokens > 0 .... {'PASS' if chat_ok else 'FAIL'}  (tokens={chat_result['reasoning_tokens']})")
+    print(f"non-streaming reasoning_tokens > 0 .... {'PASS' if chat_tokens_ok else 'FAIL'}  (tokens={chat_result['reasoning_tokens']})")
+    print(f"non-streaming reasoning_content text .. {'PASS' if chat_text_ok else 'FAIL'}  ({chat_result['reasoning_content_chars']} chars)")
 
-    if not chat_result["reasoning_content_present"]:
-        print(
-            "note: reasoning_content is not populated for OpenAI-compat chat() — "
-            "wrapper only exposes token count, not the reasoning text. "
-            "Use stream() to consume thinking content."
-        )
-
-    return 0 if (stream_ok and chat_ok) else 1
+    return 0 if (stream_ok and chat_tokens_ok and chat_text_ok) else 1
 
 
 if __name__ == "__main__":

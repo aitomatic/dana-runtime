@@ -256,63 +256,17 @@ class OpenAICompatibleProvider(LLMProvider):
         return result
 
     async def chat(self, messages: list[LLMMessage], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
-        """Send messages and get a response via Chat Completions API."""
+        """Send messages and get a response.
+
+        Routes to the Responses API for reasoning models (gpt-5/o3/o4) when the
+        endpoint supports it, so callers get reasoning text in
+        ``LLMResponse.reasoning_content``. Falls back to Chat Completions
+        otherwise. Mirrors ``stream()`` routing.
+        """
         try:
-            _, openai_messages = self.prepare_messages(messages)
-
-            filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ["json_mode"] and v is not None}
-            filtered_kwargs = self._filter_params_for_model(self.model, filtered_kwargs)
-
-            request_kwargs = {"model": self.model, "messages": openai_messages, **filtered_kwargs}
-
-            if tools:
-                request_kwargs["tools"] = self.prepare_tools(tools)
-                request_kwargs["tool_choice"] = "auto"
-
-            if kwargs.get("json_mode", False):
-                request_kwargs["response_format"] = {"type": "json_object"}
-
-            response = await self.client.chat.completions.create(
-                **request_kwargs,
-                timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
-            )
-
-            choice = response.choices[0]
-            message = choice.message
-
-            if hasattr(message, "tool_calls") and message.tool_calls:
-                content = message.content or ""
-                tool_calls = message.tool_calls
-            else:
-                content = message.content or ""
-                tool_calls = None
-
-            usage = None
-            reasoning_tokens = None
-            if response.usage:
-                usage = {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens,
-                }
-                if hasattr(response.usage, "prompt_tokens_details") and response.usage.prompt_tokens_details:
-                    details = response.usage.prompt_tokens_details
-                    if hasattr(details, "cached_tokens"):
-                        usage["cached_tokens"] = details.cached_tokens
-                if hasattr(response.usage, "completion_tokens_details") and response.usage.completion_tokens_details:
-                    output_details = response.usage.completion_tokens_details
-                    if hasattr(output_details, "reasoning_tokens") and output_details.reasoning_tokens:
-                        reasoning_tokens = output_details.reasoning_tokens
-
-            return LLMResponse(
-                content=content,
-                model=response.model,
-                usage=usage,
-                finish_reason=choice.finish_reason,
-                tool_calls=tool_calls,
-                reasoning_tokens=reasoning_tokens,
-            )
-
+            if self._should_use_responses_api():
+                return await self._chat_via_responses(messages, tools, **kwargs)
+            return await self._chat_via_chat_completions(messages, tools, **kwargs)
         except (APITimeoutError, httpx.TimeoutException) as e:
             raise LLMTimeoutError(f"OpenAI-compatible API timeout: {e}") from e
         except APIConnectionError as e:
@@ -349,6 +303,162 @@ class OpenAICompatibleProvider(LLMProvider):
                 pass
             logger.error("OpenAI-compatible API error", error=str(e), error_type=type(e).__name__, exc_info=True)
             raise
+
+    async def _chat_via_chat_completions(self, messages: list[LLMMessage], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
+        """Non-streaming chat via the legacy Chat Completions endpoint.
+
+        Used for non-reasoning models or when the Responses API isn't available
+        (e.g. Azure with api-version < 2025-03-01-preview). Reasoning text is not
+        surfaced on this path; only ``reasoning_tokens`` count if the API returns it.
+        """
+        _, openai_messages = self.prepare_messages(messages)
+
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ["json_mode"] and v is not None}
+        filtered_kwargs = self._filter_params_for_model(self.model, filtered_kwargs)
+
+        request_kwargs = {"model": self.model, "messages": openai_messages, **filtered_kwargs}
+
+        if tools:
+            request_kwargs["tools"] = self.prepare_tools(tools)
+            request_kwargs["tool_choice"] = "auto"
+
+        if kwargs.get("json_mode", False):
+            request_kwargs["response_format"] = {"type": "json_object"}
+
+        response = await self.client.chat.completions.create(
+            **request_kwargs,
+            timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
+        )
+
+        choice = response.choices[0]
+        message = choice.message
+        content = message.content or ""
+        tool_calls = message.tool_calls if (hasattr(message, "tool_calls") and message.tool_calls) else None
+
+        usage = None
+        reasoning_tokens = None
+        if response.usage:
+            usage = {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens,
+            }
+            if hasattr(response.usage, "prompt_tokens_details") and response.usage.prompt_tokens_details:
+                cached = getattr(response.usage.prompt_tokens_details, "cached_tokens", None)
+                if cached is not None:
+                    usage["cached_tokens"] = cached
+            if hasattr(response.usage, "completion_tokens_details") and response.usage.completion_tokens_details:
+                reasoning_tokens = getattr(response.usage.completion_tokens_details, "reasoning_tokens", None) or None
+
+        return LLMResponse(
+            content=content,
+            model=response.model,
+            usage=usage,
+            finish_reason=choice.finish_reason,
+            tool_calls=tool_calls,
+            reasoning_tokens=reasoning_tokens,
+        )
+
+    async def _chat_via_responses(self, messages: list[LLMMessage], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
+        """Non-streaming chat via the Responses API.
+
+        Surfaces reasoning summary text in ``LLMResponse.reasoning_content`` for
+        gpt-5/o3/o4 models. Tool calls are returned in the same Pydantic shape
+        Chat Completions emits (``ChatCompletionMessageToolCall``) so downstream
+        parsers (e.g. ``response_parser._to_tool_call_dicts``) see no difference.
+        """
+        from openai.types.chat import ChatCompletionMessageToolCall
+        from openai.types.chat.chat_completion_message_tool_call import Function
+
+        _, openai_messages = self.prepare_messages(messages)
+        responses_input = self._convert_to_responses_input(openai_messages)
+
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ["json_mode"] and v is not None}
+        filtered_kwargs = self._filter_params_for_model(self.model, filtered_kwargs)
+
+        request_kwargs = {"model": self.model, "input": responses_input, **filtered_kwargs}
+
+        # Default summary="auto" so reasoning_content gets populated. If reasoning is
+        # passed without summary, we still merge our default in.
+        reasoning_cfg = dict(request_kwargs.get("reasoning") or {})
+        reasoning_cfg.setdefault("summary", "auto")
+        request_kwargs["reasoning"] = reasoning_cfg
+
+        if tools:
+            request_kwargs["tools"] = self._prepare_tools_for_responses(tools)
+
+        if kwargs.get("json_mode", False):
+            # Responses API uses text.format instead of response_format.
+            request_kwargs["text"] = {"format": {"type": "json_object"}}
+
+        response = await self.client.responses.create(
+            **request_kwargs,
+            timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
+        )
+
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_calls_list: list = []
+
+        for item in response.output:
+            item_type = getattr(item, "type", None)
+            if item_type == "reasoning":
+                for s in item.summary or []:
+                    text = getattr(s, "text", None)
+                    if text:
+                        reasoning_parts.append(text)
+            elif item_type == "message":
+                for c in item.content or []:
+                    if getattr(c, "type", None) == "output_text":
+                        text = getattr(c, "text", "") or ""
+                        if text:
+                            content_parts.append(text)
+            elif item_type == "function_call":
+                tool_calls_list.append(
+                    ChatCompletionMessageToolCall(
+                        id=item.call_id,
+                        type="function",
+                        function=Function(name=item.name, arguments=item.arguments or ""),
+                    )
+                )
+
+        # Map Responses API status to a Chat-Completions-style finish_reason so
+        # callers don't need to know which path was used.
+        if tool_calls_list:
+            finish_reason = "tool_calls"
+        elif response.status == "incomplete":
+            details = getattr(response, "incomplete_details", None)
+            reason = getattr(details, "reason", None) if details else None
+            finish_reason = "length" if reason == "max_output_tokens" else "incomplete"
+        else:
+            finish_reason = "stop"
+
+        usage = None
+        reasoning_tokens = None
+        if response.usage:
+            usage = {
+                "prompt_tokens": response.usage.input_tokens,
+                "completion_tokens": response.usage.output_tokens,
+                "total_tokens": response.usage.total_tokens,
+            }
+            input_details = getattr(response.usage, "input_tokens_details", None)
+            if input_details:
+                cached = getattr(input_details, "cached_tokens", None)
+                if cached is not None:
+                    usage["cached_tokens"] = cached
+            output_details = getattr(response.usage, "output_tokens_details", None)
+            if output_details:
+                reasoning_tokens = getattr(output_details, "reasoning_tokens", None) or None
+
+        return LLMResponse(
+            content="".join(content_parts),
+            model=response.model,
+            usage=usage,
+            finish_reason=finish_reason,
+            tool_calls=tool_calls_list or None,
+            reasoning_tokens=reasoning_tokens,
+            reasoning_content="".join(reasoning_parts) or None,
+        )
 
     # --- Embedding methods ---
 
