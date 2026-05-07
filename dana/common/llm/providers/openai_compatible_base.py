@@ -66,19 +66,17 @@ DEFAULT_REASONING_EFFORT = "low"
 
 
 def _serialize_output_item(item: Any) -> dict:
-    """Convert a Responses API output item to a JSON-serializable dict.
+    """Convert a Responses API output item to a JSON-serializable dict that's
+    safe to send back as ``input[]``.
 
-    Items are pydantic models in openai-python; ``model_dump()`` is the canonical
-    path. Falls back to manual extraction so we never crash on schema drift —
+    Output-side reasoning items carry fields like ``status`` and ``content`` that
+    are server metadata only — the input schema rejects them with HTTP 400
+    ``unknown_parameter``. We restrict to the documented input-side fields:
+    ``type``, ``id``, ``summary``, ``encrypted_content``.
+
+    Falls back to manual extraction so schema drift never crashes capture —
     storing partial state is better than dropping the entry entirely.
     """
-    dump = getattr(item, "model_dump", None)
-    if callable(dump):
-        try:
-            return dump(exclude_none=False, mode="json")
-        except Exception:
-            pass
-
     summary_list: list[dict] = []
     for s in getattr(item, "summary", None) or []:
         s_dump = getattr(s, "model_dump", None)
@@ -91,6 +89,7 @@ def _serialize_output_item(item: Any) -> dict:
         text = getattr(s, "text", None)
         if text is not None:
             summary_list.append({"type": getattr(s, "type", "summary_text"), "text": text})
+
     return {
         "type": getattr(item, "type", "reasoning"),
         "id": getattr(item, "id", None),
@@ -105,6 +104,22 @@ def _looks_like_include_rejection(err: BadRequestError) -> bool:
     loosely so the fallback fires in all observed forms."""
     msg = str(err).lower()
     return "include" in msg and ("reasoning" in msg or "encrypted" in msg or "unsupported" in msg)
+
+
+def _looks_like_reasoning_rejection(err: BadRequestError) -> bool:
+    """Heuristic for replayed-reasoning-item rejection. Covers:
+      - stale ``id`` ("not found", "expired", "session")
+      - item-shape mismatch ("unknown_parameter" pointing at ``input[N].*``)
+      - explicit reasoning-content rejection ("reasoning_item")
+    Matches loosely; false positives just trigger one extra request without
+    items, which is acceptable degradation."""
+    msg = str(err).lower()
+    return (
+        ("input[" in msg and "reasoning" not in msg.split("input[")[0])
+        or "reasoning_item" in msg
+        or ("reasoning" in msg and ("not found" in msg or "expired" in msg or "session" in msg))
+        or ("unknown_parameter" in msg and "input[" in msg)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +594,21 @@ class OpenAICompatibleProvider(LLMProvider):
                 )
                 self._include_unsupported = True
                 request_kwargs.pop("include", None)
+                response = await self.client.responses.create(
+                    **request_kwargs,
+                    timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
+                )
+            elif _looks_like_reasoning_rejection(e):
+                # Stale reasoning id, item-shape mismatch (e.g. unknown field
+                # like 'status' on input), or model refusing replay mid-turn.
+                # Strip reasoning items from input[] and retry once so the turn
+                # still completes — degrades to flat-text replay rather than
+                # failing the user's request entirely.
+                logger.warning(
+                    "responses.create rejected replayed reasoning items; retrying without items",
+                    error=str(e),
+                )
+                request_kwargs["input"] = [item for item in request_kwargs["input"] if item.get("type") != "reasoning"]
                 response = await self.client.responses.create(
                     **request_kwargs,
                     timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
