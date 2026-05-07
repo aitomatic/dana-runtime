@@ -1,6 +1,7 @@
 """OpenAI-compatible provider base class for OpenAI and Azure."""
 
 import json
+import os
 from typing import Any
 
 import httpx
@@ -52,6 +53,45 @@ MODEL_RESTRICTIONS: dict[str, dict] = {
 # Model prefixes that default to Responses API
 RESPONSES_API_PREFIXES = ("gpt-5", "o3-", "o4-", "o3", "o4")
 
+# Valid reasoning effort levels accepted by the OpenAI Responses API.
+# "minimal" is gpt-5-only; the SDK rejects unknown values, so validate at the wrapper.
+VALID_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
+
+# Generic fallback env var when no provider-specific override is set.
+GENERIC_REASONING_EFFORT_ENV = "LLM_REASONING_EFFORT"
+
+
+DEFAULT_REASONING_EFFORT = "low"
+
+
+def _resolve_reasoning_effort(provider_env_var: str | None) -> str:
+    """Resolve default reasoning effort from env, with validation.
+
+    Precedence:
+      1. provider-specific env var (e.g. ``AZURE_THINKING_EFFORT``)
+      2. generic ``LLM_REASONING_EFFORT``
+      3. hardcoded ``DEFAULT_REASONING_EFFORT`` ("low" — favors latency/cost;
+         operators can opt in to deeper reasoning per provider via env)
+
+    Invalid values are logged and ignored so a typo in env doesn't break calls.
+    """
+    for env_name in (provider_env_var, GENERIC_REASONING_EFFORT_ENV):
+        if not env_name:
+            continue
+        raw = os.getenv(env_name)
+        if not raw:
+            continue
+        normalized = raw.strip().lower()
+        if normalized in VALID_REASONING_EFFORTS:
+            return normalized
+        logger.warning(
+            "ignoring invalid reasoning effort env var",
+            env_var=env_name,
+            value=raw,
+            valid=sorted(VALID_REASONING_EFFORTS),
+        )
+    return DEFAULT_REASONING_EFFORT
+
 
 def make_logging_http_client(timeout_seconds: int) -> httpx.AsyncClient:
     """Build an ``httpx.AsyncClient`` with request/response hooks.
@@ -85,6 +125,13 @@ class OpenAICompatibleProvider(LLMProvider):
     client: Any  # AsyncOpenAI or AsyncAzureOpenAI
     model: str
     _use_responses_api: bool | None = None
+    # Subclasses set this to expose a provider-specific knob, e.g.
+    # ``AZURE_THINKING_EFFORT`` or ``OPENAI_THINKING_EFFORT``. Resolved at call
+    # time so env changes take effect without process restart in tests.
+    _REASONING_EFFORT_ENV_VAR: str | None = None
+
+    def _default_reasoning_effort(self) -> str:
+        return _resolve_reasoning_effort(self._REASONING_EFFORT_ENV_VAR)
 
     @property
     def supports_native_tools(self) -> bool:
@@ -379,12 +426,13 @@ class OpenAICompatibleProvider(LLMProvider):
         request_kwargs = {"model": self.model, "input": responses_input, **filtered_kwargs}
 
         # Default reasoning config:
-        #   effort="medium"  — without this, gpt-5* sometimes skips reasoning entirely,
-        #                      making reasoning_content nondeterministic. Callers wanting
-        #                      faster/cheaper turns can override (e.g. effort="low").
-        #   summary="auto"   — required for reasoning summary text to be returned at all.
+        #   effort  — without explicit effort, gpt-5* sometimes skips reasoning entirely,
+        #             making reasoning_content nondeterministic. Resolved from the provider's
+        #             env var (e.g. AZURE_THINKING_EFFORT) → LLM_REASONING_EFFORT → "low".
+        #             Caller-supplied reasoning.effort always wins.
+        #   summary="auto"  — required for reasoning summary text to be returned at all.
         reasoning_cfg = dict(request_kwargs.get("reasoning") or {})
-        reasoning_cfg.setdefault("effort", "medium")
+        reasoning_cfg.setdefault("effort", self._default_reasoning_effort())
         reasoning_cfg.setdefault("summary", "auto")
         request_kwargs["reasoning"] = reasoning_cfg
 
@@ -673,11 +721,11 @@ class OpenAICompatibleProvider(LLMProvider):
         request_kwargs = {"model": self.model, "input": responses_input, "stream": True, **filtered_kwargs}
 
         # Default reasoning config (mirrors _chat_via_responses):
-        #   effort="medium"  — gpt-5* without explicit effort sometimes skips reasoning,
-        #                      yielding zero thinking deltas. Override for cheaper turns.
-        #   summary="auto"   — required for reasoning summary delta events to fire.
+        #   effort  — env-driven default (provider env → LLM_REASONING_EFFORT → "low")
+        #             so gpt-5* deterministically reasons. Caller can override per-call.
+        #   summary="auto"  — required for reasoning summary delta events to fire.
         reasoning_cfg = dict(request_kwargs.get("reasoning") or {})
-        reasoning_cfg.setdefault("effort", "medium")
+        reasoning_cfg.setdefault("effort", self._default_reasoning_effort())
         reasoning_cfg.setdefault("summary", "auto")
         request_kwargs["reasoning"] = reasoning_cfg
 

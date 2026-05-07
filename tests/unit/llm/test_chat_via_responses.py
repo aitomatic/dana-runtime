@@ -238,10 +238,17 @@ class TestRouting:
 
 
 class TestReasoningDefaults:
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        monkeypatch.delenv("LLM_REASONING_EFFORT", raising=False)
+        monkeypatch.delenv("OPENAI_THINKING_EFFORT", raising=False)
+        monkeypatch.delenv("AZURE_THINKING_EFFORT", raising=False)
+        yield
+
     @pytest.mark.asyncio
-    async def test_defaults_effort_medium_and_summary_auto(self):
-        """Without explicit reasoning kwargs, wrapper sets effort+summary so the
-        model actually reasons and the summary text comes back."""
+    async def test_defaults_effort_low_and_summary_auto(self):
+        """Without explicit reasoning kwargs and no env override, wrapper falls
+        back to effort='low' (favors latency/cost; ops can dial higher via env)."""
         provider = _make_provider()
         msg = _make_output_item("message", content=[_make_message_content("done")])
         provider.client.responses.create = AsyncMock(return_value=_make_response([msg]))
@@ -250,7 +257,7 @@ class TestReasoningDefaults:
 
         assert provider.client.responses.create.await_args is not None
         sent_reasoning = provider.client.responses.create.await_args.kwargs["reasoning"]
-        assert sent_reasoning == {"effort": "medium", "summary": "auto"}
+        assert sent_reasoning == {"effort": "low", "summary": "auto"}
 
     @pytest.mark.asyncio
     async def test_caller_effort_overrides_default(self):
@@ -258,16 +265,16 @@ class TestReasoningDefaults:
         msg = _make_output_item("message", content=[_make_message_content("done")])
         provider.client.responses.create = AsyncMock(return_value=_make_response([msg]))
 
-        await provider._chat_via_responses([LLMMessage(role="user", content="hi")], reasoning={"effort": "low"})
+        await provider._chat_via_responses([LLMMessage(role="user", content="hi")], reasoning={"effort": "high"})
 
         assert provider.client.responses.create.await_args is not None
         sent_reasoning = provider.client.responses.create.await_args.kwargs["reasoning"]
         # caller's effort wins, summary still defaulted
-        assert sent_reasoning == {"effort": "low", "summary": "auto"}
+        assert sent_reasoning == {"effort": "high", "summary": "auto"}
 
     @pytest.mark.asyncio
-    async def test_caller_summary_none_overrides_default(self):
-        """Caller can opt out of summary by passing it explicitly (e.g. summary='detailed')."""
+    async def test_caller_summary_overrides_default(self):
+        """Caller can override summary explicitly (e.g. summary='detailed')."""
         provider = _make_provider()
         msg = _make_output_item("message", content=[_make_message_content("done")])
         provider.client.responses.create = AsyncMock(return_value=_make_response([msg]))
@@ -276,7 +283,89 @@ class TestReasoningDefaults:
 
         assert provider.client.responses.create.await_args is not None
         sent_reasoning = provider.client.responses.create.await_args.kwargs["reasoning"]
-        assert sent_reasoning == {"effort": "medium", "summary": "detailed"}
+        assert sent_reasoning == {"effort": "low", "summary": "detailed"}
+
+
+class TestReasoningEffortEnv:
+    """Env-var driven default for reasoning.effort.
+
+    Precedence: caller kwarg > provider env (e.g. AZURE_THINKING_EFFORT) > LLM_REASONING_EFFORT > "medium".
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        monkeypatch.delenv("LLM_REASONING_EFFORT", raising=False)
+        monkeypatch.delenv("OPENAI_THINKING_EFFORT", raising=False)
+        monkeypatch.delenv("AZURE_THINKING_EFFORT", raising=False)
+        yield
+
+    async def _capture_effort(self, provider):
+        msg = _make_output_item("message", content=[_make_message_content("done")])
+        provider.client.responses.create = AsyncMock(return_value=_make_response([msg]))
+        await provider._chat_via_responses([LLMMessage(role="user", content="hi")])
+        return provider.client.responses.create.await_args.kwargs["reasoning"]["effort"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("level", ["minimal", "low", "medium", "high"])
+    async def test_generic_env_sets_default(self, monkeypatch, level):
+        monkeypatch.setenv("LLM_REASONING_EFFORT", level)
+        effort = await self._capture_effort(_make_provider())
+        assert effort == level
+
+    @pytest.mark.asyncio
+    async def test_generic_env_case_insensitive_and_trims(self, monkeypatch):
+        monkeypatch.setenv("LLM_REASONING_EFFORT", "  HIGH  ")
+        effort = await self._capture_effort(_make_provider())
+        assert effort == "high"
+
+    @pytest.mark.asyncio
+    async def test_invalid_env_value_falls_back_to_default(self, monkeypatch):
+        """Invalid env values are logged + ignored; resolver returns hardcoded default."""
+        monkeypatch.setenv("LLM_REASONING_EFFORT", "ultra")
+        effort = await self._capture_effort(_make_provider())
+        assert effort == "low"
+
+    @pytest.mark.asyncio
+    async def test_azure_env_overrides_generic(self, monkeypatch):
+        from dana.common.llm.providers.azure import AzureProvider
+
+        monkeypatch.setenv("LLM_REASONING_EFFORT", "low")
+        monkeypatch.setenv("AZURE_THINKING_EFFORT", "high")
+        provider = AzureProvider.__new__(AzureProvider)
+        provider.model = "gpt-5"
+        provider.client = MagicMock()
+        provider._use_responses_api = True
+        effort = await self._capture_effort(provider)
+        assert effort == "high"
+
+    @pytest.mark.asyncio
+    async def test_openai_env_overrides_generic(self, monkeypatch):
+        from dana.common.llm.providers.openai import OpenAIProvider
+
+        monkeypatch.setenv("LLM_REASONING_EFFORT", "low")
+        monkeypatch.setenv("OPENAI_THINKING_EFFORT", "minimal")
+        provider = OpenAIProvider.__new__(OpenAIProvider)
+        provider.model = "gpt-5"
+        provider.client = MagicMock()
+        provider._use_responses_api = True
+        effort = await self._capture_effort(provider)
+        assert effort == "minimal"
+
+    @pytest.mark.asyncio
+    async def test_caller_kwarg_beats_env(self, monkeypatch):
+        monkeypatch.setenv("LLM_REASONING_EFFORT", "high")
+        provider = _make_provider()
+        msg = _make_output_item("message", content=[_make_message_content("done")])
+        provider.client.responses.create = AsyncMock(return_value=_make_response([msg]))
+
+        await provider._chat_via_responses(
+            [LLMMessage(role="user", content="hi")],
+            reasoning={"effort": "low"},
+        )
+
+        sent = provider.client.responses.create.await_args.kwargs["reasoning"]
+        assert sent["effort"] == "low"
+        assert sent["summary"] == "auto"
 
 
 class TestJsonMode:
