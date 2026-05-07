@@ -21,6 +21,13 @@ class AzureProvider(OpenAICompatibleProvider):
     # Valid values: "minimal" | "low" | "medium" | "high".
     _REASONING_EFFORT_ENV_VAR = "AZURE_THINKING_EFFORT"
 
+    @property
+    def name(self) -> str:
+        return "azure"
+
+    def _endpoint_url(self) -> str:
+        return getattr(self, "azure_endpoint", "") or ""
+
     def _responses_api_supported(self) -> bool:
         # api-version format is "YYYY-MM-DD" or "YYYY-MM-DD-preview"; first 10 chars
         # are the ISO date which sorts correctly lexicographically.
@@ -54,6 +61,7 @@ class AzureProvider(OpenAICompatibleProvider):
             raise ValueError("Azure OpenAI endpoint URL not found. Set AZURE_OPENAI_API_URL environment variable.")
 
         azure_endpoint = azure_endpoint.rstrip("/")
+        self.azure_endpoint = azure_endpoint
 
         if api_version:
             self.api_version = api_version

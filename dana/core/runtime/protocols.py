@@ -38,6 +38,14 @@ class ParsedResponse:
     response: str | None
     tool_calls: list[dict[str, Any]]
     todo_list: list[TodoItem] | None = None
+    # Raw reasoning items from the OpenAI Responses API (carries summary + optional
+    # encrypted_content). Persisted in TimelineEntry.metadata so the same provider
+    # can replay structured reasoning state across turns instead of re-deriving it
+    # from flattened assistant text.
+    reasoning_items: list[dict] | None = None
+    # Server-side response id for audit/debugging and as a future fallback to
+    # previous_response_id mode.
+    response_id: str | None = None
 
 
 # ---------------------------------------------------------------------------

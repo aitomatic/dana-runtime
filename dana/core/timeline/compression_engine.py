@@ -709,15 +709,21 @@ Respond with ONLY a JSON object containing the summary:
         # We need to keep messages corresponding to entries_to_keep
         native_messages_to_keep_count = len(entries_to_keep)
 
+        # Compose summary metadata from scratch (no reasoning_items / encrypted_content
+        # leak from compressed-away entries — those are stale state that doesn't
+        # belong in the summary anyway, and the summary text already encodes outcomes).
+        # Explicit dict construction here is the no-leak guarantee.
+        summary_metadata = {
+            COMPRESSED_CONTEXT_KEY: summary,
+            COMPRESSION_TIMESTAMP_KEY: compression_timestamp.isoformat(),
+            COMPRESSED_ENTRIES_COUNT_KEY: compressed_count,
+        }
+
         # Create summary as a NativeMessage with role='system'
         summary_native_message = NativeMessage(
             role="system",
             content=f"[SUMMARY] {summary}",
-            metadata={
-                COMPRESSED_CONTEXT_KEY: summary,
-                COMPRESSION_TIMESTAMP_KEY: compression_timestamp.isoformat(),
-                COMPRESSED_ENTRIES_COUNT_KEY: compressed_count,
-            },
+            metadata=dict(summary_metadata),
             timestamp=compression_timestamp,
         )
 
@@ -727,11 +733,7 @@ Respond with ONLY a JSON object containing the summary:
                 entry_type=TimelineEntryType.TIMELINE_SUMMARY,
                 content=summary,
                 timestamp=entries_to_compress[0].timestamp if entries_to_compress else compression_timestamp,
-                metadata={
-                    COMPRESSED_CONTEXT_KEY: summary,
-                    COMPRESSION_TIMESTAMP_KEY: compression_timestamp.isoformat(),
-                    COMPRESSED_ENTRIES_COUNT_KEY: compressed_count,
-                },
+                metadata=dict(summary_metadata),
             )
             self.timeline = [summary_entry]
 
