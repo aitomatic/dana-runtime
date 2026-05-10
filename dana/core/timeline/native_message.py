@@ -182,9 +182,17 @@ class NativeMessage:
         if self.tool_calls:
             tool_calls_for_llm = [tc.to_dict() for tc in self.tool_calls]
 
+        # Propagate reasoning-replay metadata so the provider can splice
+        # raw items back into Responses API input[]. Without this, replay
+        # silently breaks for the CompressedTimeline path (which routes
+        # through NativeMessage instead of Timeline.to_llm_messages directly).
+        meta = self.metadata or {}
         return LLMMessage(
             role=self.role,
             content=self.content,
             tool_calls=tool_calls_for_llm,
             tool_call_id=self.tool_call_id,
+            reasoning_items=meta.get("reasoning_items"),
+            reasoning_fingerprint=meta.get("fingerprint"),
+            response_id=meta.get("response_id"),
         )

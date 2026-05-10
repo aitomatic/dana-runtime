@@ -725,6 +725,35 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
     # SHARED HELPERS (used by both sync and async STAR methods)
     # ============================================================================
 
+    def _provider_fingerprint(self) -> str | None:
+        """Active provider's replay fingerprint, or None if unavailable.
+
+        Used to gate cross-turn reasoning replay — items captured from provider X
+        are only replayed when the same X handles the next call. Defensive lookup
+        so non-OpenAI providers without the property don't break agent flow.
+        """
+        try:
+            client = self._llm_client
+            if client is None:
+                return None
+            provider = getattr(client, "provider", None)
+            return getattr(provider, "fingerprint", None) if provider is not None else None
+        except Exception:
+            return None
+
+    def _build_thinking_metadata(self, reasoning_items: list[dict] | None, response_id: str | None) -> dict:
+        """Metadata payload attached to AGENT_THOUGHTS entries for replay.
+
+        Empty dict when there's nothing to replay — keeps existing entries clean.
+        """
+        if not reasoning_items:
+            return {}
+        return {
+            "reasoning_items": reasoning_items,
+            "fingerprint": self._provider_fingerprint(),
+            "response_id": response_id,
+        }
+
     def _record_think_results(
         self,
         timeline: Timeline,
@@ -735,6 +764,8 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         done: bool | None,
         todo_list: list | None,
         output_state: str,
+        reasoning_items: list[dict] | None = None,
+        response_id: str | None = None,
     ) -> DictParams:
         """Record think results to timeline and build output trace.
 
@@ -747,6 +778,8 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             done = True
             output_state = "exit"
 
+        thinking_metadata = self._build_thinking_metadata(reasoning_items, response_id)
+
         if not tool_calls or len(tool_calls) == 0:
             # Persist reasoning even on direct-answer turns. Without this, the
             # model's internal reasoning (LLMResponse.reasoning_content for
@@ -758,6 +791,7 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                     TimelineEntry(
                         entry_type=TimelineEntryType.AGENT_THOUGHTS,
                         content=reasoning,
+                        metadata=dict(thinking_metadata),
                     )
                 )
             response = response if (response and len(response) > 0) else "No response generated"
@@ -773,6 +807,7 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                     TimelineEntry(
                         entry_type=TimelineEntryType.AGENT_THOUGHTS,
                         content=reasoning,
+                        metadata=dict(thinking_metadata),
                     )
                 )
 
@@ -977,6 +1012,8 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         llm_messages = _rebuild_llm_messages()
 
         response, reasoning, tool_calls, done, todo_list = None, None, [], None, None
+        reasoning_items: list[dict] | None = None
+        response_id: str | None = None
         output_state = "retry"
         for attempt in range(self.MAX_THINK_RETRIES):
             raw = self._runtime.call_llm(llm_messages, messages_fn=_rebuild_llm_messages)
@@ -988,6 +1025,8 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                 parsed.done,
                 parsed.todo_list,
             )
+            reasoning_items = parsed.reasoning_items
+            response_id = parsed.response_id
 
             has_tool_calls = bool(tool_calls)
             has_response = bool(response and response.strip())
@@ -1015,6 +1054,8 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             done,
             todo_list,
             output_state,
+            reasoning_items=reasoning_items,
+            response_id=response_id,
         )
 
     @observable
@@ -1126,6 +1167,8 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         llm_messages = _rebuild_llm_messages_async()
 
         response, reasoning, tool_calls, done, todo_list = None, None, [], None, None
+        reasoning_items: list[dict] | None = None
+        response_id: str | None = None
         output_state = "retry"
         for attempt in range(self.MAX_THINK_RETRIES):
             if hasattr(self._runtime, "call_llm_async"):
@@ -1146,6 +1189,8 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                 parsed.done,
                 parsed.todo_list,
             )
+            reasoning_items = parsed.reasoning_items
+            response_id = parsed.response_id
 
             has_tool_calls = bool(tool_calls)
             has_response = bool(response and response.strip())
@@ -1173,6 +1218,8 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             done,
             todo_list,
             output_state,
+            reasoning_items=reasoning_items,
+            response_id=response_id,
         )
 
     @observable

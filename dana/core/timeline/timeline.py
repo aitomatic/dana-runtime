@@ -618,10 +618,20 @@ class Timeline:
                 messages.append(LLMMessage(role="assistant", content=content, tool_calls=entry.tool_calls))
             else:
                 role = self._get_entry_role(entry, default_role)
-                messages.append(LLMMessage(role=role, content=content))
+                msg = LLMMessage(role=role, content=content)
+                # Propagate reasoning replay metadata when present so providers
+                # can splice raw items into Responses API input[] (Phase 3).
+                meta = entry.metadata or {}
+                if role == "assistant" and meta.get("reasoning_items"):
+                    msg.reasoning_items = meta.get("reasoning_items")
+                    msg.reasoning_fingerprint = meta.get("fingerprint")
+                    msg.response_id = meta.get("response_id")
+                messages.append(msg)
 
         # Merge consecutive assistant messages (without tool_calls) to avoid confusing the LLM
-        # OpenAI models can get confused by multiple consecutive assistant messages
+        # OpenAI models can get confused by multiple consecutive assistant messages.
+        # Skip merge when either side carries reasoning_items — merging would alias
+        # replay items across distinct turns and lose 1:1 fingerprint provenance.
         merged_messages = []
         for msg in messages:
             if (
@@ -630,6 +640,8 @@ class Timeline:
                 and merged_messages[-1].role == "assistant"
                 and not msg.tool_calls
                 and not merged_messages[-1].tool_calls
+                and not msg.reasoning_items
+                and not merged_messages[-1].reasoning_items
                 and isinstance(msg.content, str)
                 and isinstance(merged_messages[-1].content, str)
             ):

@@ -124,4 +124,6 @@ class CodecRuntimeWithoutNativeToolUse(CodecRuntimeBase):
             response=response_text if response_text else None,
             tool_calls=tool_calls,
             todo_list=[],
+            reasoning_items=getattr(response, "reasoning_items", None),
+            response_id=getattr(response, "response_id", None),
         )

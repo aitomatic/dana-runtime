@@ -1,11 +1,12 @@
 """OpenAI-compatible provider base class for OpenAI and Azure."""
 
+import hashlib
 import json
 import os
 from typing import Any
 
 import httpx
-from openai import APIConnectionError, APITimeoutError
+from openai import APIConnectionError, APITimeoutError, BadRequestError
 import structlog
 
 from ..types import (
@@ -62,6 +63,89 @@ GENERIC_REASONING_EFFORT_ENV = "LLM_REASONING_EFFORT"
 
 
 DEFAULT_REASONING_EFFORT = "low"
+
+
+def _serialize_output_item(item: Any) -> dict:
+    """Convert a Responses API output item to a JSON-serializable dict that's
+    safe to send back as ``input[]``.
+
+    Output-side reasoning items carry fields like ``status`` and ``content`` that
+    are server metadata only — the input schema rejects them with HTTP 400
+    ``unknown_parameter``. We restrict to the documented input-side fields:
+    ``type``, ``id``, ``summary``, ``encrypted_content``.
+
+    Falls back to manual extraction so schema drift never crashes capture —
+    storing partial state is better than dropping the entry entirely.
+    """
+    summary_list: list[dict] = []
+    for s in getattr(item, "summary", None) or []:
+        s_dump = getattr(s, "model_dump", None)
+        if callable(s_dump):
+            try:
+                summary_list.append(s_dump(exclude_none=False, mode="json"))
+                continue
+            except Exception:
+                pass
+        text = getattr(s, "text", None)
+        if text is not None:
+            summary_list.append({"type": getattr(s, "type", "summary_text"), "text": text})
+
+    return {
+        "type": getattr(item, "type", "reasoning"),
+        "id": getattr(item, "id", None),
+        "summary": summary_list,
+        "encrypted_content": getattr(item, "encrypted_content", None),
+    }
+
+
+def _looks_like_include_rejection(err: BadRequestError) -> bool:
+    """Heuristic — older Azure api-versions and non-trusted accounts reject
+    ``include=["reasoning.encrypted_content"]`` with varying messages. Match
+    loosely so the fallback fires in all observed forms."""
+    msg = str(err).lower()
+    return "include" in msg and ("reasoning" in msg or "encrypted" in msg or "unsupported" in msg)
+
+
+def _looks_like_reasoning_rejection(err: BadRequestError) -> bool:
+    """Heuristic for replayed-reasoning-item rejection. Covers:
+      - stale ``id`` ("not found", "expired", "session")
+      - item-shape mismatch ("unknown_parameter" pointing at ``input[N].*``)
+      - explicit reasoning-content rejection ("reasoning_item")
+    Matches loosely; false positives just trigger one extra request without
+    items, which is acceptable degradation."""
+    msg = str(err).lower()
+    return (
+        ("input[" in msg and "reasoning" not in msg.split("input[")[0])
+        or "reasoning_item" in msg
+        or ("reasoning" in msg and ("not found" in msg or "expired" in msg or "session" in msg))
+        or ("unknown_parameter" in msg and "input[" in msg)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reasoning-state replay (Phase 3)
+# ---------------------------------------------------------------------------
+
+REASONING_REPLAY_ENV = "LLM_REASONING_REPLAY"
+# Carrier keys threaded from LLMMessage → openai_messages → responses_input.
+# Underscore prefix flags them as non-API; the splicer reads + strips them.
+_RC_ITEMS = "_reasoning_items"
+_RC_FINGERPRINT = "_reasoning_fingerprint"
+_RC_RESPONSE_ID = "_response_id"
+_REPLAY_CARRIER_KEYS = (_RC_ITEMS, _RC_FINGERPRINT, _RC_RESPONSE_ID)
+
+
+def _replay_enabled() -> bool:
+    """Replay is on by default; ``LLM_REASONING_REPLAY=0`` disables it."""
+    raw = os.getenv(REASONING_REPLAY_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "off", "no")
+
+
+def _strip_replay_carriers(d: dict) -> dict:
+    """Return a copy of ``d`` with replay-carrier keys removed."""
+    return {k: v for k, v in d.items() if k not in _REPLAY_CARRIER_KEYS}
 
 
 def _resolve_reasoning_effort(provider_env_var: str | None) -> str:
@@ -130,8 +214,43 @@ class OpenAICompatibleProvider(LLMProvider):
     # time so env changes take effect without process restart in tests.
     _REASONING_EFFORT_ENV_VAR: str | None = None
 
+    # Sticky flag — set after the first ``include=["reasoning.encrypted_content"]``
+    # rejection so we stop paying the round-trip cost of retry on every call.
+    _include_unsupported: bool = False
+
     def _default_reasoning_effort(self) -> str:
         return _resolve_reasoning_effort(self._REASONING_EFFORT_ENV_VAR)
+
+    @property
+    def name(self) -> str:
+        """Short provider identifier used in fingerprints. Subclasses override."""
+        return self.__class__.__name__.replace("Provider", "").lower()
+
+    @property
+    def model_family(self) -> str:
+        """Coarse model family for fingerprinting (e.g. 'gpt-5', 'o3').
+
+        Falls back to the full model name when no known family prefix matches —
+        keeps fingerprints distinct for unrecognized models rather than collapsing.
+        """
+        return self._get_model_family(self.model) or self.model
+
+    def _endpoint_url(self) -> str:
+        """Endpoint URL used for fingerprinting. Subclasses override."""
+        return ""
+
+    @property
+    def endpoint_hash(self) -> str:
+        """Stable 8-char hash of the endpoint URL — distinguishes deployments
+        without storing PII in metadata. Recomputed each access (cheap)."""
+        url = self._endpoint_url() or ""
+        return hashlib.sha256(url.encode("utf-8")).hexdigest()[:8]
+
+    @property
+    def fingerprint(self) -> str:
+        """provider:model_family:endpoint_hash — used as the gate key for
+        cross-turn reasoning-state replay. Mismatches fall back to text-flatten."""
+        return f"{self.name}:{self.model_family}:{self.endpoint_hash}"
 
     @property
     def supports_native_tools(self) -> bool:
@@ -247,6 +366,14 @@ class OpenAICompatibleProvider(LLMProvider):
                     }
                 )
             elif msg.role == "assistant":
+                # Carry reasoning replay metadata onto the wire-format dict via
+                # underscore-prefixed keys; ``_convert_to_responses_input``
+                # consumes + strips them so they never reach the API.
+                replay_carrier: dict[str, Any] = {}
+                if msg.reasoning_items:
+                    replay_carrier["_reasoning_items"] = msg.reasoning_items
+                    replay_carrier["_reasoning_fingerprint"] = msg.reasoning_fingerprint
+                    replay_carrier["_response_id"] = msg.response_id
                 if msg.tool_calls:
                     formatted_tool_calls = []
                     for tc in msg.tool_calls:
@@ -269,10 +396,11 @@ class OpenAICompatibleProvider(LLMProvider):
                             "role": "assistant",
                             "content": safe_content,
                             "tool_calls": formatted_tool_calls,
+                            **replay_carrier,
                         }
                     )
                 else:
-                    openai_messages.append({"role": "assistant", "content": safe_content})
+                    openai_messages.append({"role": "assistant", "content": safe_content, **replay_carrier})
         return system, openai_messages
 
     def prepare_tools(self, tools) -> list[dict]:
@@ -443,18 +571,60 @@ class OpenAICompatibleProvider(LLMProvider):
             # Responses API uses text.format instead of response_format.
             request_kwargs["text"] = {"format": {"type": "json_object"}}
 
-        response = await self.client.responses.create(
-            **request_kwargs,
-            timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
-        )
+        # Opt in to encrypted reasoning state when account has trusted access.
+        # When unsupported, the API may either reject the call (handled below)
+        # or silently omit the field — both are safe; we degrade to summary-only.
+        if not self._include_unsupported:
+            existing_include = list(request_kwargs.get("include") or [])
+            if "reasoning.encrypted_content" not in existing_include:
+                request_kwargs["include"] = existing_include + ["reasoning.encrypted_content"]
+
+        try:
+            response = await self.client.responses.create(
+                **request_kwargs,
+                timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
+            )
+        except BadRequestError as e:
+            # Sticky one-shot fallback: drop the include flag and retry. Subsequent
+            # calls skip the include flag entirely (no per-call retry cost).
+            if not self._include_unsupported and _looks_like_include_rejection(e):
+                logger.warning(
+                    "responses.create rejected include=reasoning.encrypted_content; falling back to summary-only reasoning capture",
+                    error=str(e),
+                )
+                self._include_unsupported = True
+                request_kwargs.pop("include", None)
+                response = await self.client.responses.create(
+                    **request_kwargs,
+                    timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
+                )
+            elif _looks_like_reasoning_rejection(e):
+                # Stale reasoning id, item-shape mismatch (e.g. unknown field
+                # like 'status' on input), or model refusing replay mid-turn.
+                # Strip reasoning items from input[] and retry once so the turn
+                # still completes — degrades to flat-text replay rather than
+                # failing the user's request entirely.
+                logger.warning(
+                    "responses.create rejected replayed reasoning items; retrying without items",
+                    error=str(e),
+                )
+                request_kwargs["input"] = [item for item in request_kwargs["input"] if item.get("type") != "reasoning"]
+                response = await self.client.responses.create(
+                    **request_kwargs,
+                    timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
+                )
+            else:
+                raise
 
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
+        reasoning_items: list[dict] = []
         tool_calls_list: list = []
 
         for item in response.output:
             item_type = getattr(item, "type", None)
             if item_type == "reasoning":
+                reasoning_items.append(_serialize_output_item(item))
                 for s in item.summary or []:
                     text = getattr(s, "text", None)
                     if text:
@@ -510,6 +680,8 @@ class OpenAICompatibleProvider(LLMProvider):
             tool_calls=tool_calls_list or None,
             reasoning_tokens=reasoning_tokens,
             reasoning_content="".join(reasoning_parts) or None,
+            reasoning_items=reasoning_items or None,
+            response_id=getattr(response, "id", None),
         )
 
     # --- Embedding methods ---
@@ -650,10 +822,30 @@ class OpenAICompatibleProvider(LLMProvider):
         Responses API uses:
           {"type": "function_call", "id": "...", "call_id": "...", "name": "...", "arguments": "...", "status": "completed"}
           {"type": "function_call_output", "call_id": "...", "output": "..."}
+
+        Reasoning-state replay (Phase 3): when an assistant message carries
+        ``_reasoning_items`` with a fingerprint matching this provider, the raw
+        reasoning items are emitted into ``input[]`` *before* the assistant
+        message — the model picks up structured reasoning state across turns
+        instead of re-deriving it from flattened text. Carrier keys are stripped
+        so they never reach the API. Disabled when ``LLM_REASONING_REPLAY=0``.
         """
         result = []
+        replay_on = _replay_enabled()
+        my_fingerprint = self.fingerprint
+        replay_count = 0
         for msg in openai_messages:
             role = msg.get("role")
+            # Replay path — splice raw reasoning items before the assistant message
+            # whenever fingerprint matches and items exist. Cross-provider replays
+            # fall through to the flat-text path; carriers always get stripped.
+            if role == "assistant" and msg.get(_RC_ITEMS):
+                if replay_on and msg.get(_RC_FINGERPRINT) == my_fingerprint:
+                    items = msg.get(_RC_ITEMS) or []
+                    for item in items:
+                        result.append(dict(item))
+                    replay_count += len(items)
+                msg = _strip_replay_carriers(msg)
             # Convert multimodal user messages to Responses API format
             if role == "user" and isinstance(msg.get("content"), list):
                 content = msg["content"]
@@ -705,6 +897,12 @@ class OpenAICompatibleProvider(LLMProvider):
                 )
             else:
                 result.append(msg)
+        if replay_count > 0:
+            logger.debug(
+                "reasoning replay",
+                items=replay_count,
+                fingerprint=my_fingerprint,
+            )
         return result
 
     async def _stream_responses(self, messages: list[LLMMessage], tools: list | None = None, **kwargs):
