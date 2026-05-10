@@ -13,6 +13,22 @@ logger = structlog.get_logger()
 class AzureProvider(OpenAICompatibleProvider):
     """Azure OpenAI provider."""
 
+    # Azure exposes the Responses API only on api-version >= this date.
+    # Older versions return HTTP 400 BadRequest for /openai/responses.
+    _RESPONSES_API_MIN_DATE = "2025-03-01"
+
+    # Env var operators use to dial reasoning effort for Azure deployments.
+    # Valid values: "minimal" | "low" | "medium" | "high".
+    _REASONING_EFFORT_ENV_VAR = "AZURE_THINKING_EFFORT"
+
+    def _responses_api_supported(self) -> bool:
+        # api-version format is "YYYY-MM-DD" or "YYYY-MM-DD-preview"; first 10 chars
+        # are the ISO date which sorts correctly lexicographically.
+        version = getattr(self, "api_version", None)
+        if not version or len(version) < 10:
+            return False
+        return version[:10] >= self._RESPONSES_API_MIN_DATE
+
     def __init__(
         self, api_key: str | None = None, model: str = "gpt-35-turbo", base_url: str | None = None, api_version: str | None = None
     ):

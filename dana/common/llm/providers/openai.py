@@ -13,6 +13,10 @@ logger = structlog.get_logger()
 class OpenAIProvider(OpenAICompatibleProvider):
     """OpenAI API provider."""
 
+    # Env var operators use to dial reasoning effort for OpenAI direct API.
+    # Valid values: "minimal" | "low" | "medium" | "high".
+    _REASONING_EFFORT_ENV_VAR = "OPENAI_THINKING_EFFORT"
+
     def __init__(self, api_key: str | None = None, model: str = "gpt-3.5-turbo", base_url: str | None = None):
         self.model = model
 

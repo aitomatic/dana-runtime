@@ -1,6 +1,7 @@
 """OpenAI-compatible provider base class for OpenAI and Azure."""
 
 import json
+import os
 from typing import Any
 
 import httpx
@@ -52,6 +53,45 @@ MODEL_RESTRICTIONS: dict[str, dict] = {
 # Model prefixes that default to Responses API
 RESPONSES_API_PREFIXES = ("gpt-5", "o3-", "o4-", "o3", "o4")
 
+# Valid reasoning effort levels accepted by the OpenAI Responses API.
+# "minimal" is gpt-5-only; the SDK rejects unknown values, so validate at the wrapper.
+VALID_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
+
+# Generic fallback env var when no provider-specific override is set.
+GENERIC_REASONING_EFFORT_ENV = "LLM_REASONING_EFFORT"
+
+
+DEFAULT_REASONING_EFFORT = "low"
+
+
+def _resolve_reasoning_effort(provider_env_var: str | None) -> str:
+    """Resolve default reasoning effort from env, with validation.
+
+    Precedence:
+      1. provider-specific env var (e.g. ``AZURE_THINKING_EFFORT``)
+      2. generic ``LLM_REASONING_EFFORT``
+      3. hardcoded ``DEFAULT_REASONING_EFFORT`` ("low" — favors latency/cost;
+         operators can opt in to deeper reasoning per provider via env)
+
+    Invalid values are logged and ignored so a typo in env doesn't break calls.
+    """
+    for env_name in (provider_env_var, GENERIC_REASONING_EFFORT_ENV):
+        if not env_name:
+            continue
+        raw = os.getenv(env_name)
+        if not raw:
+            continue
+        normalized = raw.strip().lower()
+        if normalized in VALID_REASONING_EFFORTS:
+            return normalized
+        logger.warning(
+            "ignoring invalid reasoning effort env var",
+            env_var=env_name,
+            value=raw,
+            valid=sorted(VALID_REASONING_EFFORTS),
+        )
+    return DEFAULT_REASONING_EFFORT
+
 
 def make_logging_http_client(timeout_seconds: int) -> httpx.AsyncClient:
     """Build an ``httpx.AsyncClient`` with request/response hooks.
@@ -85,6 +125,13 @@ class OpenAICompatibleProvider(LLMProvider):
     client: Any  # AsyncOpenAI or AsyncAzureOpenAI
     model: str
     _use_responses_api: bool | None = None
+    # Subclasses set this to expose a provider-specific knob, e.g.
+    # ``AZURE_THINKING_EFFORT`` or ``OPENAI_THINKING_EFFORT``. Resolved at call
+    # time so env changes take effect without process restart in tests.
+    _REASONING_EFFORT_ENV_VAR: str | None = None
+
+    def _default_reasoning_effort(self) -> str:
+        return _resolve_reasoning_effort(self._REASONING_EFFORT_ENV_VAR)
 
     @property
     def supports_native_tools(self) -> bool:
@@ -256,63 +303,17 @@ class OpenAICompatibleProvider(LLMProvider):
         return result
 
     async def chat(self, messages: list[LLMMessage], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
-        """Send messages and get a response via Chat Completions API."""
+        """Send messages and get a response.
+
+        Routes to the Responses API for reasoning models (gpt-5/o3/o4) when the
+        endpoint supports it, so callers get reasoning text in
+        ``LLMResponse.reasoning_content``. Falls back to Chat Completions
+        otherwise. Mirrors ``stream()`` routing.
+        """
         try:
-            _, openai_messages = self.prepare_messages(messages)
-
-            filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ["json_mode"] and v is not None}
-            filtered_kwargs = self._filter_params_for_model(self.model, filtered_kwargs)
-
-            request_kwargs = {"model": self.model, "messages": openai_messages, **filtered_kwargs}
-
-            if tools:
-                request_kwargs["tools"] = self.prepare_tools(tools)
-                request_kwargs["tool_choice"] = "auto"
-
-            if kwargs.get("json_mode", False):
-                request_kwargs["response_format"] = {"type": "json_object"}
-
-            response = await self.client.chat.completions.create(
-                **request_kwargs,
-                timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
-            )
-
-            choice = response.choices[0]
-            message = choice.message
-
-            if hasattr(message, "tool_calls") and message.tool_calls:
-                content = message.content or ""
-                tool_calls = message.tool_calls
-            else:
-                content = message.content or ""
-                tool_calls = None
-
-            usage = None
-            reasoning_tokens = None
-            if response.usage:
-                usage = {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens,
-                }
-                if hasattr(response.usage, "prompt_tokens_details") and response.usage.prompt_tokens_details:
-                    details = response.usage.prompt_tokens_details
-                    if hasattr(details, "cached_tokens"):
-                        usage["cached_tokens"] = details.cached_tokens
-                if hasattr(response.usage, "completion_tokens_details") and response.usage.completion_tokens_details:
-                    output_details = response.usage.completion_tokens_details
-                    if hasattr(output_details, "reasoning_tokens") and output_details.reasoning_tokens:
-                        reasoning_tokens = output_details.reasoning_tokens
-
-            return LLMResponse(
-                content=content,
-                model=response.model,
-                usage=usage,
-                finish_reason=choice.finish_reason,
-                tool_calls=tool_calls,
-                reasoning_tokens=reasoning_tokens,
-            )
-
+            if self._should_use_responses_api():
+                return await self._chat_via_responses(messages, tools, **kwargs)
+            return await self._chat_via_chat_completions(messages, tools, **kwargs)
         except (APITimeoutError, httpx.TimeoutException) as e:
             raise LLMTimeoutError(f"OpenAI-compatible API timeout: {e}") from e
         except APIConnectionError as e:
@@ -349,6 +350,167 @@ class OpenAICompatibleProvider(LLMProvider):
                 pass
             logger.error("OpenAI-compatible API error", error=str(e), error_type=type(e).__name__, exc_info=True)
             raise
+
+    async def _chat_via_chat_completions(self, messages: list[LLMMessage], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
+        """Non-streaming chat via the legacy Chat Completions endpoint.
+
+        Used for non-reasoning models or when the Responses API isn't available
+        (e.g. Azure with api-version < 2025-03-01-preview). Reasoning text is not
+        surfaced on this path; only ``reasoning_tokens`` count if the API returns it.
+        """
+        _, openai_messages = self.prepare_messages(messages)
+
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ["json_mode"] and v is not None}
+        filtered_kwargs = self._filter_params_for_model(self.model, filtered_kwargs)
+
+        request_kwargs = {"model": self.model, "messages": openai_messages, **filtered_kwargs}
+
+        if tools:
+            request_kwargs["tools"] = self.prepare_tools(tools)
+            request_kwargs["tool_choice"] = "auto"
+
+        if kwargs.get("json_mode", False):
+            request_kwargs["response_format"] = {"type": "json_object"}
+
+        response = await self.client.chat.completions.create(
+            **request_kwargs,
+            timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
+        )
+
+        choice = response.choices[0]
+        message = choice.message
+        content = message.content or ""
+        tool_calls = message.tool_calls if (hasattr(message, "tool_calls") and message.tool_calls) else None
+
+        usage = None
+        reasoning_tokens = None
+        if response.usage:
+            usage = {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens,
+            }
+            if hasattr(response.usage, "prompt_tokens_details") and response.usage.prompt_tokens_details:
+                cached = getattr(response.usage.prompt_tokens_details, "cached_tokens", None)
+                if cached is not None:
+                    usage["cached_tokens"] = cached
+            if hasattr(response.usage, "completion_tokens_details") and response.usage.completion_tokens_details:
+                reasoning_tokens = getattr(response.usage.completion_tokens_details, "reasoning_tokens", None) or None
+
+        return LLMResponse(
+            content=content,
+            model=response.model,
+            usage=usage,
+            finish_reason=choice.finish_reason,
+            tool_calls=tool_calls,
+            reasoning_tokens=reasoning_tokens,
+        )
+
+    async def _chat_via_responses(self, messages: list[LLMMessage], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
+        """Non-streaming chat via the Responses API.
+
+        Surfaces reasoning summary text in ``LLMResponse.reasoning_content`` for
+        gpt-5/o3/o4 models. Tool calls are returned in the same Pydantic shape
+        Chat Completions emits (``ChatCompletionMessageToolCall``) so downstream
+        parsers (e.g. ``response_parser._to_tool_call_dicts``) see no difference.
+        """
+        from openai.types.chat import ChatCompletionMessageToolCall
+        from openai.types.chat.chat_completion_message_tool_call import Function
+
+        _, openai_messages = self.prepare_messages(messages)
+        responses_input = self._convert_to_responses_input(openai_messages)
+
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ["json_mode"] and v is not None}
+        filtered_kwargs = self._filter_params_for_model(self.model, filtered_kwargs)
+
+        request_kwargs = {"model": self.model, "input": responses_input, **filtered_kwargs}
+
+        # Default reasoning config:
+        #   effort  — without explicit effort, gpt-5* sometimes skips reasoning entirely,
+        #             making reasoning_content nondeterministic. Resolved from the provider's
+        #             env var (e.g. AZURE_THINKING_EFFORT) → LLM_REASONING_EFFORT → "low".
+        #             Caller-supplied reasoning.effort always wins.
+        #   summary="auto"  — required for reasoning summary text to be returned at all.
+        reasoning_cfg = dict(request_kwargs.get("reasoning") or {})
+        reasoning_cfg.setdefault("effort", self._default_reasoning_effort())
+        reasoning_cfg.setdefault("summary", "auto")
+        request_kwargs["reasoning"] = reasoning_cfg
+
+        if tools:
+            request_kwargs["tools"] = self._prepare_tools_for_responses(tools)
+
+        if kwargs.get("json_mode", False):
+            # Responses API uses text.format instead of response_format.
+            request_kwargs["text"] = {"format": {"type": "json_object"}}
+
+        response = await self.client.responses.create(
+            **request_kwargs,
+            timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
+        )
+
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_calls_list: list = []
+
+        for item in response.output:
+            item_type = getattr(item, "type", None)
+            if item_type == "reasoning":
+                for s in item.summary or []:
+                    text = getattr(s, "text", None)
+                    if text:
+                        reasoning_parts.append(text)
+            elif item_type == "message":
+                for c in item.content or []:
+                    if getattr(c, "type", None) == "output_text":
+                        text = getattr(c, "text", "") or ""
+                        if text:
+                            content_parts.append(text)
+            elif item_type == "function_call":
+                tool_calls_list.append(
+                    ChatCompletionMessageToolCall(
+                        id=item.call_id,
+                        type="function",
+                        function=Function(name=item.name, arguments=item.arguments or ""),
+                    )
+                )
+
+        # Map Responses API status to a Chat-Completions-style finish_reason so
+        # callers don't need to know which path was used.
+        if tool_calls_list:
+            finish_reason = "tool_calls"
+        elif response.status == "incomplete":
+            details = getattr(response, "incomplete_details", None)
+            reason = getattr(details, "reason", None) if details else None
+            finish_reason = "length" if reason == "max_output_tokens" else "incomplete"
+        else:
+            finish_reason = "stop"
+
+        usage = None
+        reasoning_tokens = None
+        if response.usage:
+            usage = {
+                "prompt_tokens": response.usage.input_tokens,
+                "completion_tokens": response.usage.output_tokens,
+                "total_tokens": response.usage.total_tokens,
+            }
+            input_details = getattr(response.usage, "input_tokens_details", None)
+            if input_details:
+                cached = getattr(input_details, "cached_tokens", None)
+                if cached is not None:
+                    usage["cached_tokens"] = cached
+            output_details = getattr(response.usage, "output_tokens_details", None)
+            if output_details:
+                reasoning_tokens = getattr(output_details, "reasoning_tokens", None) or None
+
+        return LLMResponse(
+            content="".join(content_parts),
+            model=response.model,
+            usage=usage,
+            finish_reason=finish_reason,
+            tool_calls=tool_calls_list or None,
+            reasoning_tokens=reasoning_tokens,
+            reasoning_content="".join(reasoning_parts) or None,
+        )
 
     # --- Embedding methods ---
 
@@ -558,6 +720,15 @@ class OpenAICompatibleProvider(LLMProvider):
 
         request_kwargs = {"model": self.model, "input": responses_input, "stream": True, **filtered_kwargs}
 
+        # Default reasoning config (mirrors _chat_via_responses):
+        #   effort  — env-driven default (provider env → LLM_REASONING_EFFORT → "low")
+        #             so gpt-5* deterministically reasons. Caller can override per-call.
+        #   summary="auto"  — required for reasoning summary delta events to fire.
+        reasoning_cfg = dict(request_kwargs.get("reasoning") or {})
+        reasoning_cfg.setdefault("effort", self._default_reasoning_effort())
+        reasoning_cfg.setdefault("summary", "auto")
+        request_kwargs["reasoning"] = reasoning_cfg
+
         if tools:
             request_kwargs["tools"] = self._prepare_tools_for_responses(tools)
 
@@ -586,16 +757,30 @@ class OpenAICompatibleProvider(LLMProvider):
                         },
                     )
 
-            elif event.type == "response.reasoning.delta":
+            elif event.type in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
+                # Both summary deltas (when reasoning.summary="auto") and raw reasoning
+                # text deltas (trusted access) carry .delta strings; surface as "thinking".
                 yield LLMStreamChunk(type="thinking", content=event.delta)
+
+    def _responses_api_supported(self) -> bool:
+        """Whether the underlying endpoint exposes the Responses API at all.
+
+        OpenAI-compatible endpoints support it unconditionally. Azure subclasses
+        override this to gate on api-version (Responses API requires
+        api-version >= 2025-03-01-preview).
+        """
+        return True
 
     def _should_use_responses_api(self) -> bool:
         """Determine whether to use Responses API or Chat Completions.
 
-        Priority: config flag > model prefix > default (Chat Completions).
+        Priority: explicit config flag > endpoint capability + model prefix.
         """
         if self._use_responses_api is not None:
             return self._use_responses_api
+
+        if not self._responses_api_supported():
+            return False
 
         model_lower = self.model.lower()
         for prefix in RESPONSES_API_PREFIXES:
