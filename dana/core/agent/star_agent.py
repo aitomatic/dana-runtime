@@ -786,11 +786,15 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             # gpt-5/o3/o4, or <thinking> tags / JSON reasoning fields for other
             # codecs) is silently dropped whenever the agent answers without
             # invoking a tool. Same emit pattern as the tool-calls branch below.
-            if reasoning and len(reasoning) > 0:
+            # Gate on reasoning_items, not summary text: GPT-5/o3/o4 low-summary
+            # turns return a reasoning item (rs_… + encrypted_content) with an
+            # empty summary. Skipping the entry there drops the encrypted item
+            # and the turn replays without reasoning state.
+            if (reasoning and len(reasoning) > 0) or thinking_metadata.get("reasoning_items"):
                 timeline.add_entry(
                     TimelineEntry(
                         entry_type=TimelineEntryType.AGENT_THOUGHTS,
-                        content=reasoning,
+                        content=reasoning or "",
                         metadata=dict(thinking_metadata),
                     )
                 )
@@ -802,11 +806,13 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                 )
             )
         else:
-            if reasoning and len(reasoning) > 0:
+            # See gate rationale above — reasoning_items must persist even when
+            # the summary text is empty, or cross-turn replay loses the item.
+            if (reasoning and len(reasoning) > 0) or thinking_metadata.get("reasoning_items"):
                 timeline.add_entry(
                     TimelineEntry(
                         entry_type=TimelineEntryType.AGENT_THOUGHTS,
-                        content=reasoning,
+                        content=reasoning or "",
                         metadata=dict(thinking_metadata),
                     )
                 )

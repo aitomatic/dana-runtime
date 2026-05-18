@@ -170,6 +170,90 @@ class TestRecordThinkResultsMetadata:
         assert thoughts[0].metadata == {}
 
 
+class TestEmptySummaryReasoningPersistence:
+    """Regression: GPT-5/o3/o4 turns return a reasoning item (rs_… +
+    encrypted_content) with an EMPTY summary on low-summary turns. The summary
+    text is empty but the item is still required for cross-turn replay. The
+    AGENT_THOUGHTS gate must key on reasoning_items, not on summary text —
+    otherwise the encrypted item is dropped and the turn replays without state.
+    """
+
+    _EMPTY_SUMMARY_ITEM = {
+        "type": "reasoning",
+        "id": "rs_empty_summary_001",
+        "summary": [],
+        "encrypted_content": "gAAAA_enc_blob",
+    }
+
+    def test_tool_call_branch_persists_item_when_summary_empty(self):
+        agent = _make_agent()
+        tl = Timeline()
+
+        agent._record_think_results(
+            timeline=tl,
+            trace_percepts={},
+            response="",
+            reasoning="",  # empty summary text
+            tool_calls=[{"tool_call_id": "call_X", "function": "bash__execute", "arguments": "{}"}],
+            done=False,
+            todo_list=None,
+            output_state="continue",
+            reasoning_items=[self._EMPTY_SUMMARY_ITEM],
+            response_id="resp_empty_001",
+        )
+
+        thoughts = [e for e in tl.timeline if e.entry_type == TimelineEntryType.AGENT_THOUGHTS]
+        assert len(thoughts) == 1
+        assert thoughts[0].metadata["reasoning_items"] == [self._EMPTY_SUMMARY_ITEM]
+        assert thoughts[0].metadata["response_id"] == "resp_empty_001"
+
+        # AGENT_THOUGHTS must sit immediately before TOOL_CALL — replay ordering.
+        types = [e.entry_type for e in tl.timeline]
+        assert types == [TimelineEntryType.AGENT_THOUGHTS, TimelineEntryType.TOOL_CALL]
+
+    def test_direct_answer_branch_persists_item_when_summary_empty(self):
+        agent = _make_agent()
+        tl = Timeline()
+
+        agent._record_think_results(
+            timeline=tl,
+            trace_percepts={},
+            response="Final answer.",
+            reasoning="",  # empty summary text
+            tool_calls=[],
+            done=True,
+            todo_list=None,
+            output_state="exit",
+            reasoning_items=[self._EMPTY_SUMMARY_ITEM],
+            response_id="resp_empty_002",
+        )
+
+        thoughts = [e for e in tl.timeline if e.entry_type == TimelineEntryType.AGENT_THOUGHTS]
+        assert len(thoughts) == 1
+        assert thoughts[0].metadata["reasoning_items"] == [self._EMPTY_SUMMARY_ITEM]
+
+    def test_no_entry_when_summary_empty_and_no_items(self):
+        """Nothing to persist — no phantom AGENT_THOUGHTS entry."""
+        agent = _make_agent()
+        tl = Timeline()
+
+        agent._record_think_results(
+            timeline=tl,
+            trace_percepts={},
+            response="",
+            reasoning="",
+            tool_calls=[{"tool_call_id": "call_X", "function": "bash__execute", "arguments": "{}"}],
+            done=False,
+            todo_list=None,
+            output_state="continue",
+            reasoning_items=None,
+            response_id=None,
+        )
+
+        thoughts = [e for e in tl.timeline if e.entry_type == TimelineEntryType.AGENT_THOUGHTS]
+        assert thoughts == []
+
+
 class TestMetadataJsonRoundTrip:
     def test_reasoning_items_survive_to_dict_from_dict(self):
         entry = TimelineEntry(
