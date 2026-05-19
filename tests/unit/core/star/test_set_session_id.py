@@ -112,6 +112,30 @@ class TestSetSessionIdBoundary:
         assert "pre-compact" not in contents
         assert agent._timeline._native_messages
 
+    def test_reload_timeline_false_keeps_timeline(self, tmp_path):
+        # Opt-out path: a caller-managed timeline (e.g. a seeded persona entry)
+        # survives the session switch — set_session_id only relabels.
+        agent = _make_agent(tmp_path, session_id="A")
+        original = agent._timeline
+        agent._timeline.add_entry(_entry("seeded-persona"))
+
+        agent.set_session_id("B", reload_timeline=False)
+
+        assert agent._timeline is original
+        assert agent._session_id == "B"
+        assert [e.content for e in agent._timeline.timeline] == ["seeded-persona"]
+
+    def test_reload_timeline_false_does_not_flush_old_session(self, tmp_path):
+        # Pure relabel must not persist anything to the outgoing session id.
+        agent = _make_agent(tmp_path, session_id="A")
+        agent._timeline.add_entry(_entry("kept"))
+
+        agent.set_session_id("B", reload_timeline=False)
+
+        repo = agent._timeline._repository
+        assert repo is not None
+        assert list(repo.read_session_entries("A")) == []
+
     def test_same_session_id_is_fast_path(self, tmp_path):
         agent = _make_agent(tmp_path, session_id="A")
         original_timeline = agent._timeline

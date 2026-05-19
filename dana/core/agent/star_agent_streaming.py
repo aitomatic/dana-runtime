@@ -173,9 +173,12 @@ class STARAgentStreamingMixin:
             StreamEvent: Stream events throughout the STAR loop.
         """
         # Session management (mirrors aquery())
+        # reload_timeline gates per-session timeline reload (see set_session_id).
+        # Popped so it does not leak into the downstream stream kwargs.
+        reload_timeline = kwargs.pop("reload_timeline", True)
         new_session_id = kwargs.get("session_id")
         if new_session_id is not None:
-            self.set_session_id(new_session_id)
+            self.set_session_id(new_session_id, reload_timeline=reload_timeline)
         session_id = self._session_id
 
         self._star_loop_count = 0
