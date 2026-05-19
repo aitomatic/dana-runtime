@@ -173,15 +173,12 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         #     env var wins, so ops can retune without code changes).
         # Historically these were aliased to the same value; the split lets ops set
         # the trigger via env while agent authors still pick an appropriate context budget.
-        self._timeline = CompressedTimeline(
-            max_context_tokens=max_context_tokens,
-            max_tokens_until_compression=compress_trigger_tokens,
-            agent=self,
-            repository_factory=self._repository_factory,
-            compression_enabled=compress_timeline,
-            system_tokens_fn=self._estimate_system_prompt_tokens,
-            tools_tokens_fn=self._estimate_tools_tokens,
-        )
+        # Persisted so set_session_id can rebuild an identically-configured
+        # timeline when the session boundary changes (see _build_timeline).
+        self._max_context_tokens = max_context_tokens
+        self._compress_trigger_tokens = compress_trigger_tokens
+        self._compress_timeline = compress_timeline
+        self._timeline = self._build_timeline()
 
         # Initialize EventLog API (only if observer AND codec provided)
         # Events ONLY come from Observer - no observer = no EventLog
@@ -248,9 +245,51 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         self._reminder_manager = ReminderManager()
         self._star_loop_count = 0  # Tracks iterations within current query
 
+    def _build_timeline(self) -> CompressedTimeline:
+        """Construct a fresh, fully-configured CompressedTimeline.
+
+        Single source of truth for timeline construction — used by ``__init__``
+        and by ``set_session_id``. Building a new instance (rather than mutating
+        the existing one) resets ALL session-scoped state, including the
+        compaction-tracking fields (``_last_compression_at``,
+        ``_active_compact_session_id``, ``_active_compact_compression_at``) that
+        a bare ``rehydrate()`` would otherwise leak across sessions.
+        """
+        return CompressedTimeline(
+            max_context_tokens=self._max_context_tokens,
+            max_tokens_until_compression=self._compress_trigger_tokens,
+            agent=self,
+            repository_factory=self._repository_factory,
+            compression_enabled=self._compress_timeline,
+            system_tokens_fn=self._estimate_system_prompt_tokens,
+            tools_tokens_fn=self._estimate_tools_tokens,
+        )
+
     def set_session_id(self, session_id: str) -> None:
-        """Set the session id for the agent."""
+        """Switch the agent to a different session, making ``session_id`` a
+        real context boundary.
+
+        Changing the session id:
+          1. Flushes the outgoing session's timeline to disk (no data loss).
+          2. Rebuilds the timeline from scratch — resets entries AND all
+             compaction-tracking state.
+          3. Rehydrates from the new session's persisted entries (compaction-
+             snapshot aware). An unknown session id yields an empty timeline.
+
+        Re-setting the current id is a no-op (no repository hit). Ordering is
+        load-bearing: ``_session_id`` is assigned before ``rehydrate()`` because
+        ``read_since`` reads the session id off the agent.
+        """
+        if session_id == self._session_id:
+            return
+
+        timeline = getattr(self, "_timeline", None)
+        if timeline is not None and getattr(timeline, "_repository", None) is not None and timeline.timeline:
+            timeline.save(self._session_id)
+
         self._session_id = session_id
+        self._timeline = self._build_timeline()
+        self._timeline.rehydrate()
 
     def resume_from_timeline(self, timeline: Timeline, session_id: str | None = None) -> None:
         """
