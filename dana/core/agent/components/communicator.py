@@ -232,7 +232,7 @@ class Communicator:
         initial_message: str | None = None,
         session_id: str | None = None,
         input_handler: Callable[[], Awaitable[str]] | None = None,
-        reload_timeline: bool = True,
+        reload_timeline: bool = False,
     ) -> None:
         """
         Async interactive conversation loop with pluggable input handler.
@@ -243,7 +243,8 @@ class Communicator:
             input_handler: Async callable that returns user input string.
                           If None, uses default blocking input() wrapped in executor.
             reload_timeline: Forwarded to each turn's aquery so set_session_id
-                can skip the per-session timeline reload when False.
+                can perform the per-session timeline reload when True. Default
+                False keeps the agent's current timeline.
         """
         # Default input handler wraps blocking input() in executor
         if input_handler is None:

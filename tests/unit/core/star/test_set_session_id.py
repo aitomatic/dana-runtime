@@ -55,7 +55,7 @@ class TestSetSessionIdBoundary:
         agent = _make_agent(tmp_path, session_id="A")
         agent._timeline.add_entry(_entry("hello-A"))
 
-        agent.set_session_id("never-saved")
+        agent.set_session_id("never-saved", reload_timeline=True)
 
         assert agent._timeline.timeline == []
         assert agent._timeline._native_messages == []
@@ -69,7 +69,7 @@ class TestSetSessionIdBoundary:
         agent._timeline._last_compression_at = datetime(2026, 4, 20, 12, 0, 0)
         agent._timeline._active_compact_session_id = "A__compact__stale"
 
-        agent.set_session_id("B")
+        agent.set_session_id("B", reload_timeline=True)
 
         assert agent._timeline.timeline == []
         # Fresh instance -> compaction-tracking state fully reset, not leaked.
@@ -83,10 +83,10 @@ class TestSetSessionIdBoundary:
         agent._timeline.add_entry(_entry("agent-a", TimelineEntryType.AGENT_RESPONSE))
         agent._timeline.save("A")
 
-        agent.set_session_id("B")
+        agent.set_session_id("B", reload_timeline=True)
         assert agent._timeline.timeline == []
 
-        agent.set_session_id("A")
+        agent.set_session_id("A", reload_timeline=True)
         contents = [e.content for e in agent._timeline.timeline]
         assert contents == ["user-q", "agent-a"]
         # _native_messages recomputed by read_since.
@@ -104,8 +104,8 @@ class TestSetSessionIdBoundary:
         tl._native_messages = [tl._timeline_entry_to_native_message(e) for e in tl.timeline]
         tl.save("A")
 
-        agent.set_session_id("B")
-        agent.set_session_id("A")
+        agent.set_session_id("B", reload_timeline=True)
+        agent.set_session_id("A", reload_timeline=True)
 
         contents = [e.content for e in agent._timeline.timeline]
         assert "post-compact" in contents

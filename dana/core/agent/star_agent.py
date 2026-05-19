@@ -265,10 +265,16 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             tools_tokens_fn=self._estimate_tools_tokens,
         )
 
-    def set_session_id(self, session_id: str, reload_timeline: bool = True) -> None:
+    def set_session_id(self, session_id: str, reload_timeline: bool = False) -> None:
         """Switch the agent to a different session.
 
-        With ``reload_timeline=True`` (default) ``session_id`` is a real context
+        With ``reload_timeline=False`` (default) the call is a pure relabel:
+        the current in-memory timeline is kept and carried into the new session
+        id (it is persisted under the new id on the next ``save``). This is the
+        default because most callers — including subclasses that seed their own
+        timeline before the STAR loop — manage their own context.
+
+        With ``reload_timeline=True`` ``session_id`` becomes a real context
         boundary:
           1. Flushes the outgoing session's timeline to disk (no data loss).
           2. Rebuilds the timeline from scratch — resets entries AND all
@@ -276,13 +282,11 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
           3. Rehydrates from the new session's persisted entries (compaction-
              snapshot aware). An unknown session id yields an empty timeline.
 
-        With ``reload_timeline=False`` the call is a pure relabel: the current
-        in-memory timeline is kept and carried into the new session id (it is
-        persisted under the new id on the next ``save``). This is the opt-out
-        for callers that manage their own timeline (e.g. a subclass that seeds
-        a persona entry before the STAR loop). Note: skipping the rehydrate
-        alone is not enough — the rebuild in step 2 would still discard the
-        caller's timeline — so the flag gates the whole reload.
+        ``TaskResource`` passes ``reload_timeline=True`` when dispatching to
+        sub-agents, so each spawn gets a disjoint, disk-accurate timeline.
+        Note: skipping the rehydrate alone is not enough — the rebuild in
+        step 2 would still discard the caller's timeline — so the flag gates
+        the whole reload.
 
         Re-setting the current id is a no-op (no repository hit). Ordering is
         load-bearing: ``_session_id`` is assigned before ``rehydrate()`` because
@@ -291,8 +295,8 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         Args:
             session_id: The session id to switch to.
             reload_timeline: When True, rebuild + rehydrate the timeline from
-                the new session. When False, keep the current timeline and only
-                relabel.
+                the new session. When False (default), keep the current
+                timeline and only relabel.
         """
         if session_id == self._session_id:
             return
@@ -472,8 +476,9 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
 
     async def aquery(self, **kwargs) -> DictParams:
         # reload_timeline gates per-session timeline reload (see set_session_id).
+        # Default False; TaskResource passes True for sub-agent dispatch.
         # Popped so it does not leak into the base aquery kwargs.
-        reload_timeline = kwargs.pop("reload_timeline", True)
+        reload_timeline = kwargs.pop("reload_timeline", False)
         new_session_id = kwargs.get("session_id")
         if new_session_id is not None:
             self.set_session_id(new_session_id, reload_timeline=reload_timeline)
@@ -512,7 +517,7 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         initial_message: str | None = None,
         session_id: str | None = None,
         input_handler: Callable[[], Awaitable[str]] | None = None,
-        reload_timeline: bool = True,
+        reload_timeline: bool = False,
     ) -> None:
         """Async interactive conversation loop with pluggable input handler.
 
@@ -522,8 +527,8 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             input_handler: Async callable that returns user input string.
                           If None, uses default blocking input() wrapped in executor.
             reload_timeline: Forwarded to each turn's aquery -> set_session_id.
-                When False, the agent's current in-memory timeline is kept
-                instead of being reloaded per session (see set_session_id).
+                When False (default), the agent's current in-memory timeline is
+                kept instead of being reloaded per session (see set_session_id).
         """
         await self._communicator.aconverse(
             initial_message=initial_message,

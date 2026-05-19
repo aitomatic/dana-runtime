@@ -174,8 +174,9 @@ class STARAgentStreamingMixin:
         """
         # Session management (mirrors aquery())
         # reload_timeline gates per-session timeline reload (see set_session_id).
+        # Default False; TaskResource passes True for sub-agent dispatch.
         # Popped so it does not leak into the downstream stream kwargs.
-        reload_timeline = kwargs.pop("reload_timeline", True)
+        reload_timeline = kwargs.pop("reload_timeline", False)
         new_session_id = kwargs.get("session_id")
         if new_session_id is not None:
             self.set_session_id(new_session_id, reload_timeline=reload_timeline)

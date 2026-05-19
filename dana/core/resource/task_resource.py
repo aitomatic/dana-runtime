@@ -238,8 +238,13 @@ class TaskResource(BaseResource):
         # Execute the agent query. On failure, mark the session "failed" (so
         # task_output does not report it "running" forever) and re-raise so
         # the caller still observes the error.
+        #
+        # reload_timeline=True: a sub-agent's session_id IS a hard context
+        # boundary — each spawn gets a disjoint, disk-accurate timeline (fresh
+        # for a new session, rehydrated for a resumed one). This overrides the
+        # default False, which keeps the caller's in-memory timeline.
         try:
-            result = await agent.aquery(message=prompt, session_id=session_id)
+            result = await agent.aquery(message=prompt, session_id=session_id, reload_timeline=True)
         except Exception as e:
             self._sessions[session_id]["status"] = "failed"
             self._sessions[session_id]["error"] = str(e)
