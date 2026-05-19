@@ -177,7 +177,7 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         # timeline when the session boundary changes (see _build_timeline).
         self._max_context_tokens = max_context_tokens
         self._compress_trigger_tokens = compress_trigger_tokens
-        self._compress_timeline = compress_timeline
+        self._compression_enabled = compress_timeline
         self._timeline = self._build_timeline()
 
         # Initialize EventLog API (only if observer AND codec provided)
@@ -260,7 +260,7 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             max_tokens_until_compression=self._compress_trigger_tokens,
             agent=self,
             repository_factory=self._repository_factory,
-            compression_enabled=self._compress_timeline,
+            compression_enabled=self._compression_enabled,
             system_tokens_fn=self._estimate_system_prompt_tokens,
             tools_tokens_fn=self._estimate_tools_tokens,
         )
