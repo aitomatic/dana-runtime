@@ -125,3 +125,24 @@ class TestFactoryDispatch:
         resource = TaskResource(resource_id="task", agents={"fake": _factory()})
         out = await resource.task(description="d", prompt="x", subagent_type="nope")
         assert "Unknown agent type" in out
+
+    @pytest.mark.asyncio
+    async def test_failed_aquery_marks_session_failed(self):
+        class FailingSubAgent(FakeSubAgent):
+            async def aquery(self, message=None, session_id=None, **kwargs):
+                raise RuntimeError("boom")
+
+        resource = TaskResource(
+            resource_id="task",
+            agents={"fail": functools.partial(FailingSubAgent, agent_id="failing")},
+        )
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await resource.task(description="d", prompt="x", subagent_type="fail")
+
+        # Session must not be stuck "running" — task_output reports the failure.
+        sid = next(iter(resource._sessions))
+        assert resource._sessions[sid]["status"] == "failed"
+        out = await resource.task_output(task_id=sid)
+        assert out.startswith("Status: failed")
+        assert "boom" in out

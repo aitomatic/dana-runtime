@@ -235,8 +235,15 @@ class TaskResource(BaseResource):
             "status": "running",
         }
 
-        # Execute the agent query
-        result = await agent.aquery(message=prompt, session_id=session_id)
+        # Execute the agent query. On failure, mark the session "failed" (so
+        # task_output does not report it "running" forever) and re-raise so
+        # the caller still observes the error.
+        try:
+            result = await agent.aquery(message=prompt, session_id=session_id)
+        except Exception as e:
+            self._sessions[session_id]["status"] = "failed"
+            self._sessions[session_id]["error"] = str(e)
+            raise
 
         # Update session state
         self._sessions[session_id]["status"] = "completed"
@@ -270,5 +277,8 @@ class TaskResource(BaseResource):
             result = session.get("result", {})
             response = result.get("response", str(result)) if isinstance(result, dict) else str(result)
             return f"Status: completed\n\n{response}"
+
+        if status == "failed":
+            return f"Status: failed\n\n{session.get('error', 'Unknown error')}"
 
         return f"Status: {status}"
