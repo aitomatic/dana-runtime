@@ -480,6 +480,103 @@ class TestCompressedTimelineToLLMMessages:
         assert summary_count2 == 1
 
 
+class TestSubAgentResponseToolRole:
+    """SUB_AGENT_RESPONSE with tool_call_id must round-trip as role='tool'.
+
+    Regression for: openai 400 'tool_call_ids did not have response messages'
+    when resuming a timeline where the assistant called a sub-agent via a native
+    tool call and the sub-agent's response was stored as SUB_AGENT_RESPONSE.
+    The native-message conversion was defaulting these to role='assistant' and
+    dropping tool_call_id, which left the next LLM call's assistant tool_calls
+    unanswered on the wire.
+    """
+
+    def test_sub_agent_response_with_tool_call_id_maps_to_tool_role(self):
+        timeline = CompressedTimeline()
+        tool_call_id = "call_KU7CA5MtLbAEdSnYugJfwsV0"
+
+        timeline.add_entry(
+            TimelineEntry(
+                entry_type=TimelineEntryType.TOOL_CALL,
+                content="",
+                tool_calls=[
+                    {
+                        "function": "assistant__query",
+                        "arguments": {"message": "..."},
+                        "tool_call_id": tool_call_id,
+                    }
+                ],
+            )
+        )
+        timeline.add_entry(
+            TimelineEntry(
+                entry_type=TimelineEntryType.SUB_AGENT_RESPONSE,
+                content="sub-agent answer",
+                tool_call_id=tool_call_id,
+            )
+        )
+
+        msgs = timeline.to_llm_messages()
+        roles = [m.role for m in msgs]
+        assert roles == ["assistant", "tool"], roles
+        assert msgs[0].tool_calls and msgs[0].tool_calls[0]["id"] == tool_call_id
+        assert msgs[1].tool_call_id == tool_call_id
+
+    def test_sub_agent_response_without_tool_call_id_stays_assistant(self):
+        """Legacy XML sub-agent flow had no tool_call_id — keep as assistant."""
+        timeline = CompressedTimeline()
+        timeline.add_entry(
+            TimelineEntry(
+                entry_type=TimelineEntryType.SUB_AGENT_RESPONSE,
+                content="legacy sub-agent answer",
+            )
+        )
+        msgs = timeline.to_llm_messages()
+        assert [m.role for m in msgs] == ["assistant"]
+        assert msgs[0].tool_call_id is None
+
+    def test_resume_from_persisted_entries_preserves_tool_call_pairing(self):
+        """Reproduces the bug from the reported timeline JSON exactly."""
+        tool_call_id = "call_KU7CA5MtLbAEdSnYugJfwsV0"
+        entries = [
+            TimelineEntry(
+                entry_type=TimelineEntryType.USER_MESSAGE,
+                content="user request",
+                is_latest_user_message=True,
+            ),
+            TimelineEntry(
+                entry_type=TimelineEntryType.TOOL_CALL,
+                content="",
+                tool_calls=[
+                    {
+                        "function": "assistant__query",
+                        "arguments": {"message": "..."},
+                        "tool_call_id": tool_call_id,
+                    }
+                ],
+            ),
+            TimelineEntry(
+                entry_type=TimelineEntryType.SUB_AGENT_RESPONSE,
+                content="sub-agent answer",
+                tool_call_id=tool_call_id,
+            ),
+        ]
+
+        timeline = CompressedTimeline()
+        timeline.load_from_entries(entries)
+
+        msgs = timeline.to_llm_messages()
+        roles = [m.role for m in msgs]
+        assert roles == ["user", "assistant", "tool"], roles
+        # Every assistant tool_call must have a matching tool message right after.
+        for i, m in enumerate(msgs):
+            if m.role == "assistant" and m.tool_calls:
+                pairing = msgs[i + 1 : i + 1 + len(m.tool_calls)]
+                pair_ids = {p.tool_call_id for p in pairing if p.role == "tool"}
+                call_ids = {tc["id"] for tc in m.tool_calls}
+                assert call_ids <= pair_ids, f"unpaired tool_calls: {call_ids - pair_ids}"
+
+
 class TestCompressedTimelineLoadFromEntries:
     """Test load_from_entries method."""
 
