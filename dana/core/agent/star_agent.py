@@ -282,11 +282,11 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
           3. Rehydrates from the new session's persisted entries (compaction-
              snapshot aware). An unknown session id yields an empty timeline.
 
-        ``TaskResource`` passes ``reload_timeline=True`` when dispatching to
-        sub-agents, so each spawn gets a disjoint, disk-accurate timeline.
-        Note: skipping the rehydrate alone is not enough — the rebuild in
-        step 2 would still discard the caller's timeline — so the flag gates
-        the whole reload.
+        This is the internal primitive; ``reload_timeline`` is not exposed on the
+        query methods. Prefer the public ``resume(session_id)`` wrapper for the
+        reload path (``TaskResource`` calls it per sub-agent spawn). Note:
+        skipping the rehydrate alone is not enough — the rebuild in step 2 would
+        still discard the caller's timeline — so the flag gates the whole reload.
 
         Re-setting the current id is a no-op (no repository hit). Ordering is
         load-bearing: ``_session_id`` is assigned before ``rehydrate()`` because
@@ -313,6 +313,32 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         self._session_id = session_id
         self._timeline = self._build_timeline()
         self._timeline.rehydrate()
+
+    def resume(self, session_id: str) -> None:
+        """Resume a persisted session by id, reloading its timeline from disk.
+
+        The single public entry point for a session reload. Thin wrapper over
+        ``set_session_id(session_id, reload_timeline=True)``: flushes the
+        current session, rebuilds the timeline (resetting all session-scoped
+        and compaction-tracking state), then rehydrates from ``session_id``'s
+        persisted entries. An unknown id yields an empty timeline.
+
+        Mutates instance state (timeline + session id) — must NOT be interleaved
+        with an in-flight query on a shared agent. ``TaskResource`` calls this on
+        a freshly built per-spawn instance, so isolation is guaranteed there.
+
+        Fork semantics: ``resume(A)`` followed by ``aquery(session_id=B)`` reads
+        from A and writes to B — A's history is branched into B and A on disk is
+        left untouched. Resuming and continuing in place means omitting
+        ``session_id`` on ``aquery`` (or passing the same id).
+
+        See ``resume_from_timeline`` to adopt an in-memory ``Timeline`` object
+        instead of loading by id.
+
+        Args:
+            session_id: The persisted session to load and continue.
+        """
+        self.set_session_id(session_id, reload_timeline=True)
 
     def resume_from_timeline(self, timeline: Timeline, session_id: str | None = None) -> None:
         """
@@ -475,13 +501,12 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                 self._timeline.save(session_id)
 
     async def aquery(self, **kwargs) -> DictParams:
-        # reload_timeline gates per-session timeline reload (see set_session_id).
-        # Default False; TaskResource passes True for sub-agent dispatch.
-        # Popped so it does not leak into the base aquery kwargs.
-        reload_timeline = kwargs.pop("reload_timeline", False)
+        # session_id relabels the in-memory session / write target (see
+        # set_session_id). To reload a persisted session from disk first, call
+        # resume(session_id) before aquery() — relabel never reloads.
         new_session_id = kwargs.get("session_id")
         if new_session_id is not None:
-            self.set_session_id(new_session_id, reload_timeline=reload_timeline)
+            self.set_session_id(new_session_id)
         session_id = self._session_id
 
         # Reset STAR loop counter for new query
@@ -517,24 +542,23 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         initial_message: str | None = None,
         session_id: str | None = None,
         input_handler: Callable[[], Awaitable[str]] | None = None,
-        reload_timeline: bool = False,
     ) -> None:
         """Async interactive conversation loop with pluggable input handler.
+
+        The in-memory timeline is kept across turns (each turn relabels, never
+        reloads). To continue a persisted conversation, call ``resume(session_id)``
+        before ``aconverse``.
 
         Args:
             initial_message: Optional initial message to start the conversation
             session_id: Optional session identifier. If None, generates UUID.
             input_handler: Async callable that returns user input string.
                           If None, uses default blocking input() wrapped in executor.
-            reload_timeline: Forwarded to each turn's aquery -> set_session_id.
-                When False (default), the agent's current in-memory timeline is
-                kept instead of being reloaded per session (see set_session_id).
         """
         await self._communicator.aconverse(
             initial_message=initial_message,
             session_id=session_id,
             input_handler=input_handler,
-            reload_timeline=reload_timeline,
         )
 
     def __getattr__(self, name: str):

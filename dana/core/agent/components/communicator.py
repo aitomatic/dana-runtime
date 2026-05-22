@@ -232,19 +232,19 @@ class Communicator:
         initial_message: str | None = None,
         session_id: str | None = None,
         input_handler: Callable[[], Awaitable[str]] | None = None,
-        reload_timeline: bool = False,
     ) -> None:
         """
         Async interactive conversation loop with pluggable input handler.
+
+        Each turn relabels the session (keeps the in-memory timeline); it never
+        reloads from disk. To continue a persisted conversation, call the agent's
+        ``resume(session_id)`` before invoking this loop.
 
         Args:
             initial_message: Optional initial message to start the conversation
             session_id: Optional session identifier. If None, generates UUID.
             input_handler: Async callable that returns user input string.
                           If None, uses default blocking input() wrapped in executor.
-            reload_timeline: Forwarded to each turn's aquery so set_session_id
-                can perform the per-session timeline reload when True. Default
-                False keeps the agent's current timeline.
         """
         # Default input handler wraps blocking input() in executor
         if input_handler is None:
@@ -402,7 +402,7 @@ class Communicator:
 
                 # Process the message through the agent (async)
                 print("\nAgent: ", end="", flush=True)
-                traces = await self._agent.aquery(message=user_input, session_id=session_id, reload_timeline=reload_timeline)
+                traces = await self._agent.aquery(message=user_input, session_id=session_id)
                 response = traces.get("response", "No response generated")
                 print(response)
 

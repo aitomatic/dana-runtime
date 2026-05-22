@@ -158,5 +158,55 @@ class TestRehydrate:
         assert timeline._native_messages == []
 
 
+class TestResume:
+    """resume(session_id) is the public reload wrapper over set_session_id."""
+
+    def test_resume_returns_none(self, tmp_path):
+        # Locked contract: resume is a side-effecting command, not chainable.
+        agent = _make_agent(tmp_path, session_id="A")
+        assert agent.resume("B") is None
+
+    def test_resume_reloads_persisted_session(self, tmp_path):
+        agent = _make_agent(tmp_path, session_id="A")
+        agent._timeline.add_entry(_entry("user-q", TimelineEntryType.USER_MESSAGE))
+        agent._timeline.add_entry(_entry("agent-a", TimelineEntryType.AGENT_RESPONSE))
+        agent._timeline.save("A")
+
+        agent.resume("B")
+        assert agent._timeline.timeline == []
+
+        agent.resume("A")
+        assert [e.content for e in agent._timeline.timeline] == ["user-q", "agent-a"]
+
+    def test_resume_unknown_session_is_empty(self, tmp_path):
+        agent = _make_agent(tmp_path, session_id="A")
+        agent._timeline.add_entry(_entry("hello-A"))
+
+        agent.resume("never-saved")
+
+        assert agent._timeline.timeline == []
+        assert agent._session_id == "never-saved"
+
+    def test_resume_then_relabel_forks_read_a_write_b(self, tmp_path):
+        # Fork semantics: resume(A) loads A; a subsequent relabel to B (the
+        # default aquery path) keeps A's in-memory timeline, so a save under B
+        # branches A's history into B while A on disk stays untouched.
+        agent = _make_agent(tmp_path, session_id="seed")
+        agent._timeline.add_entry(_entry("a-history"))
+        agent._timeline.save("A")
+
+        agent.resume("A")
+        agent.set_session_id("B")  # relabel (reload_timeline defaults False)
+        assert agent._session_id == "B"
+        assert [e.content for e in agent._timeline.timeline] == ["a-history"]
+
+        agent._timeline.save("B")
+        repo = agent._timeline._repository
+        assert repo is not None
+        assert [e.content for e in repo.read_session_entries("B")] == ["a-history"]
+        # A is the read source only — never written back by the fork.
+        assert [e.content for e in repo.read_session_entries("A")] == ["a-history"]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

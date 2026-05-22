@@ -25,6 +25,12 @@ class FakeSubAgent(BaseAgent):
         kwargs.setdefault("auto_register", False)
         super().__init__(agent_type="fake_sub", agent_id=agent_id, **kwargs)
         self.seen_prompts: list = []
+        self.resumed_sessions: list = []
+
+    def resume(self, session_id: str) -> None:
+        # Mirror STARAgent.resume: adopt the session id (fake has no disk timeline).
+        self.resumed_sessions.append(session_id)
+        self._session_id = session_id
 
     async def aquery(self, message: str | None = None, session_id: str | None = None, **kwargs) -> dict:
         # Yield control so concurrent dispatches interleave — a shared instance
