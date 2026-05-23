@@ -8,11 +8,14 @@ session's persisted entries. Unknown session -> empty timeline. Same id -> no-op
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
 from dana.config.storage_config import FileStorageConfig
 from dana.core.agent.star_agent import STARAgent
+from dana.core.prompt.environment_info import EnvironmentInfo
 from dana.core.timeline.compressed_timeline import CompressedTimeline
 from dana.core.timeline.timeline import TimelineEntry, TimelineEntryType
 from dana.repositories.local_file_repository import LocalTimelineRepository
@@ -145,6 +148,42 @@ class TestSetSessionIdBoundary:
 
         assert agent._timeline is original_timeline
         assert [e.content for e in agent._timeline.timeline] == ["untouched"]
+
+    def test_session_scratchpad_lives_under_session_folder(self, tmp_path):
+        agent = _make_agent(tmp_path, session_id="A")
+
+        scratchpad = Path(EnvironmentInfo(agent, "NativeToolsCodec/agent-1/prompts").scratchpad_directory)
+
+        assert scratchpad == tmp_path / "agent-1" / "sessions" / "A" / "scratchpad"
+        assert scratchpad.is_dir()
+
+    def test_relabel_invalidates_system_prompt_cache(self, tmp_path):
+        agent = _make_agent(tmp_path, session_id="A")
+        agent._runtime.invalidate_system_prompt_cache = Mock()
+
+        agent.set_session_id("B", reload_timeline=False)
+
+        agent._runtime.invalidate_system_prompt_cache.assert_called_once_with()
+
+    def test_reload_invalidates_system_prompt_cache(self, tmp_path):
+        agent = _make_agent(tmp_path, session_id="A")
+        agent._runtime.invalidate_system_prompt_cache = Mock()
+
+        agent.set_session_id("B", reload_timeline=True)
+
+        agent._runtime.invalidate_system_prompt_cache.assert_called_once_with()
+
+    def test_cached_system_prompt_rerenders_after_session_change(self, tmp_path):
+        agent = _make_agent(tmp_path, session_id="A")
+        prompt_api = agent._runtime._get_prompt_api(agent)
+        prompt_api.load = lambda: "scratch={{scratchpad_directory}}"
+
+        first_prompt = agent._runtime._build_system_prompt(agent)
+        agent.set_session_id("B", reload_timeline=False)
+        second_prompt = agent._runtime._build_system_prompt(agent)
+
+        assert str(tmp_path / "agent-1" / "sessions" / "A" / "scratchpad") in first_prompt
+        assert str(tmp_path / "agent-1" / "sessions" / "B" / "scratchpad") in second_prompt
 
 
 class TestRehydrate:
