@@ -173,15 +173,12 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         #     env var wins, so ops can retune without code changes).
         # Historically these were aliased to the same value; the split lets ops set
         # the trigger via env while agent authors still pick an appropriate context budget.
-        self._timeline = CompressedTimeline(
-            max_context_tokens=max_context_tokens,
-            max_tokens_until_compression=compress_trigger_tokens,
-            agent=self,
-            repository_factory=self._repository_factory,
-            compression_enabled=compress_timeline,
-            system_tokens_fn=self._estimate_system_prompt_tokens,
-            tools_tokens_fn=self._estimate_tools_tokens,
-        )
+        # Persisted so set_session_id can rebuild an identically-configured
+        # timeline when the session boundary changes (see _build_timeline).
+        self._max_context_tokens = max_context_tokens
+        self._compress_trigger_tokens = compress_trigger_tokens
+        self._compression_enabled = compress_timeline
+        self._timeline = self._build_timeline()
 
         # Initialize EventLog API (only if observer AND codec provided)
         # Events ONLY come from Observer - no observer = no EventLog
@@ -248,9 +245,100 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         self._reminder_manager = ReminderManager()
         self._star_loop_count = 0  # Tracks iterations within current query
 
-    def set_session_id(self, session_id: str) -> None:
-        """Set the session id for the agent."""
+    def _build_timeline(self) -> CompressedTimeline:
+        """Construct a fresh, fully-configured CompressedTimeline.
+
+        Single source of truth for timeline construction — used by ``__init__``
+        and by ``set_session_id``. Building a new instance (rather than mutating
+        the existing one) resets ALL session-scoped state, including the
+        compaction-tracking fields (``_last_compression_at``,
+        ``_active_compact_session_id``, ``_active_compact_compression_at``) that
+        a bare ``rehydrate()`` would otherwise leak across sessions.
+        """
+        return CompressedTimeline(
+            max_context_tokens=self._max_context_tokens,
+            max_tokens_until_compression=self._compress_trigger_tokens,
+            agent=self,
+            repository_factory=self._repository_factory,
+            compression_enabled=self._compression_enabled,
+            system_tokens_fn=self._estimate_system_prompt_tokens,
+            tools_tokens_fn=self._estimate_tools_tokens,
+        )
+
+    def set_session_id(self, session_id: str, reload_timeline: bool = False) -> None:
+        """Switch the agent to a different session.
+
+        With ``reload_timeline=False`` (default) the call is a pure relabel:
+        the current in-memory timeline is kept and carried into the new session
+        id (it is persisted under the new id on the next ``save``). This is the
+        default because most callers — including subclasses that seed their own
+        timeline before the STAR loop — manage their own context.
+
+        With ``reload_timeline=True`` ``session_id`` becomes a real context
+        boundary:
+          1. Flushes the outgoing session's timeline to disk (no data loss).
+          2. Rebuilds the timeline from scratch — resets entries AND all
+             compaction-tracking state.
+          3. Rehydrates from the new session's persisted entries (compaction-
+             snapshot aware). An unknown session id yields an empty timeline.
+
+        This is the internal primitive; ``reload_timeline`` is not exposed on the
+        query methods. Prefer the public ``resume(session_id)`` wrapper for the
+        reload path (``TaskResource`` calls it per sub-agent spawn). Note:
+        skipping the rehydrate alone is not enough — the rebuild in step 2 would
+        still discard the caller's timeline — so the flag gates the whole reload.
+
+        Re-setting the current id is a no-op (no repository hit). Ordering is
+        load-bearing: ``_session_id`` is assigned before ``rehydrate()`` because
+        ``read_since`` reads the session id off the agent.
+
+        Args:
+            session_id: The session id to switch to.
+            reload_timeline: When True, rebuild + rehydrate the timeline from
+                the new session. When False (default), keep the current
+                timeline and only relabel.
+        """
+        if session_id == self._session_id:
+            return
+
+        if not reload_timeline:
+            # Pure relabel — caller owns the timeline; do not flush/rebuild.
+            self._session_id = session_id
+            return
+
+        timeline = getattr(self, "_timeline", None)
+        if timeline is not None and getattr(timeline, "_repository", None) is not None and timeline.timeline:
+            timeline.save(self._session_id)
+
         self._session_id = session_id
+        self._timeline = self._build_timeline()
+        self._timeline.rehydrate()
+
+    def resume(self, session_id: str) -> None:
+        """Resume a persisted session by id, reloading its timeline from disk.
+
+        The single public entry point for a session reload. Thin wrapper over
+        ``set_session_id(session_id, reload_timeline=True)``: flushes the
+        current session, rebuilds the timeline (resetting all session-scoped
+        and compaction-tracking state), then rehydrates from ``session_id``'s
+        persisted entries. An unknown id yields an empty timeline.
+
+        Mutates instance state (timeline + session id) — must NOT be interleaved
+        with an in-flight query on a shared agent. ``TaskResource`` calls this on
+        a freshly built per-spawn instance, so isolation is guaranteed there.
+
+        Fork semantics: ``resume(A)`` followed by ``aquery(session_id=B)`` reads
+        from A and writes to B — A's history is branched into B and A on disk is
+        left untouched. Resuming and continuing in place means omitting
+        ``session_id`` on ``aquery`` (or passing the same id).
+
+        See ``resume_from_timeline`` to adopt an in-memory ``Timeline`` object
+        instead of loading by id.
+
+        Args:
+            session_id: The persisted session to load and continue.
+        """
+        self.set_session_id(session_id, reload_timeline=True)
 
     def resume_from_timeline(self, timeline: Timeline, session_id: str | None = None) -> None:
         """
@@ -413,7 +501,9 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                 self._timeline.save(session_id)
 
     async def aquery(self, **kwargs) -> DictParams:
-        # Generate session_id if not provided
+        # session_id relabels the in-memory session / write target (see
+        # set_session_id). To reload a persisted session from disk first, call
+        # resume(session_id) before aquery() — relabel never reloads.
         new_session_id = kwargs.get("session_id")
         if new_session_id is not None:
             self.set_session_id(new_session_id)
@@ -454,6 +544,10 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         input_handler: Callable[[], Awaitable[str]] | None = None,
     ) -> None:
         """Async interactive conversation loop with pluggable input handler.
+
+        The in-memory timeline is kept across turns (each turn relabels, never
+        reloads). To continue a persisted conversation, call ``resume(session_id)``
+        before ``aconverse``.
 
         Args:
             initial_message: Optional initial message to start the conversation

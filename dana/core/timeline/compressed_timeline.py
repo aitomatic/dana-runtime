@@ -323,10 +323,12 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
 
         Mapping rules:
         - USER_MESSAGE -> role='user'
-        - AGENT_RESPONSE, AGENT_THOUGHTS, AGENT_LEARNING, SUB_AGENT_RESPONSE, TODO_LIST
-          -> role='assistant'
+        - AGENT_RESPONSE, AGENT_THOUGHTS, AGENT_LEARNING, TODO_LIST -> role='assistant'
         - TOOL_CALL -> role='assistant' with tool_calls
         - RESOURCE_RESULT, WORKFLOW_RESULT -> role='tool' with tool_call_id
+        - SUB_AGENT_RESPONSE w/ tool_call_id -> role='tool' (sub-agent invoked as native tool)
+        - SUB_AGENT_RESPONSE w/o tool_call_id -> role='assistant' (legacy XML flow)
+        - UNKNOWN_TOOL_CALL / FAILED_TOOL_CALL w/ tool_call_id -> role='tool'
         - TIMELINE_SUMMARY, CONTEXT -> role='system'
         - Other -> role='assistant' (default)
 
@@ -416,17 +418,22 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
             in (
                 TimelineEntryType.UNKNOWN_TOOL_CALL.value,
                 TimelineEntryType.FAILED_TOOL_CALL.value,
+                TimelineEntryType.SUB_AGENT_RESPONSE.value,
             )
             and entry.tool_call_id
         ):
-            # Tool execution errors with a tool_call_id must be role="tool"
+            # Tool execution results / errors with a tool_call_id must be role="tool"
             # so the LLM API can match them to their corresponding tool_calls.
             # Without this, the API rejects with "tool_call_ids did not have response messages".
+            # SUB_AGENT_RESPONSE is produced by `_record_tool_results` for tool_type="agent"
+            # the same way RESOURCE_RESULT/WORKFLOW_RESULT are produced for resources/workflows,
+            # so it must be normalized to the same role when a tool_call_id is present.
             role = "tool"
             tool_call_id = entry.tool_call_id
         else:
-            # Default: AGENT_RESPONSE, AGENT_THOUGHTS, AGENT_LEARNING, SUB_AGENT_RESPONSE,
-            # TODO_LIST, UNKNOWN_TOOL_CALL (without tool_call_id), FAILED_TOOL_CALL (without tool_call_id)
+            # Default: AGENT_RESPONSE, AGENT_THOUGHTS, AGENT_LEARNING, TODO_LIST,
+            # SUB_AGENT_RESPONSE (without tool_call_id — legacy XML flow),
+            # UNKNOWN_TOOL_CALL/FAILED_TOOL_CALL (without tool_call_id)
             role = "assistant"
 
         return NativeMessage(

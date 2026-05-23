@@ -1,19 +1,30 @@
-"""TaskResource for dispatching tasks to sub-agents with dynamic tool descriptions."""
+"""TaskResource for dispatching tasks to sub-agents with dynamic tool descriptions.
 
+Agents are registered as **factories** — callables that construct a fresh
+agent per ``task()`` invocation. Each spawn gets a disjoint object graph
+(``_timeline``, ``_star_loop_count``, ``_session_id``, EventLog cursor), which
+eliminates both the concurrent-same-type state corruption and the sequential
+timeline-accumulation bug that a single shared instance suffered.
+
+A legacy instance registration is still accepted (wrapped as a constant
+factory) but is unsafe under concurrency and emits a ``DeprecationWarning``.
+"""
+
+from collections.abc import Callable
 from typing import Any
 import uuid
+import warnings
 
 from dana.common.protocols import Notifiable
-from dana.common.protocols.war import TOOL_NAME, named_tool
-from dana.common.utils.misc import Misc
+from dana.common.protocols.war import named_tool
 from dana.core.resource.base_resource import BaseResource
 
 
 class TaskResource(BaseResource):
     """Resource for launching tasks to sub-agents.
 
-    The TaskResource dispatches tasks to specialized sub-agents, with tool descriptions
-    dynamically generated based on the registered agents and their capabilities.
+    The TaskResource dispatches tasks to specialized sub-agents, with tool
+    descriptions dynamically generated from the registered agent factories.
     """
 
     def __init__(self, resource_id: str, agents: dict[str, Any] | None = None, **kwargs):
@@ -21,30 +32,92 @@ class TaskResource(BaseResource):
 
         Args:
             resource_id: Unique identifier for this resource instance.
-            agents: Dictionary mapping agent type names to agent instances.
+            agents: Mapping of agent type name -> agent factory (preferred) or
+                agent instance (legacy, deprecated). Factories must satisfy the
+                contract documented on ``register_agent``.
             **kwargs: Additional arguments passed to the base resource.
         """
         super().__init__(resource_id=resource_id, **kwargs)
-        self._agents: dict[str, Any] = agents or {}
+        # Factory per agent type; constructs a fresh agent per task() call.
+        self._agents: dict[str, Callable[[], Any]] = {}
+        # TASK_TOOL_DESCRIPTION cached per type — read off the agent class so
+        # no live instance is needed to render the tool docstring.
+        self._descriptions: dict[str, str] = {}
         self._sessions: dict[str, dict[str, Any]] = {}
+        # Notifiables (inherited self._notifiables list) are applied to each
+        # agent in task() right after the factory spawns it — agents do not
+        # exist until a task() call constructs one.
+
+        for name, agent_or_factory in (agents or {}).items():
+            self.register_agent(name, agent_or_factory)
         self._update_task_docstring()
 
     def with_notifiable(self, *notifiables: Notifiable) -> "TaskResource":
-        """Propagate notifiables to stored agents so sub-agent activity is visible."""
-        for agent in self._agents.values():
-            if hasattr(agent, "with_notifiable"):
+        """Record notifiables; applied to every agent spawned by ``task()``.
+
+        Also forwarded to any already-live session agents so in-flight or
+        resumable sub-agents stay observable.
+        """
+        for session in self._sessions.values():
+            agent = session.get("agent")
+            if agent is not None and hasattr(agent, "with_notifiable"):
                 agent.with_notifiable(*notifiables)
         super().with_notifiable(*notifiables)
         return self
 
-    def register_agent(self, name: str, agent: Any) -> None:
-        """Register an agent for task dispatch.
+    def register_agent(self, name: str, agent_or_factory: Any) -> None:
+        """Register an agent factory for task dispatch.
+
+        Factory contract (preferred path):
+            1. MUST be a callable that constructs a fresh agent with no
+               arguments — e.g. ``functools.partial(AgentCls, ...)``.
+            2. MUST expose its target class via ``.func`` so the agent's
+               ``TASK_TOOL_DESCRIPTION`` is reachable without instantiation.
+               ``functools.partial`` satisfies this; a bare ``lambda`` does NOT.
+            3. SHOULD pin a stable ``agent_id`` — timeline storage is keyed by
+               it; an unpinned id breaks session resume.
+            4. SHOULD pass ``auto_register=False`` — per-spawn agents must not
+               pollute the global registry.
+
+        Legacy path: passing a ``BaseAgent`` instance is still accepted but
+        deprecated. A shared instance corrupts state across concurrent and
+        sequential ``Task`` calls; it is wrapped as a constant factory and a
+        ``DeprecationWarning`` is emitted.
 
         Args:
             name: The name to use for this agent type.
-            agent: The agent instance.
+            agent_or_factory: An agent factory (preferred) or instance (legacy).
         """
-        self._agents[name] = agent
+        from dana.core.agent.base_agent import BaseAgent
+
+        if isinstance(agent_or_factory, BaseAgent):
+            warnings.warn(
+                f"register_agent('{name}', <instance>) is deprecated and unsafe "
+                "under concurrency: a shared agent instance interleaves mutable "
+                "state across Task calls. Pass a factory instead, e.g. "
+                "functools.partial(AgentCls, agent_id=..., auto_register=False).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            instance = agent_or_factory
+            cls: type = type(instance)
+            # Constant factory — intentionally has no `.func`; the description
+            # is cached in _descriptions below, so nothing re-reads the class
+            # off this callable.
+            factory: Callable[[], Any] = lambda inst=instance: inst  # noqa: E731
+        else:
+            factory = agent_or_factory
+            if not callable(factory):
+                raise TypeError(f"Agent factory for '{name}' must be callable, got {type(factory)!r}.")
+            if not hasattr(factory, "func"):
+                raise TypeError(
+                    f"Agent factory for '{name}' must expose its target class via '.func' "
+                    "— use functools.partial(AgentCls, ...), not a bare lambda."
+                )
+            cls = getattr(factory, "func")  # noqa: B009 - Pyright cannot narrow Any here
+
+        self._agents[name] = factory
+        self._descriptions[name] = getattr(cls, "TASK_TOOL_DESCRIPTION", "No description available")
         self._update_task_docstring()
 
     def unregister_agent(self, name: str) -> bool:
@@ -58,6 +131,7 @@ class TaskResource(BaseResource):
         """
         if name in self._agents:
             del self._agents[name]
+            self._descriptions.pop(name, None)
             self._update_task_docstring()
             return True
         return False
@@ -73,15 +147,11 @@ class TaskResource(BaseResource):
             "",
             "The Task tool launches specialized agents (subprocesses) that autonomously handle complex tasks. Each agent type has specific capabilities and tools available to it.",
             "",
-            "Available agent types and the tools they have access to:",
+            "Available agent types:",
         ]
 
-        # Add each agent with its full description
-        for name, agent in self._agents.items():
-            desc = getattr(agent.__class__, "TASK_TOOL_DESCRIPTION", "No description available")
-            tools = self._get_agent_tools(agent)
-            tools_str = ", ".join(tools) if tools else "None"
-            parts.append(f"- {name}: {desc} (Tools: {tools_str})")
+        for name, desc in self._descriptions.items():
+            parts.append(f"- {name}: {desc}")
 
         parts.extend(
             [
@@ -104,26 +174,6 @@ class TaskResource(BaseResource):
         )
 
         return "\n".join(parts)
-
-    def _get_agent_tools(self, agent: Any) -> list[str]:
-        """Extract tool names from an agent's resources.
-
-        Args:
-            agent: The agent to extract tools from.
-
-        Returns:
-            List of tool names available to the agent.
-        """
-        tool_names = []
-        resources = getattr(agent, "_resources", [])
-
-        for resource in resources:
-            for method_name, method in Misc.extract_tool_use_methods(resource):
-                # Check for custom tool name from @named_tool decorator
-                custom_name = method.__dict__.get(TOOL_NAME) if hasattr(method, "__dict__") else None
-                tool_names.append(custom_name or method_name)
-
-        return tool_names
 
     def _generate_session_id(self) -> str:
         """Generate a unique session ID.
@@ -165,8 +215,18 @@ class TaskResource(BaseResource):
             available = ", ".join(self._agents.keys()) if self._agents else "none"
             return f"Error: Unknown agent type '{subagent_type}'. Available agents: {available}"
 
-        agent = self._agents[subagent_type]
         session_id = resume or self._generate_session_id()
+
+        # Resume reuses the live instance if it is still in memory; otherwise
+        # (and for every fresh task) the factory builds a disjoint agent so no
+        # mutable state is shared across spawns. Disk-based resume for an
+        # evicted session is handled by the agent's own set_session_id reload.
+        existing = self._sessions.get(session_id, {}).get("agent") if resume else None
+        agent = existing if existing is not None else self._agents[subagent_type]()
+
+        # Propagate recorded notifiables to the freshly constructed agent.
+        if self._notifiables and hasattr(agent, "with_notifiable"):
+            agent.with_notifiable(*self._notifiables)
 
         # Store session state
         self._sessions[session_id] = {
@@ -175,8 +235,23 @@ class TaskResource(BaseResource):
             "status": "running",
         }
 
-        # Execute the agent query
-        result = await agent.aquery(message=prompt, session_id=session_id)
+        # A sub-agent's session_id IS a hard context boundary: resume() reloads
+        # the session's timeline from disk (empty for a new session, rehydrated
+        # for a resumed one), giving each spawn a disjoint, disk-accurate
+        # timeline. The agent is freshly built per spawn (factory), so this
+        # instance mutation is isolated. aquery() then continues in place and
+        # persists back to the same session_id.
+        agent.resume(session_id)
+
+        # Execute the agent query. On failure, mark the session "failed" (so
+        # task_output does not report it "running" forever) and re-raise so
+        # the caller still observes the error.
+        try:
+            result = await agent.aquery(message=prompt)
+        except Exception as e:
+            self._sessions[session_id]["status"] = "failed"
+            self._sessions[session_id]["error"] = str(e)
+            raise
 
         # Update session state
         self._sessions[session_id]["status"] = "completed"
@@ -210,5 +285,8 @@ class TaskResource(BaseResource):
             result = session.get("result", {})
             response = result.get("response", str(result)) if isinstance(result, dict) else str(result)
             return f"Status: completed\n\n{response}"
+
+        if status == "failed":
+            return f"Status: failed\n\n{session.get('error', 'Unknown error')}"
 
         return f"Status: {status}"

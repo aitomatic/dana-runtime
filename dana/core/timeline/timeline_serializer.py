@@ -171,6 +171,21 @@ class TimelineSerializerMixin:
         self._active_compact_compression_at = self._parse_ts_from_compact_id(latest)
         logger.info("compact_session_adopted", session_id=latest)
 
+    def rehydrate(self: CompressedTimeline) -> None:
+        """Reload this timeline from the agent's current session on disk.
+
+        Thin wrapper over ``read_since``: assigns the persisted entries to
+        ``self.timeline`` (``_native_messages`` is recomputed by ``read_since``
+        as a side effect). Compaction-snapshot aware.
+
+        No-op for in-memory timelines (no repository or no agent) — ``read_since``
+        would otherwise raise ``ValueError``. A session id that was never saved
+        naturally yields an empty timeline (no error).
+        """
+        if self._repository is None or self._agent is None:
+            return
+        self.timeline = list(self.read_since(0))
+
     # ------------------------------------------------------------------
     # save
     # ------------------------------------------------------------------
