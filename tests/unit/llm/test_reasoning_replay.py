@@ -63,7 +63,9 @@ class TestSpliceFingerprintMatch:
         assert result[1]["type"] == "reasoning"
         assert result[1]["id"] == "rs_001"
         assert result[2]["role"] == "assistant"
-        assert result[2]["content"] == "answer"
+        # Thought text dropped once native reasoning is spliced (redundant +
+        # trips Azure invalid_prompt). The reasoning item carries the summary.
+        assert result[2]["content"] == ""
         # All carrier keys stripped
         for key in ("_reasoning_items", "_reasoning_fingerprint", "_response_id"):
             assert key not in result[2]
@@ -315,6 +317,79 @@ class TestEndToEndPrepareMessagesAndConvert:
         # No leakage of carrier keys
         for key in ("_reasoning_items", "_reasoning_fingerprint", "_response_id"):
             assert key not in result[2]
+
+
+class TestNativeSpliceDropsRedundantText:
+    """When native reasoning items are spliced, the visible thought text must NOT
+    also ride along as assistant message content. It's redundant with the item's
+    summary+encrypted_content, and it trips Azure's invalid_prompt (Prompt Shield)
+    filter, which scans message-role content but not reasoning.summary.
+    Verified shape: see atlas-q33 timeline entry 2 (reasoning item + 3379-char
+    duplicate thought text → invalid_prompt rejection)."""
+
+    def test_thought_text_blanked_when_items_spliced(self):
+        provider = _make_provider(fingerprint="azure:gpt-5:abcd1234")
+        thought = "Analyzing telemetry parameters; exclude floors; can't filter directly."
+        msgs = [
+            {"role": "user", "content": "Q"},
+            {
+                "role": "assistant",
+                "content": thought,
+                "_reasoning_items": [_REASONING_ITEM],
+                "_reasoning_fingerprint": "azure:gpt-5:abcd1234",
+            },
+        ]
+
+        result = provider._convert_to_responses_input(msgs)
+
+        assert result[1]["type"] == "reasoning"
+        assert result[2]["role"] == "assistant"
+        assert result[2]["content"] == ""  # redundant thought text dropped
+        # Raw thought text must appear nowhere in any message-role payload.
+        msg_text = " ".join(r.get("content", "") for r in result if r.get("role") == "assistant")
+        assert thought not in msg_text
+
+    def test_thought_text_preserved_on_fingerprint_mismatch(self):
+        """Fallback path: no native splice → keep flat text so cross-provider
+        replay still carries the reasoning."""
+        provider = _make_provider(fingerprint="azure:gpt-5:abcd1234")
+        thought = "fallback reasoning text"
+        msgs = [
+            {
+                "role": "assistant",
+                "content": thought,
+                "_reasoning_items": [_REASONING_ITEM],
+                "_reasoning_fingerprint": "openai:gpt-5:99999999",
+            }
+        ]
+
+        result = provider._convert_to_responses_input(msgs)
+
+        assert all(r.get("type") != "reasoning" for r in result)
+        assert result[0]["content"] == thought
+
+    def test_tool_call_narration_preserved_when_items_spliced(self):
+        """Reasoning items on a tool-call message keep their pre-call narration;
+        only the standalone thought block is blanked."""
+        provider = _make_provider(fingerprint="azure:gpt-5:abcd1234")
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "calling search",
+                "_reasoning_items": [_REASONING_ITEM],
+                "_reasoning_fingerprint": "azure:gpt-5:abcd1234",
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "search", "arguments": "{}"}},
+                ],
+            },
+        ]
+
+        result = provider._convert_to_responses_input(msgs)
+
+        assert result[0]["type"] == "reasoning"
+        assert result[1]["role"] == "assistant"
+        assert result[1]["content"] == "calling search"
+        assert result[2]["type"] == "function_call"
 
 
 class TestChatViaResponsesActuallySendsItems:

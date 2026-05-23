@@ -845,7 +845,19 @@ class OpenAICompatibleProvider(LLMProvider):
                     for item in items:
                         result.append(dict(item))
                     replay_count += len(items)
-                msg = _strip_replay_carriers(msg)
+                    msg = _strip_replay_carriers(msg)
+                    # The spliced reasoning item already carries the summary +
+                    # encrypted_content, so the visible thought text is now
+                    # redundant. Drop it from the assistant message: it is
+                    # duplicate context, and Azure's invalid_prompt / Prompt
+                    # Shield filter scans message-role content (but not
+                    # reasoning.summary), so replaying raw thoughts as assistant
+                    # text triggers false-positive rejections. Tool-call
+                    # narration is short and kept (emitted by the branch below).
+                    if not msg.get("tool_calls"):
+                        msg = {**msg, "content": ""}
+                else:
+                    msg = _strip_replay_carriers(msg)
             # Convert multimodal user messages to Responses API format
             if role == "user" and isinstance(msg.get("content"), list):
                 content = msg["content"]
