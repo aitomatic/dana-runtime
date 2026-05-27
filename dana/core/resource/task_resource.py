@@ -164,11 +164,19 @@ class TaskResource(BaseResource):
                 "- If you are searching for code within a specific file or set of 2-3 files, use the Read tool instead of the Task tool, to find the match more quickly",
                 "- Other tasks that are not related to the agent descriptions above",
                 "",
-                "Usage notes:",
+                "=== CRITICAL: `resume` — continuing prior work with a subagent ===",
+                "",
+                "`resume` is the ONLY mechanism for multi-turn dialogue with a subagent. Read this carefully — misusing it is the #1 cause of subagents 'forgetting' prior turns.",
+                "",
+                "- Every `task()` call WITHOUT `resume` spawns a BRAND-NEW subagent with ZERO memory of any prior interaction. The previous subagent's reasoning, tool results, partial work, and your earlier instructions are completely gone. Same prompt, fresh mind, no continuity.",
+                "- Every `task()` response ends with `[session_id: xxxxxxxx]`. That ID is the handle for that specific subagent's context. Capture it whenever you might follow up.",
+                "- To continue, follow up on, refine, correct, or build on a subagent's earlier output, you MUST pass `resume=<that session_id>`. The subagent then rehydrates its full timeline from disk and continues in place — the next prompt is appended to the same conversation.",
+                "- Treat the choice as: 'Am I starting a NEW task, or continuing an EXISTING one?' Continuing → `resume`. Starting fresh → omit `resume`. When in doubt, if your new prompt references the prior result in any way ('also check...', 'now do X with that...', 'why did you...', 'fix the issue you found...'), USE `resume`. Spawning a new subagent for a follow-up forces you to re-explain everything and the subagent re-does work it already did.",
+                "- Resume is cheap. Re-explaining context to a fresh subagent is expensive (tokens, latency, and the subagent may reach different conclusions than the original).",
+                "",
+                "Other usage notes:",
                 "- Always include a short description (3-5 words) summarizing what the agent will do",
                 "- Provide clear, detailed prompts so the agent can work autonomously and return exactly the information you need",
-                "- When the agent is done, it will return a single message back to you along with its session_id. You can use this ID to resume the agent later if needed for follow-up work.",
-                "- Agents can be resumed using the `resume` parameter by passing the session_id from a previous invocation. When resumed, the agent continues with its full previous context preserved.",
                 "- You can optionally run agents in the background using the run_in_background parameter.",
             ]
         )
@@ -201,12 +209,24 @@ class TaskResource(BaseResource):
             prompt: The task for the agent to perform.
             subagent_type: The type of specialized agent to use for this task.
             model: Optional model to use for this agent.
-            resume: Optional session_id to resume from a previous invocation.
+            resume: Session ID returned by a prior task() invocation (the
+                ``[session_id: xxxxxxxx]`` suffix on the previous response).
+                THE primary channel for multi-turn dialogue with a subagent —
+                pass it whenever the new prompt continues, follows up on,
+                refines, or references a prior subagent's work. When supplied,
+                the subagent rehydrates its full timeline from disk and the new
+                prompt is appended to the existing conversation. When omitted,
+                a brand-new subagent is spawned with NO memory of any prior
+                interaction — the previous subagent's reasoning, tool results,
+                and your earlier instructions are gone. Omit ONLY for genuinely
+                independent, unrelated tasks. Re-spawning instead of resuming
+                forces context re-explanation and may yield divergent answers.
             run_in_background: Set to true to run this agent in the background.
             max_turns: Maximum number of agentic turns before stopping.
 
         Returns:
-            The agent's response along with a session_id for resumption.
+            The agent's response suffixed with ``[session_id: <id>]``. Capture
+            this id and pass it back as ``resume`` to continue the conversation.
         """
         _ = (description, model, run_in_background, max_turns)  # Reserved for future use
 
