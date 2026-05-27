@@ -98,13 +98,19 @@ Today's date: {today}"""
 
     @property
     def scratchpad_directory(self) -> str:
-        # Deferred to avoid circular import at module level
+        from dana.core.agent.tool_result_dump import resolve_session_folder_for_agent
+
+        session_folder = resolve_session_folder_for_agent(self._agent)
+        if session_folder is not None:
+            tmp_path = session_folder / "scratchpad"
+            tmp_path.mkdir(parents=True, exist_ok=True)
+            return str(tmp_path.absolute())
+
+        # Deferred to avoid circular import at module level.
         from dana.config.storage_config import FileStorageConfig
 
         workspace_folder = Path(FileStorageConfig().workspace_folder)
-
-        relative_prompt_path = Path(self._relative_path)
         _session_id = getattr(self._agent, "_session_id", str(uuid4()))
-        tmp_path = workspace_folder / relative_prompt_path.parent / "tmp" / _session_id / "scratchpad"
+        tmp_path = workspace_folder / str(self._agent.object_id) / "sessions" / _session_id / "scratchpad"
         tmp_path.mkdir(parents=True, exist_ok=True)
         return str(tmp_path.absolute())

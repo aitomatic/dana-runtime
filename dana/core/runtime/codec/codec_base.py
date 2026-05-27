@@ -98,6 +98,10 @@ class CodecRuntimeBase(AgentRuntime):
         prompt_api = self._get_prompt_api(agent)
         return prompt_api.system_prompt
 
+    def invalidate_system_prompt_cache(self) -> None:
+        if self._prompt_api is not None:
+            self._prompt_api._system_prompt = None
+
     def call_llm(
         self,
         messages: list[LLMMessage],

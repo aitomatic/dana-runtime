@@ -304,6 +304,7 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         if not reload_timeline:
             # Pure relabel — caller owns the timeline; do not flush/rebuild.
             self._session_id = session_id
+            self._invalidate_system_prompt_cache()
             return
 
         timeline = getattr(self, "_timeline", None)
@@ -311,8 +312,14 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             timeline.save(self._session_id)
 
         self._session_id = session_id
+        self._invalidate_system_prompt_cache()
         self._timeline = self._build_timeline()
         self._timeline.rehydrate()
+
+    def _invalidate_system_prompt_cache(self) -> None:
+        runtime = getattr(self, "_runtime", None)
+        if runtime is not None and hasattr(runtime, "invalidate_system_prompt_cache"):
+            runtime.invalidate_system_prompt_cache()
 
     def resume(self, session_id: str) -> None:
         """Resume a persisted session by id, reloading its timeline from disk.
