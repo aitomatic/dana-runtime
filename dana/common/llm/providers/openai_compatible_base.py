@@ -64,6 +64,12 @@ GENERIC_REASONING_EFFORT_ENV = "LLM_REASONING_EFFORT"
 
 DEFAULT_REASONING_EFFORT = "low"
 
+# Generic fallback env var to force/disable Responses API across any provider.
+# Provider-specific vars (OPENAI_USE_RESPONSES_API / AZURE_USE_RESPONSES_API) win.
+GENERIC_USE_RESPONSES_API_ENV = "LLM_USE_RESPONSES_API"
+_RESPONSES_API_ENABLE_VALUES = frozenset({"1", "true", "on", "yes"})
+_RESPONSES_API_DISABLE_VALUES = frozenset({"0", "false", "off", "no"})
+
 
 def _serialize_output_item(item: Any) -> dict:
     """Convert a Responses API output item to a JSON-serializable dict that's
@@ -177,6 +183,37 @@ def _resolve_reasoning_effort(provider_env_var: str | None) -> str:
     return DEFAULT_REASONING_EFFORT
 
 
+def _resolve_use_responses_api_env(provider_env_var: str | None) -> bool | None:
+    """Resolve an explicit Responses-API override from environment.
+
+    Precedence:
+      1. provider-specific env var (e.g. ``OPENAI_USE_RESPONSES_API``)
+      2. generic ``LLM_USE_RESPONSES_API``
+
+    Returns ``True``/``False`` when set, or ``None`` when unset so the caller
+    falls back to the config flag and then model/endpoint auto-detection.
+    Invalid values are logged and ignored so a typo doesn't silently flip routing.
+    """
+    for env_name in (provider_env_var, GENERIC_USE_RESPONSES_API_ENV):
+        if not env_name:
+            continue
+        raw = os.getenv(env_name)
+        if not raw:
+            continue
+        normalized = raw.strip().lower()
+        if normalized in _RESPONSES_API_ENABLE_VALUES:
+            return True
+        if normalized in _RESPONSES_API_DISABLE_VALUES:
+            return False
+        logger.warning(
+            "ignoring invalid use_responses_api env var",
+            env_var=env_name,
+            value=raw,
+            valid=sorted(_RESPONSES_API_ENABLE_VALUES | _RESPONSES_API_DISABLE_VALUES),
+        )
+    return None
+
+
 def make_logging_http_client(timeout_seconds: int) -> httpx.AsyncClient:
     """Build an ``httpx.AsyncClient`` with request/response hooks.
 
@@ -213,6 +250,10 @@ class OpenAICompatibleProvider(LLMProvider):
     # ``AZURE_THINKING_EFFORT`` or ``OPENAI_THINKING_EFFORT``. Resolved at call
     # time so env changes take effect without process restart in tests.
     _REASONING_EFFORT_ENV_VAR: str | None = None
+    # Provider-specific env var to force/disable Responses API, e.g.
+    # ``OPENAI_USE_RESPONSES_API`` / ``AZURE_USE_RESPONSES_API``. Resolved at
+    # call time; takes precedence over the ``use_responses_api`` config flag.
+    _RESPONSES_API_ENV_VAR: str | None = None
 
     # Sticky flag — set after the first ``include=["reasoning.encrypted_content"]``
     # rejection so we stop paying the round-trip cost of retry on every call.
@@ -984,10 +1025,26 @@ class OpenAICompatibleProvider(LLMProvider):
     def _should_use_responses_api(self) -> bool:
         """Determine whether to use Responses API or Chat Completions.
 
-        Priority: explicit config flag > endpoint capability + model prefix.
+        Priority: env override > config flag > endpoint capability + model prefix.
+
+        An explicit override (env or config) takes the caller's word and bypasses
+        the endpoint-capability gate — useful for forcing the path under test or
+        against a custom-configured resource. When forcing it on against an
+        endpoint that reports no support (e.g. an Azure api-version older than
+        2025-03-01), we log a warning since the request will likely 400.
         """
-        if self._use_responses_api is not None:
-            return self._use_responses_api
+        override = _resolve_use_responses_api_env(self._RESPONSES_API_ENV_VAR)
+        if override is None:
+            override = self._use_responses_api
+
+        if override is not None:
+            if override and not self._responses_api_supported():
+                logger.warning(
+                    "Responses API forced on but endpoint reports no support; request may fail",
+                    provider=self.name,
+                    model=self.model,
+                )
+            return override
 
         if not self._responses_api_supported():
             return False
