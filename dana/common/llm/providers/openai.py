@@ -17,6 +17,10 @@ class OpenAIProvider(OpenAICompatibleProvider):
     # Valid values: "minimal" | "low" | "medium" | "high".
     _REASONING_EFFORT_ENV_VAR = "OPENAI_THINKING_EFFORT"
 
+    # Env var to force/disable the Responses API for this provider.
+    # Truthy: 1/true/on/yes — falsy: 0/false/off/no. Overrides the config flag.
+    _RESPONSES_API_ENV_VAR = "OPENAI_USE_RESPONSES_API"
+
     @property
     def name(self) -> str:
         return "openai"

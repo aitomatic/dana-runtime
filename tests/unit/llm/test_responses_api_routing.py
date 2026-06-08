@@ -82,6 +82,54 @@ class TestAzureRoutingDecision:
         assert p._should_use_responses_api() is True
 
 
+class TestEnvVarOverride:
+    """Env var forces/disables Responses API, taking precedence over config flag."""
+
+    def test_provider_env_forces_on_over_version_gate(self, monkeypatch):
+        monkeypatch.setenv("AZURE_USE_RESPONSES_API", "true")
+        p = _make_azure(api_version="2024-12-01-preview", model="gpt-4o")
+        assert p._should_use_responses_api() is True
+
+    def test_provider_env_forces_off_over_prefix_match(self, monkeypatch):
+        monkeypatch.setenv("AZURE_USE_RESPONSES_API", "0")
+        p = _make_azure(api_version="2025-04-01-preview", model="gpt-5.2")
+        assert p._should_use_responses_api() is False
+
+    def test_provider_env_overrides_config_flag(self, monkeypatch):
+        monkeypatch.setenv("AZURE_USE_RESPONSES_API", "off")
+        p = _make_azure(api_version="2025-04-01-preview", model="gpt-5.2", use_responses_api=True)
+        assert p._should_use_responses_api() is False
+
+    @pytest.mark.parametrize("raw", ["1", "true", "on", "yes", "TRUE", " Yes "])
+    def test_truthy_values(self, monkeypatch, raw):
+        monkeypatch.setenv("AZURE_USE_RESPONSES_API", raw)
+        p = _make_azure(api_version="2024-12-01-preview", model="gpt-4o")
+        assert p._should_use_responses_api() is True
+
+    @pytest.mark.parametrize("raw", ["0", "false", "off", "no", "FALSE"])
+    def test_falsy_values(self, monkeypatch, raw):
+        monkeypatch.setenv("AZURE_USE_RESPONSES_API", raw)
+        p = _make_azure(api_version="2025-04-01-preview", model="gpt-5.2")
+        assert p._should_use_responses_api() is False
+
+    def test_invalid_value_ignored_falls_back_to_auto_detect(self, monkeypatch):
+        monkeypatch.setenv("AZURE_USE_RESPONSES_API", "maybe")
+        p = _make_azure(api_version="2025-04-01-preview", model="gpt-5.2")
+        assert p._should_use_responses_api() is True  # prefix match still applies
+
+    def test_generic_env_applies_when_provider_var_unset(self, monkeypatch):
+        monkeypatch.delenv("AZURE_USE_RESPONSES_API", raising=False)
+        monkeypatch.setenv("LLM_USE_RESPONSES_API", "true")
+        p = _make_azure(api_version="2024-12-01-preview", model="gpt-4o")
+        assert p._should_use_responses_api() is True
+
+    def test_provider_var_wins_over_generic(self, monkeypatch):
+        monkeypatch.setenv("AZURE_USE_RESPONSES_API", "false")
+        monkeypatch.setenv("LLM_USE_RESPONSES_API", "true")
+        p = _make_azure(api_version="2025-04-01-preview", model="gpt-5.2")
+        assert p._should_use_responses_api() is False
+
+
 class TestOpenAIBaseDefaultSupported:
     """Non-Azure OpenAI-compatible providers support Responses API unconditionally."""
 
