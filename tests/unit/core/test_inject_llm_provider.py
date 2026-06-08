@@ -75,3 +75,25 @@ def test_set_llm_provider_repoints_all_sinks(tmp_path):
     assert agent.llm_client.provider is prov2
     assert agent._runtime._llm_caller._llm.provider is prov2
     assert agent._ltmemory._rlm._llm.provider is prov2
+
+
+def test_injected_provider_drives_ltmemory(tmp_path):
+    prov = OpenAIProvider(api_key="test-key", model="gpt-4")
+
+    agent = STARAgent(
+        llm_provider_instance=prov,
+        ltmemory_path=str(tmp_path / "ltm"),
+        **AGENT_KW,
+    )
+
+    assert agent._ltmemory is not None
+    assert agent._ltmemory._rlm._llm.provider is prov
+
+
+def test_legacy_string_path_stays_lazy():
+    # No instance: _llm_client must remain None until the property is touched
+    # (preserves construction without API keys).
+    agent = STARAgent(llm_provider="openai", model="gpt-4", **AGENT_KW)
+
+    assert agent._llm_client is None
+    assert agent._llm_config == {"provider": "openai", "model": "gpt-4"}
