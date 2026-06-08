@@ -116,6 +116,10 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         # Normalize an injected provider instance to a single LLM, built once.
         # Instance wins: when present, the llm_provider/model strings are ignored
         # (the instance binds its own client + model).
+        #
+        # NOTE: this inline build mirrors _apply_llm_provider (the canonical post-init
+        # re-point path). Keep the two in sync — provider-name/model derivation and the
+        # _llm_client/_llm_config writes must match.
         if llm_provider_instance is not None:
             if llm_provider is not None or model is not None:
                 logger.debug("llm_provider_instance set; ignoring llm_provider/model args")
@@ -424,8 +428,13 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             if llm_provider is not None or model is not None:
                 logger.debug("llm_provider_instance set; ignoring llm_provider/model args")
             llm = LLM(provider=llm_provider_instance)
+            self._llm_config = {
+                "provider": getattr(llm_provider_instance, "name", None) or "custom",
+                "model": getattr(llm_provider_instance, "model", None),
+            }
         elif llm_provider is not None:
             llm = LLM(provider=llm_provider, model=model)
+            self._llm_config = {"provider": llm_provider, "model": model}
         else:
             return
 

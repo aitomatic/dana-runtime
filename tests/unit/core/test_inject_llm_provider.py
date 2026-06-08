@@ -65,12 +65,13 @@ def test_injected_provider_reaches_agent_and_call_site():
     assert agent._runtime._llm_caller._llm is agent.llm_client
 
 
-def test_set_llm_provider_repoints_all_sinks():
+def test_set_llm_provider_repoints_all_sinks(tmp_path):
     prov1 = OpenAIProvider(api_key="k1", model="gpt-4")
-    agent = STARAgent(llm_provider_instance=prov1, **AGENT_KW)
+    agent = STARAgent(llm_provider_instance=prov1, ltmemory_path=str(tmp_path / "ltm"), **AGENT_KW)
 
     prov2 = OpenAIProvider(api_key="k2", model="gpt-4o")
     agent.set_llm_provider(llm_provider_instance=prov2)
 
     assert agent.llm_client.provider is prov2
     assert agent._runtime._llm_caller._llm.provider is prov2
+    assert agent._ltmemory._rlm._llm.provider is prov2
