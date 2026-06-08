@@ -26,6 +26,24 @@ The polymorphism exists one layer down; the agent ctor is the only true gap.
 - Providers expose `self.model` and `self.name` (e.g. `openai_compatible_base.py:294`,
   `anthropic.py:212`), so name+model can be derived from an instance.
 
+## Why runtime + LLMCaller need no new params
+
+Normalization (`LLMProvider → LLM`) happens **once**, at the agent boundary in
+`_apply_llm_provider`. Runtime and `LLMCaller` keep speaking their existing `LLM` currency
+(`llm=` ctor arg + `set_llm`). Pushing the raw provider instance two layers deeper would
+duplicate the wrapping in three places — DRY violation for zero gain.
+
+`LLMCaller._resolve_llm()` (the real call site, `llm_caller.py:496`) resolves in priority order:
+
+1. `self._llm` (set via `set_llm`) — **short-circuits everything**
+2. `agent.llm_client` — read lazily only when `self._llm` is None
+3. build fresh `LLM(provider=self._provider, model=self._model)` from name strings
+
+Therefore `runtime.set_llm(llm)` → `LLMCaller.set_llm(llm)` sets priority-#1, so `.create()` uses
+exactly the injected provider. **The explicit `set_llm` is mandatory** for the mid-session
+re-point: priority #2 (`agent.llm_client`) is shadowed once the caller has cached a `self._llm`
+from a prior call, so setting `agent._llm_client` alone would silently no-op an in-flight caller.
+
 ## The three injection sinks
 
 An injected provider must reach **all three**, or split-brain results (agent reads the
