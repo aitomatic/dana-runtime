@@ -37,15 +37,26 @@ injected provider while the actual call site silently builds a different one fro
 | `runtime._llm_caller._llm` | `LLMCaller` builds own from name/model | `runtime.set_llm(llm)` — **exists** |
 | `LTMemory → RLMResource._llm` | `LLM(provider=str, model=str)` | new thin `llm` passthrough + `set_llm` |
 
-## Chosen approach (A): overload `llm_provider` + central fan-out method
+## Chosen approach: dedicated `llm_provider_instance` param + central fan-out method
 
-Rejected alternatives: (B) separate `provider_instance=` param — two params for one job,
-`model` ambiguity, not DRY with `LLM.__init__`; (C) accept a pre-built `LLM` only — caller
-wants to pass the provider, not pre-wrap it.
+Add a **new** param `llm_provider_instance: LLMProvider | None` rather than widening
+`llm_provider` to `str | LLMProvider`. Rationale:
 
-Approach A widens the existing `llm_provider` param to `str | LLMProvider`, mirroring the
-`str | LLMProvider` overload `LLM.__init__` already exposes, so the agent ctor reads
-consistently with the layer beneath it.
+- `llm_provider` already means a **name string** at 51 call sites (`llm_provider="openai"`).
+  Redefining it as an instance would break them; keeping it string-typed is backward-compatible.
+- Distinct named params (no `str | LLMProvider` union) read unambiguously — the caller's intent
+  is explicit at the call site, no isinstance branching to reason about.
+
+Rejected: (1) widen `llm_provider` to a union — breaks/obscures the 51 existing string callers;
+(2) accept a pre-built `LLM` only — caller wants to pass the provider, not pre-wrap it.
+
+### Parameter table
+
+| Param | Type | Role |
+|-------|------|------|
+| `llm_provider` | `str \| None` | provider name (legacy, unchanged) |
+| `model` | `str \| None` | model name (legacy, unchanged) |
+| `llm_provider_instance` | `LLMProvider \| None` | pre-built instance — **wins when set** |
 
 ### Spine: a single fan-out method
 
@@ -53,35 +64,36 @@ Both the constructor and the public runtime setter call this. It is the only pla
 knows about all three sinks.
 
 ```python
-def _apply_llm_provider(self, provider, model=None):
-    # normalize → LLM
-    if isinstance(provider, LLM):
-        llm = provider
-    elif isinstance(provider, LLMProvider):
-        llm = LLM(provider=provider)            # provider_name → "custom"; model from instance
-    else:                                        # str | None (legacy path)
-        llm = LLM(provider=provider, model=model)
+def _apply_llm_provider(self, llm_provider_instance=None, llm_provider=None, model=None):
+    # normalize → LLM (instance wins)
+    if llm_provider_instance is not None:
+        if llm_provider is not None or model is not None:
+            logger.debug("llm_provider_instance set; ignoring llm_provider/model args")
+        llm = LLM(provider=llm_provider_instance)   # provider_name → "custom"; model from instance
+    else:                                            # legacy name/model path
+        llm = LLM(provider=llm_provider, model=model)
 
     self._llm_client = llm
     if self._runtime is not None:
-        self._runtime.set_llm(llm)               # → LLMCaller.set_llm
+        self._runtime.set_llm(llm)                   # → LLMCaller.set_llm
     if self._ltmemory is not None:
-        self._ltmemory.set_llm(llm)              # new thin setter → RLMResource.set_llm
+        self._ltmemory.set_llm(llm)                  # new thin setter → RLMResource.set_llm
 
-def set_llm_provider(self, provider, model=None):   # public — runtime re-point
+def set_llm_provider(self, llm_provider_instance=None, llm_provider=None, model=None):
     """Re-point this agent (and its runtime + LTMemory) at a new provider/LLM.
 
-    `provider` may be a provider name (str), an LLMProvider instance, or a pre-built LLM.
+    Pass `llm_provider_instance` (an LLMProvider) for instance injection, or
+    `llm_provider` (name str) + `model` for the legacy path. Instance wins.
     """
-    self._apply_llm_provider(provider, model)
+    self._apply_llm_provider(llm_provider_instance, llm_provider, model)
 ```
 
 ### Constructor branch (instance wins)
 
 ```python
-if isinstance(llm_provider, LLMProvider):
-    name  = getattr(llm_provider, "name", None) or "custom"
-    model = getattr(llm_provider, "model", None)   # instance wins; `model` arg ignored
+if llm_provider_instance is not None:
+    name  = getattr(llm_provider_instance, "name", None) or "custom"
+    model = getattr(llm_provider_instance, "model", None)   # instance wins; `model` arg ignored
 else:
     name  = llm_provider or config_manager.get_first_available_provider() or "anthropic"
 
@@ -89,10 +101,7 @@ if runtime is None:
     runtime = RuntimeRegistry.select_codec_runtime(provider=name, model=model, codec=codec)
 self._runtime = runtime
 # ... build self._ltmemory (if ltmemory_path) ...
-self._apply_llm_provider(
-    llm_provider if isinstance(llm_provider, LLMProvider) else name,
-    model,
-)
+self._apply_llm_provider(llm_provider_instance, llm_provider, model)
 ```
 
 `name` is cosmetic in this path: `select_codec_runtime` returns `CodecRuntimeWith[out]NativeToolUse`
@@ -101,8 +110,9 @@ runtime built. The string is metadata only.
 
 ### Signature changes
 
-- `STARAgent.__init__`: `llm_provider: str | None` → `llm_provider: str | LLMProvider | None`.
-- New public `STARAgent.set_llm_provider(provider, model=None)`.
+- `STARAgent.__init__`: add `llm_provider_instance: LLMProvider | None = None`.
+  `llm_provider: str | None` and `model: str | None` stay unchanged (backward-compatible).
+- New public `STARAgent.set_llm_provider(llm_provider_instance=None, llm_provider=None, model=None)`.
 - `LTMemory.__init__`: add `llm: LLM | None = None`; when present, pass to `RLMResource`
   instead of `llm_provider`/`llm_model`. New `LTMemory.set_llm(llm)` → `RLMResource.set_llm`.
 - `RLMResource.__init__`: add `llm: LLM | None = None`; when present, `self._llm = llm` and
@@ -119,17 +129,18 @@ resolves eagerly via the fan-out.
 
 - **Instance + pre-built `runtime`:** instance wins — `set_llm` mutates the passed runtime.
   Not an error (per decision).
-- **`model` arg + instance:** `model` ignored (instance binds its own model). `logger.debug`,
-  not a raise.
+- **`llm_provider`/`model` + `llm_provider_instance`:** the string args are ignored (instance
+  binds its own model). `logger.debug`, not a raise.
 - **`set_llm_provider` mid-session:** re-points all three sinks; in-flight calls hold their own
   `llm` ref, so no torn state.
-- **Legacy `llm_provider="openai"` string:** unchanged — flows through the `else` branch.
+- **Legacy `llm_provider="openai"` string:** unchanged — `llm_provider_instance is None` path.
 
 ## Testing
 
-1. Inject `OpenAIProvider(base_url=..., model=...)` → assert `agent.llm_client.provider is instance`
-   **and** `runtime._llm_caller._llm is agent.llm_client` (proves no split-brain).
-2. `set_llm_provider(other_instance)` → both sinks now reference `other_instance`.
+1. `STARAgent(llm_provider_instance=OpenAIProvider(base_url=..., model=...))` → assert
+   `agent.llm_client.provider is instance` **and** `runtime._llm_caller._llm is agent.llm_client`
+   (proves no split-brain).
+2. `set_llm_provider(llm_provider_instance=other)` → both sinks now reference `other`.
 3. `ltmemory_path` set + injected provider → `RLMResource._llm` uses the injected provider.
 4. Regression: `llm_provider="openai"` string path behaves exactly as before.
 
@@ -140,7 +151,6 @@ resolves eagerly via the fan-out.
 
 ## Unresolved questions
 
-- Should `set_llm_provider` accept a bare `str` name too (re-point by name)? Spec assumes yes
-  (cheap, same fan-out) — confirm during implementation.
-- Provider `name` collision: if a custom instance's `.name` matches a registered provider name,
-  `select_codec_runtime` still only branches on codec, so no behavioral impact — noted, no action.
+- None blocking. `set_llm_provider` accepts both the instance and the legacy name+model args, so
+  re-point-by-name is supported. Provider `.name` collisions are inert (`select_codec_runtime`
+  branches on codec, not name) — no action.
