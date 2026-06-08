@@ -97,3 +97,21 @@ def test_legacy_string_path_stays_lazy():
 
     assert agent._llm_client is None
     assert agent._llm_config == {"provider": "openai", "model": "gpt-4"}
+
+
+def test_set_llm_provider_string_path_updates_all_sinks(tmp_path):
+    agent = STARAgent(
+        llm_provider="anthropic",
+        model="claude-sonnet-4-20250514",
+        ltmemory_path=str(tmp_path / "ltm"),
+        **AGENT_KW,
+    )
+    # Legacy path: lazy until touched
+    assert agent._llm_client is None
+
+    agent.set_llm_provider(llm_provider="openai", model="gpt-4o")
+
+    assert agent._llm_config == {"provider": "openai", "model": "gpt-4o"}
+    assert agent._llm_client is not None  # eagerly built by _apply_llm_provider
+    assert agent._runtime._llm_caller._llm is agent._llm_client
+    assert agent._ltmemory._rlm._llm is agent._llm_client

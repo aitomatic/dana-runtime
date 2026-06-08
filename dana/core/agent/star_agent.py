@@ -464,10 +464,12 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
 
     @llm_client.setter
     def llm_client(self, value: LLM):
-        """Set the LLM client."""
+        """Set the LLM client. Prefer set_llm_provider() to swap providers (also keeps _llm_config in sync)."""
         self._llm_client = value
         if hasattr(self._runtime, "set_llm"):
             self._runtime.set_llm(value)
+        if getattr(self, "_ltmemory", None) is not None:
+            self._ltmemory.set_llm(value)
 
     # ============================================================================
     # PUBLIC API - AGENT IDENTITY & PROMPTS
