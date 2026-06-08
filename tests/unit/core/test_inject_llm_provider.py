@@ -1,6 +1,7 @@
 from dana.common.llm import LLM
 from dana.common.llm.providers import OpenAIProvider
 from dana.common.resource.rlm_resource import RLMResource
+from dana.core.agent.star_agent import STARAgent
 from dana.core.memory import LTMemory
 
 
@@ -41,3 +42,35 @@ def test_ltmemory_set_llm_repoints(tmp_path):
     mem.set_llm(llm2)
 
     assert mem._rlm._llm is llm2
+
+
+AGENT_KW = dict(
+    agent_type="inject-test",
+    auto_register=False,
+    enable_web_search=False,
+    enable_skills=False,
+    enable_code_execution=False,
+    enable_assistant=False,
+)
+
+
+def test_injected_provider_reaches_agent_and_call_site():
+    prov = OpenAIProvider(api_key="test-key", model="gpt-4")
+
+    agent = STARAgent(llm_provider_instance=prov, **AGENT_KW)
+
+    # Sink 1: agent client wraps the exact provider instance
+    assert agent.llm_client.provider is prov
+    # Sink 2: the actual call site (LLMCaller) holds the SAME LLM — no split-brain
+    assert agent._runtime._llm_caller._llm is agent.llm_client
+
+
+def test_set_llm_provider_repoints_all_sinks():
+    prov1 = OpenAIProvider(api_key="k1", model="gpt-4")
+    agent = STARAgent(llm_provider_instance=prov1, **AGENT_KW)
+
+    prov2 = OpenAIProvider(api_key="k2", model="gpt-4o")
+    agent.set_llm_provider(llm_provider_instance=prov2)
+
+    assert agent.llm_client.provider is prov2
+    assert agent._runtime._llm_caller._llm.provider is prov2
