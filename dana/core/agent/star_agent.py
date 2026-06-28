@@ -16,7 +16,7 @@ import structlog
 
 from dana.common.config import config_manager
 from dana.common.llm import LLM
-from dana.common.llm.types import LLMMessage
+from dana.common.llm.types import LLMMessage, LLMProvider
 from dana.common.observable import observable
 from dana.common.protocols import AgentProtocol, DictParams, Notifiable, ResourceProtocol, WorkflowProtocol
 from dana.common.protocols.types import LearningPhase
@@ -51,6 +51,7 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         agent_id: str | None = None,
         llm_provider: str | None = None,
         model: str | None = None,
+        llm_provider_instance: LLMProvider | None = None,
         config: dict[str, Any] | None = None,
         max_context_tokens: int = 4000,
         auto_register: bool = True,
@@ -112,15 +113,30 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         }
         super().__init__(**kwargs)
 
-        # Determine effective LLM provider: explicit > first available > anthropic fallback
-        if llm_provider is None:
-            llm_provider = config_manager.get_first_available_provider() or "anthropic"
+        # Normalize an injected provider instance to a single LLM, built once.
+        # Instance wins: when present, the llm_provider/model strings are ignored
+        # (the instance binds its own client + model).
+        #
+        # NOTE: this inline build mirrors _apply_llm_provider (the canonical post-init
+        # re-point path). Keep the two in sync — provider-name/model derivation and the
+        # _llm_client/_llm_config writes must match.
+        if llm_provider_instance is not None:
+            if llm_provider is not None or model is not None:
+                logger.debug("llm_provider_instance set; ignoring llm_provider/model args")
+            injected_llm = LLM(provider=llm_provider_instance)
+            provider_name = getattr(llm_provider_instance, "name", None) or "custom"
+            effective_model = getattr(llm_provider_instance, "model", None)
+        else:
+            injected_llm = None
+            provider_name = llm_provider or config_manager.get_first_available_provider() or "anthropic"
+            effective_model = model
 
-        # Initialize LLM (lazy - only created when first accessed)
-        self._llm_client = None  # Explicit init to avoid __getattr__ interception
+        # llm_client: eager when injected (provider carries its own client, no env
+        # needed), otherwise None so the lazy `llm_client` property builds it later.
+        self._llm_client = injected_llm
         self._llm_config = {
-            "provider": llm_provider,
-            "model": model,
+            "provider": provider_name,
+            "model": effective_model,
         }
 
         self._session_id = str(uuid4())
@@ -132,13 +148,17 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             from dana.core.runtime import RuntimeRegistry
 
             runtime = RuntimeRegistry.select_codec_runtime(
-                provider=llm_provider,
-                model=model,
+                provider=provider_name,
+                model=effective_model,
                 codec=codec,
                 use_native_tools=None,
             )
 
         self._runtime = runtime
+        # Sink 2: push the injected LLM into the runtime's LLMCaller so the actual
+        # call site uses it (set_llm sets LLMCaller._resolve_llm priority #1).
+        if injected_llm is not None:
+            self._runtime.set_llm(injected_llm)
 
         # Initialize other components
         self._communicator = Communicator(self)
@@ -154,8 +174,9 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
 
             self._ltmemory = LTMemory(
                 path=ltmemory_path,
-                llm_provider=llm_provider,
-                llm_model=model or config_manager.get_provider_default_model(llm_provider),
+                llm_provider=provider_name,
+                llm_model=effective_model or config_manager.get_provider_default_model(provider_name),
+                llm=injected_llm,  # Sink 3: injected provider drives RLM summarization
             )
         else:
             self._ltmemory = None
@@ -394,6 +415,46 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         if self._reminder_manager is not None:
             self._reminder_manager.register(reminder)
 
+    def _apply_llm_provider(
+        self,
+        llm_provider_instance: LLMProvider | None = None,
+        llm_provider: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        """Build a single LLM and fan it out to every sink (agent client, runtime
+        call site, long-term memory). No-op when neither an instance nor a name is
+        given, so the legacy lazy path is preserved."""
+        if llm_provider_instance is not None:
+            if llm_provider is not None or model is not None:
+                logger.debug("llm_provider_instance set; ignoring llm_provider/model args")
+            llm = LLM(provider=llm_provider_instance)
+            self._llm_config = {
+                "provider": getattr(llm_provider_instance, "name", None) or "custom",
+                "model": getattr(llm_provider_instance, "model", None),
+            }
+        elif llm_provider is not None:
+            llm = LLM(provider=llm_provider, model=model)
+            self._llm_config = {"provider": llm_provider, "model": model}
+        else:
+            return
+
+        self._llm_client = llm
+        if getattr(self, "_runtime", None) is not None:
+            self._runtime.set_llm(llm)
+        if getattr(self, "_ltmemory", None) is not None:
+            self._ltmemory.set_llm(llm)
+
+    def set_llm_provider(
+        self,
+        llm_provider_instance: LLMProvider | None = None,
+        llm_provider: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        """Re-point this agent (and its runtime + LTMemory) at a new provider/LLM
+        mid-session. Pass `llm_provider_instance` for instance injection, or
+        `llm_provider` (name) + `model` for the legacy path. Instance wins."""
+        self._apply_llm_provider(llm_provider_instance, llm_provider, model)
+
     @property
     def llm_client(self) -> LLM:
         """Get the LLM client."""
@@ -403,10 +464,12 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
 
     @llm_client.setter
     def llm_client(self, value: LLM):
-        """Set the LLM client."""
+        """Set the LLM client. Prefer set_llm_provider() to swap providers (also keeps _llm_config in sync)."""
         self._llm_client = value
         if hasattr(self._runtime, "set_llm"):
             self._runtime.set_llm(value)
+        if getattr(self, "_ltmemory", None) is not None:
+            self._ltmemory.set_llm(value)
 
     # ============================================================================
     # PUBLIC API - AGENT IDENTITY & PROMPTS
