@@ -74,26 +74,36 @@ def _register_defaults() -> None:
     _OUTPUT_REGISTRY.setdefault("toxicity", _output_toxicity)
 
 
-def build_input_scanners(names: list[str]) -> list[Any]:
+def build_input_scanners(names: list[str]) -> tuple[list[Any], dict[str, str]]:
     _register_defaults()
     return _build(names, _INPUT_REGISTRY, kind="input")
 
 
-def build_output_scanners(names: list[str]) -> list[Any]:
+def build_output_scanners(names: list[str]) -> tuple[list[Any], dict[str, str]]:
     _register_defaults()
     return _build(names, _OUTPUT_REGISTRY, kind="output")
 
 
-def _build(names: list[str], registry: dict[str, Callable[[], Any]], kind: str) -> list[Any]:
-    """Instantiate the named scanners; skip unknown/failed ones (fail-open)."""
+def _build(names: list[str], registry: dict[str, Callable[[], Any]], kind: str) -> tuple[list[Any], dict[str, str]]:
+    """Instantiate the named scanners; skip unknown/failed ones (fail-open).
+
+    Returns ``(scanners, class_to_key)`` where ``class_to_key`` maps each scanner's
+    class name (the key llm-guard uses in its ``results_valid``/``results_score``
+    dicts) back to our snake_case registry key — so the outcome's findings/triggered
+    speak the same vocabulary as ``input_scanners``/``output_scanners``/``block_on``.
+    """
     scanners: list[Any] = []
+    class_to_key: dict[str, str] = {}
     for name in names:
         builder = registry.get(name)
         if builder is None:
             logger.warning("guard_unknown_scanner", kind=kind, name=name, available=list(registry))
             continue
         try:
-            scanners.append(builder())
+            scanner = builder()
         except Exception as exc:  # model download / load failure must not break boot
             logger.warning("guard_scanner_build_failed", kind=kind, name=name, error=str(exc))
-    return scanners
+            continue
+        scanners.append(scanner)
+        class_to_key[type(scanner).__name__] = name
+    return scanners, class_to_key
