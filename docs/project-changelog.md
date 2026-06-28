@@ -3,6 +3,15 @@
 ## [Unreleased]
 
 ### Added
+- **I/O Security Guard** — LLM-Guard integration for input sanitization & output scrubbing (`dana/core/guard/`).
+  - GuardService protocol with pluggable implementations (mirrors LLMProvider pattern); injectable via `STARAgent(guard_instance=...)`.
+  - Input: block-listed scanners (default `prompt_injection`) trip → request refused (STAR loop skipped); other findings (secrets/PII) sanitized + passed.
+  - Output: gated two-stage scrub — rule scanners strip/redact; LLM scrub fires only when a scanner flags (clean output skips the LLM call).
+  - Audit via structlog events + timeline metadata; persisted AGENT_RESPONSE content overwritten with scrubbed text (no raw data on disk / replay to LLM).
+  - Fail-open: missing/broken models → no-op + warning, never breaks execution. Thread-safe lazy scanner init.
+  - Pluggable scanners via registry (register_input_scanner/register_output_scanner).
+  - Configuration: `DANA_GUARD_ENABLED`, `DANA_GUARD_INPUT_SCANNERS`, `DANA_GUARD_OUTPUT_SCANNERS`, `DANA_GUARD_SANITIZE_LLM_ENABLED`, `DANA_GUARD_FAIL_MODE`, `DANA_GUARD_BLOCK_ON`, `DANA_GUARD_BLOCK_MESSAGE` env vars.
+  - Integrated into STARAgent.query/aquery at single choke point. llm-guard added as core dependency.
 - Single-knob env trigger `DANA_COMPACT_TRIGGER_TOKENS` (default 150000, clamp `[8k, 2M]`) for compression threshold (P3).
 - Optional `system_tokens_fn` / `tools_tokens_fn` callbacks on `CompressedTimeline` — fold system-prompt and tools-schema size into `needs_compression()` estimate without coupling to any provider.
 - Client-side tool-result stubbing (`cheap_shrink_tool_results()`, P6) with predictive savings gate; opt-in via `enable_cheap_shrink_tool_results`.

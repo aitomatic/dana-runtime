@@ -49,6 +49,9 @@ dependencies = [
     "html2text>=2024.2.26",
     "rich>=14.2.0",
     "langfuse>=4.0.1",
+    # I/O security: prompt-injection / PII / toxicity scanning for agent input & output.
+    # Pulls torch/transformers (heavy) — runtime is fail-open (no-op) if models can't load.
+    "llm-guard>=0.3.16",
 ]
 
 # Command-line entry points

@@ -13,6 +13,12 @@ import pytest
 # This must be done before any imports that might trigger Langfuse initialization
 os.environ["LANGFUSE_ENABLED"] = "false"
 
+# Disable the I/O security guard by default in tests. The guard adds an LLM
+# scrub pass that would consume MockLLM responses and skew exact-queue assertions.
+# Guard behavior is covered directly in tests/unit/core/guard/ (config injected),
+# and individual tests can re-enable via monkeypatch.setenv / guard_instance.
+os.environ.setdefault("DANA_GUARD_ENABLED", "false")
+
 # Skip harness tests by default (they require mock LLM infrastructure)
 # Run them explicitly with: pytest tests/harness/ -v
 collect_ignore_glob = ["harness/*"]
