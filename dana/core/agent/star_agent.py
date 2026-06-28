@@ -6,6 +6,7 @@ It provides a cleaner, more maintainable architecture for the STAR (See-Think-Ac
 and conversational agent functionality using composable components.
 """
 
+import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 import inspect
@@ -20,6 +21,7 @@ from dana.common.llm.types import LLMMessage, LLMProvider
 from dana.common.observable import observable
 from dana.common.protocols import AgentProtocol, DictParams, Notifiable, ResourceProtocol, WorkflowProtocol
 from dana.common.protocols.types import LearningPhase
+from dana.core.guard import GuardDecision, GuardOutcome, GuardService, build_default_guard
 from dana.core.timeline.compressed_timeline import CompressedTimeline
 from dana.core.timeline.timeline import Timeline, TimelineEntry, TimelineEntryType
 from dana.repositories.repository_factory import DEFAULT_REPOSITORY_FACTORY, RepositoryFactory
@@ -52,6 +54,7 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         llm_provider: str | None = None,
         model: str | None = None,
         llm_provider_instance: LLMProvider | None = None,
+        guard_instance: GuardService | None = None,
         config: dict[str, Any] | None = None,
         max_context_tokens: int = 4000,
         auto_register: bool = True,
@@ -265,6 +268,11 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
 
         self._reminder_manager = ReminderManager()
         self._star_loop_count = 0  # Tracks iterations within current query
+
+        # I/O security guard. Injected instance wins; otherwise built from
+        # DANA_GUARD_* env (no-op when disabled or llm-guard unavailable).
+        # The scrub pass reuses this agent's LLM via the llm_client property.
+        self._guard: GuardService = guard_instance or build_default_guard(llm_getter=lambda: self.llm_client)
 
     def _build_timeline(self) -> CompressedTimeline:
         """Construct a fresh, fully-configured CompressedTimeline.
@@ -559,7 +567,15 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             self._event_log._current_session_id = session_id
 
         try:
+            in_outcome = self._guard_input(kwargs.get("message"))
+            if in_outcome is not None and in_outcome.blocked:
+                return self._guard_blocked_result(in_outcome)
+            if in_outcome is not None and in_outcome.sanitized:
+                kwargs["message"] = in_outcome.text
             result = super().query(**kwargs)
+            in_audit = in_outcome.to_audit() if in_outcome is not None else None
+            out_audit, out_text = self._guard_result_output(kwargs.get("message"), result)
+            self._annotate_guard_audit(in_audit, out_audit, out_text)
             return result
         finally:
             # Save events if EventLog exists
@@ -587,7 +603,18 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             self._event_log._current_session_id = session_id
 
         try:
+            # Guard runs llm-guard scanners (CPU/model-bound) and a sync LLM scrub;
+            # offload to a thread so the event loop is not blocked.
+            loop = asyncio.get_running_loop()
+            in_outcome = await loop.run_in_executor(None, self._guard_input, kwargs.get("message"))
+            if in_outcome is not None and in_outcome.blocked:
+                return self._guard_blocked_result(in_outcome)
+            if in_outcome is not None and in_outcome.sanitized:
+                kwargs["message"] = in_outcome.text
             result = await super().aquery(**kwargs)
+            in_audit = in_outcome.to_audit() if in_outcome is not None else None
+            out_audit, out_text = await loop.run_in_executor(None, self._guard_result_output, kwargs.get("message"), result)
+            self._annotate_guard_audit(in_audit, out_audit, out_text)
             return result
         finally:
             # Save events if EventLog exists
@@ -597,6 +624,128 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             # Save timeline (agent, codec, storage_config already set in __init__)
             if hasattr(self, "_timeline") and self._timeline is not None:
                 self._timeline.save(session_id)
+
+    # ============================================================================
+    # I/O SECURITY GUARD (llm-guard)
+    # ============================================================================
+
+    def _guard_input(self, message: Any) -> GuardOutcome | None:
+        """Scan + sanitize user input. Returns the GuardOutcome, or None for a
+        non-string/empty message. The guard is fail-open, so this never raises
+        into the query path. Callers act on ``.blocked`` / ``.sanitized``.
+        """
+        if not isinstance(message, str) or not message:
+            return None
+        return self._guard.scan_input(message)
+
+    def _guard_blocked_result(self, outcome: GuardOutcome) -> DictParams:
+        """Short-circuit a blocked input: record the attempt + refusal to the
+        timeline (audit) and return the refusal without running the STAR loop."""
+        refusal = outcome.block_message or "Request blocked by security policy."
+        logger.warning("guard_input_blocked", triggered=outcome.triggered)
+        timeline = getattr(self, "_timeline", None)
+        if timeline is not None:
+            timeline.add_entry(
+                TimelineEntry(
+                    entry_type=TimelineEntryType.USER_MESSAGE,
+                    content=outcome.text,
+                    is_latest_user_message=True,
+                    metadata={"guard": outcome.to_audit()},
+                )
+            )
+            timeline.add_entry(
+                TimelineEntry(
+                    entry_type=TimelineEntryType.AGENT_RESPONSE,
+                    content=refusal,
+                    metadata={"guard": {"decision": GuardDecision.BLOCKED.value}},
+                )
+            )
+        return {"response": refusal, "guard_blocked": True}
+
+    def _guard_result_output(self, message: Any, result: DictParams) -> tuple[dict | None, str | None]:
+        """Two-stage scrub of ``result["response"]`` in place.
+
+        Stage 1: rule-based output scanners (PII, toxicity).
+        Stage 2: LLM scrub pass guaranteeing residual sensitive data is stripped.
+
+        Returns ``(audit | None, sanitized_text | None)``. The sanitized text is
+        returned so the caller can also overwrite the persisted AGENT_RESPONSE
+        timeline entry — otherwise the raw response would leak to ``timeline.json``
+        and be replayed to the LLM on the next turn.
+        """
+        if not isinstance(result, dict):
+            return None, None
+        response = result.get("response")
+        if not isinstance(response, str) or not response:
+            return None, None
+        prompt = message if isinstance(message, str) else ""
+        scanned = self._guard.scan_output(prompt, response)
+        # Gated escalation: only invoke the (costly) LLM scrub when the rule-based
+        # scanners actually flagged something — clean output skips the LLM call.
+        if scanned.sanitized:
+            sanitized = self._guard.sanitize_output(scanned.text)
+            sanitize_audit = sanitized.to_audit()
+            final_text = sanitized.text
+        else:
+            sanitize_audit = {"decision": "skipped"}
+            final_text = scanned.text
+        result["response"] = final_text
+        return {"scan": scanned.to_audit(), "sanitize": sanitize_audit}, final_text
+
+    def _annotate_guard_audit(
+        self,
+        input_audit: dict | None,
+        output_audit: dict | None,
+        output_text: str | None = None,
+    ) -> None:
+        """Persist guard results onto the timeline so ``timeline.json`` reflects the
+        guarded I/O (saved in query's ``finally``).
+
+        - USER_MESSAGE already stores sanitized input (replaced pre-loop); we only
+          attach the audit.
+        - AGENT_RESPONSE was created with the RAW response inside the STAR loop, so
+          we overwrite its content with the scrubbed text AND attach the audit —
+          preventing on-disk leakage and re-sending sensitive data next turn.
+        """
+        timeline = getattr(self, "_timeline", None)
+        entries = getattr(timeline, "timeline", None) if timeline is not None else None
+        if not entries:
+            return
+
+        if input_audit is not None:
+            entry = self._find_latest_user_entry(entries)
+            if entry is not None:
+                self._safe_set_guard_meta(entry, input_audit)
+
+        if output_audit is not None:
+            entry = self._find_latest_by_type(entries, TimelineEntryType.AGENT_RESPONSE)
+            if entry is not None:
+                self._safe_set_guard_meta(entry, output_audit)
+                if output_text is not None:
+                    entry.content = output_text
+
+    @staticmethod
+    def _find_latest_user_entry(entries: list):
+        """Prefer the entry explicitly flagged as the latest user message; fall back
+        to the most recent USER_MESSAGE by type."""
+        for entry in reversed(entries):
+            if getattr(entry, "is_latest_user_message", False):
+                return entry
+        return STARAgent._find_latest_by_type(entries, TimelineEntryType.USER_MESSAGE)
+
+    @staticmethod
+    def _find_latest_by_type(entries: list, entry_type: TimelineEntryType):
+        for entry in reversed(entries):
+            if entry.entry_type == entry_type:
+                return entry
+        return None
+
+    @staticmethod
+    def _safe_set_guard_meta(entry, audit: dict) -> None:
+        try:
+            entry.metadata["guard"] = audit
+        except Exception:  # metadata is always a dict, but never break save on edge cases
+            pass
 
     def converse(self, initial_message: str | None = None, session_id: str | None = None) -> None:
         """Interactive conversation loop with a human user.

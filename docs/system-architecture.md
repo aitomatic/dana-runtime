@@ -106,6 +106,15 @@ User Input
 
 ```
 STARAgent
+├─ I/O Guard (Security)
+│  ├─ GuardService Protocol
+│  │  ├─ scan_input (sanitize before LLM)
+│  │  ├─ scan_output (strip sensitive data)
+│  │  └─ sanitize_output (LLM-as-sanitizer scrub)
+│  ├─ LLMGuardService (llm-guard scanners)
+│  ├─ OutputSanitizer (LLM scrub pass)
+│  └─ Audit (structlog events + timeline metadata)
+│
 ├─ Communicator (LLM Communication)
 │  ├─ Runtime (Provider abstraction)
 │  │  └─ Codec (Tool schema conversion)
@@ -151,6 +160,9 @@ STARAgent
 User Message
     │
     ▼
+Guard.scan_input(message)  ────────── I/O Security Layer
+    │                                  Block on injection · else sanitize + pass
+    ▼
 Timeline.add_entry(UserEntry)
     │
     ▼
@@ -193,6 +205,10 @@ Parse Response (ToolCalls + Text)
     │  └─ Timeline.add_entry(AssistantEntry)
     │
     ▼
+Guard.scan_output(response)  ────────── Gated two-stage output sanitization
+    │                                    (1) llm-guard scanners strip/redact
+    │                                    (2) LLM scrub — only if (1) flagged
+    ▼
 Optional Refinement (if tool errors or incomplete)
     │
     ▼
@@ -203,7 +219,7 @@ Learner.process_interaction(
 )
     │
     ▼
-Return Response to User
+Return Cleaned Response to User
 ```
 
 ## Resource Execution System
@@ -563,6 +579,37 @@ Implement provider interface + add to config.json
 - **Environment Secrets**: Never logged, loaded from .env
 - **Tool Filtering**: Only allowed resources accessible
 - **Command Execution**: Bash sandboxing where possible
+
+## I/O Security Guard (LLM-Guard Integration)
+
+Protects STAR agent I/O with pluggable scanning & sanitization layer. Powered by [protectai/llm-guard](https://github.com/protectai/llm-guard).
+
+**Architecture:**
+- **GuardService Protocol** - Single pluggable seam (mirrors `LLMProvider`). Three methods:
+  - `scan_input(message)` - Sanitize user input before LLM processing
+  - `scan_output(prompt, output)` - Apply rule scanners (strip/redact sensitive data)
+  - `sanitize_output(output)` - LLM-as-sanitizer pass (rewrites output for total scrubbing)
+- **Gated two-stage output**: rule scanners strip/redact first; the LLM scrub fires ONLY when a rule scanner flags something (clean output skips the LLM call — saves cost/latency).
+- **Block-on-injection**: input scanners listed in `DANA_GUARD_BLOCK_ON` (default `prompt_injection`) are classifier-type threats that can't be sanitized — a trip blocks the request (refusal returned, STAR loop skipped). Other findings (secrets/PII) sanitize + pass.
+- **Audit trail**: Structured logging (`guard.input_scan`, `guard.output_scan`, `guard.output_sanitize`, `guard.input_blocked` events) + timeline metadata annotation (also overwrites the persisted AGENT_RESPONSE content with scrubbed text so raw data never lands on disk / replays to the LLM).
+
+**Behavior:**
+- Input: block-listed trip → refusal (no LLM); otherwise scanned + sanitized, then passed to LLM
+- Output: rule scanners run; LLM scrub gated on a scanner flag; cleaned text returned (never blocked)
+- Fail-open: missing/broken llm-guard models → no-op + warning, never breaks execution
+
+**Configuration** (env-driven):
+| Env Var | Default | Notes |
+|---------|---------|-------|
+| `DANA_GUARD_ENABLED` | `true` | Master switch |
+| `DANA_GUARD_INPUT_SCANNERS` | `prompt_injection,secrets,toxicity` | CSV list, pluggable registry |
+| `DANA_GUARD_OUTPUT_SCANNERS` | `sensitive,toxicity` | CSV list, pluggable registry |
+| `DANA_GUARD_SANITIZE_LLM_ENABLED` | `true` | Enable gated LLM scrub pass |
+| `DANA_GUARD_FAIL_MODE` | `open` | `open`=no-op+warn on error |
+| `DANA_GUARD_BLOCK_ON` | `prompt_injection` | CSV; input scanners whose trip blocks the request |
+| `DANA_GUARD_BLOCK_MESSAGE` | (refusal text) | Returned when a block-listed scanner trips |
+
+**Integration:** Single choke point in `STARAgent.query/aquery` wraps input sanitization pre-STAR, output sanitization post-STAR. Wiring location: `dana/core/agent/star_agent.py`.
 
 ---
 

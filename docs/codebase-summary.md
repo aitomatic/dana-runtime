@@ -27,7 +27,7 @@ dana/
 
 | Module | Files | LOC | Purpose |
 |--------|-------|-----|---------|
-| **core/** | 90 | 20,001 | Agent runtime, tools, timeline, prompts |
+| **core/** | 95 | 21,052 | Agent runtime, tools, timeline, prompts, I/O security |
 | **common/** | 48 | 6,242 | LLM providers, schemas, base classes |
 | **lib/** | 33 | 7,741 | Web research, memory, MCP, embeddings |
 | **apps/** | 15 | 1,594 | CLI apps & entry points |
@@ -93,6 +93,35 @@ dana/
 - `base_resource.py` - Resource base class
 - `bash_resource.py`, `file_io_resource.py`, etc. - Implementations
 - `resource_registry.py` - Global registry
+
+### I/O Security Guard (dana/core/guard/)
+**~1,051 LOC** - Input/output sanitization & scanning with llm-guard integration
+
+**Components:**
+- **GuardService Protocol** - Abstract interface (scan_input, scan_output, sanitize_output)
+- **LLMGuardService** - llm-guard backed scanner; lazy model init, fail-open
+- **OutputSanitizer** - LLM-as-sanitizer: reuses agent llm_client for sensitive-data scrubbing
+- **NoOpGuardService** - Disabled/fallback no-op implementation
+- **Scanner Registry** - Pluggable registry for input/output scanners (mirrors LLMProvider pattern)
+- **GuardConfig** - Env-driven configuration (DANA_GUARD_* vars)
+- **Result Types** - GuardOutcome, GuardDecision (ALLOW/SANITIZED/BLOCKED)
+
+**Features:**
+- Pluggable via `guard_instance` parameter (mirrors `llm_provider_instance`)
+- Block-on-injection for classifier-type input threats; sanitize+pass otherwise
+- Gated two-stage output scrub (LLM rewrite only when rule scanners flag)
+- Audit via structlog events + timeline metadata (raw response overwritten with scrubbed text)
+- Fail-open: missing/broken models → no-op + warning; thread-safe lazy scanner init
+- Default enabled in production, disabled in tests
+
+**Key Files:**
+- `protocols.py` - GuardService protocol
+- `llm_guard_service.py` - llm-guard scanner implementation
+- `output_sanitizer.py` - LLM-as-sanitizer
+- `scanner_factory.py` - Pluggable scanner registry
+- `result.py` - Result types
+- `config.py` - Configuration & env loading
+- `__init__.py` - Factory (build_default_guard)
 
 ### Runtime & LLM Integration (dana/core/runtime/ + dana/common/llm/)
 **~6,500 LOC combined** - Provider-agnostic LLM abstraction
@@ -250,7 +279,7 @@ dana/
 
 ## Dependencies
 
-**Core:** openai, anthropic, google-genai, httpx, python-dotenv, structlog, pydantic, requests, beautifulsoup4, html2text, rich
+**Core:** openai, anthropic, google-genai, httpx, python-dotenv, structlog, pydantic, requests, beautifulsoup4, html2text, rich, llm-guard
 
 **Optional Groups:**
 - web: lxml, selenium
@@ -259,6 +288,8 @@ dana/
 - memory: lancedb, sentence-transformers
 - knowledge: rdflib, rank-bm25
 - observability: langfuse
+
+**Note:** llm-guard includes torch & transformers; runtime is fail-open if models fail to load.
 
 ## Key Files by Importance
 
