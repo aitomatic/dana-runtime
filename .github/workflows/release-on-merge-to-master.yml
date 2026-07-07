@@ -1,9 +1,9 @@
-name: Release on merge to stable
+name: Release on merge to master
 
 on:
   pull_request:
     types: [closed]
-    branches: [stable]
+    branches: [master]
 
 jobs:
   release:
@@ -13,10 +13,10 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout stable
+      - name: Checkout master
         uses: actions/checkout@v4
         with:
-          ref: stable
+          ref: master
           fetch-depth: 0
 
       - name: Read version from pyproject.toml
@@ -37,4 +37,4 @@ jobs:
           fi
           git tag "$TAG"
           git push origin "$TAG"
-          gh release create "$TAG" --title "$TAG" --generate-notes --target stable
+          gh release create "$TAG" --title "$TAG" --generate-notes --target master
