@@ -173,6 +173,9 @@ class STARAgentStreamingMixin:
             StreamEvent: Stream events throughout the STAR loop.
         """
         # Session management (mirrors aquery())
+        # session_id relabels the in-memory session / write target (see
+        # set_session_id). Call resume(session_id) beforehand to reload a
+        # persisted session from disk — relabel never reloads.
         new_session_id = kwargs.get("session_id")
         if new_session_id is not None:
             self.set_session_id(new_session_id)
@@ -254,7 +257,14 @@ class STARAgentStreamingMixin:
                 trace_inputs = {"trace_inputs": trace_outputs.get("trace_outputs", {})}
 
             except Exception as exc:
-                logger.error("Error in aquery_stream", error=str(exc))
+                from dana.core.llm.llm_caller import is_transient_llm_error
+
+                logger.error(
+                    "Error in aquery_stream (transient=%s): %s",
+                    is_transient_llm_error(exc),
+                    exc,
+                    exc_info=True,
+                )
                 yield StreamEvent(
                     event_type=StreamEventType.ERROR,
                     data=str(exc),

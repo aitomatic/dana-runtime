@@ -4,7 +4,7 @@ from openai import AsyncAzureOpenAI
 import structlog
 
 from ...config import config_manager
-from .openai_compatible_base import OpenAICompatibleProvider
+from .openai_compatible_base import OpenAICompatibleProvider, make_logging_http_client
 
 
 logger = structlog.get_logger()
@@ -12,6 +12,34 @@ logger = structlog.get_logger()
 
 class AzureProvider(OpenAICompatibleProvider):
     """Azure OpenAI provider."""
+
+    # Azure exposes the Responses API only on api-version >= this date.
+    # Older versions return HTTP 400 BadRequest for /openai/responses.
+    _RESPONSES_API_MIN_DATE = "2025-03-01"
+
+    # Env var operators use to dial reasoning effort for Azure deployments.
+    # Valid values: "minimal" | "low" | "medium" | "high".
+    _REASONING_EFFORT_ENV_VAR = "AZURE_THINKING_EFFORT"
+
+    # Env var to force/disable the Responses API for this provider.
+    # Truthy: 1/true/on/yes — falsy: 0/false/off/no. Overrides the config flag
+    # and the api-version gate (forcing on an old api-version will likely 400).
+    _RESPONSES_API_ENV_VAR = "AZURE_USE_RESPONSES_API"
+
+    @property
+    def name(self) -> str:
+        return "azure"
+
+    def _endpoint_url(self) -> str:
+        return getattr(self, "azure_endpoint", "") or ""
+
+    def _responses_api_supported(self) -> bool:
+        # api-version format is "YYYY-MM-DD" or "YYYY-MM-DD-preview"; first 10 chars
+        # are the ISO date which sorts correctly lexicographically.
+        version = getattr(self, "api_version", None)
+        if not version or len(version) < 10:
+            return False
+        return version[:10] >= self._RESPONSES_API_MIN_DATE
 
     def __init__(
         self, api_key: str | None = None, model: str = "gpt-35-turbo", base_url: str | None = None, api_version: str | None = None
@@ -38,6 +66,7 @@ class AzureProvider(OpenAICompatibleProvider):
             raise ValueError("Azure OpenAI endpoint URL not found. Set AZURE_OPENAI_API_URL environment variable.")
 
         azure_endpoint = azure_endpoint.rstrip("/")
+        self.azure_endpoint = azure_endpoint
 
         if api_version:
             self.api_version = api_version
@@ -48,6 +77,7 @@ class AzureProvider(OpenAICompatibleProvider):
             api_key=self.api_key,
             azure_endpoint=azure_endpoint,
             api_version=self.api_version,
+            http_client=make_logging_http_client(self.DEFAULT_TIMEOUT_SECONDS),
         )
 
         # Check for use_responses_api config flag

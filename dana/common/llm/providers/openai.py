@@ -4,7 +4,7 @@ from openai import AsyncOpenAI
 import structlog
 
 from ...config import config_manager
-from .openai_compatible_base import OpenAICompatibleProvider
+from .openai_compatible_base import OpenAICompatibleProvider, make_logging_http_client
 
 
 logger = structlog.get_logger()
@@ -12,6 +12,21 @@ logger = structlog.get_logger()
 
 class OpenAIProvider(OpenAICompatibleProvider):
     """OpenAI API provider."""
+
+    # Env var operators use to dial reasoning effort for OpenAI direct API.
+    # Valid values: "minimal" | "low" | "medium" | "high".
+    _REASONING_EFFORT_ENV_VAR = "OPENAI_THINKING_EFFORT"
+
+    # Env var to force/disable the Responses API for this provider.
+    # Truthy: 1/true/on/yes — falsy: 0/false/off/no. Overrides the config flag.
+    _RESPONSES_API_ENV_VAR = "OPENAI_USE_RESPONSES_API"
+
+    @property
+    def name(self) -> str:
+        return "openai"
+
+    def _endpoint_url(self) -> str:
+        return getattr(self, "base_url", None) or "https://api.openai.com/v1"
 
     def __init__(self, api_key: str | None = None, model: str = "gpt-3.5-turbo", base_url: str | None = None):
         self.model = model
@@ -31,7 +46,11 @@ class OpenAIProvider(OpenAICompatibleProvider):
         else:
             self.base_url = config_manager.get_provider_base_url("openai")
 
-        self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
+        self.client = AsyncOpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            http_client=make_logging_http_client(self.DEFAULT_TIMEOUT_SECONDS),
+        )
 
         # Check for use_responses_api config flag
         provider_config = config_manager.get_provider_config("openai")

@@ -46,13 +46,38 @@ def test_no_fallbacks_success():
     mock_llm.chat_response_sync.assert_called_once()
 
 
-def test_no_fallbacks_exception_propagates():
-    caller, mock_llm = _make_caller()
+@patch("time.sleep")
+def test_no_fallbacks_transient_error_retries_then_raises(mock_sleep):
+    """Without fallbacks, transient errors still retry on the primary provider
+    (max_retries+1 attempts), then propagate."""
+    caller, mock_llm = _make_caller(max_retries=2, base_delay=0.0)
     mock_llm.chat_response_sync.side_effect = ProviderError("rate limit exceeded")
     with pytest.raises(ProviderError):
         caller.call_llm([])
-    # Called exactly once — no retry without fallbacks
+    # 1 initial attempt + 2 retries = 3 calls
+    assert mock_llm.chat_response_sync.call_count == 3
+
+
+def test_no_fallbacks_permanent_error_propagates_immediately():
+    """Without fallbacks, permanent (non-transient) errors propagate without retry."""
+    caller, mock_llm = _make_caller()
+    mock_llm.chat_response_sync.side_effect = ProviderError("invalid model name")
+    with pytest.raises(ProviderError):
+        caller.call_llm([])
+    # Permanent → exactly one call
     mock_llm.chat_response_sync.assert_called_once()
+
+
+def test_no_fallbacks_connection_error_classified_transient():
+    """openai.APIConnectionError surfaces as ProviderError('...: Connection error.')
+    and must now be classified transient (regression: was non-transient before)."""
+    caller, mock_llm = _make_caller(max_retries=1, base_delay=0.0)
+    mock_llm.chat_response_sync.side_effect = ProviderError("Chat failed with azure: Connection error.")
+    with patch("time.sleep"):
+        with pytest.raises(ProviderError):
+            caller.call_llm([])
+    # Treated as transient → retried once
+    assert mock_llm.chat_response_sync.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +166,7 @@ def test_all_providers_fail_raises_last_exception(mock_sleep):
     # Patch _invoke_llm_sync: call 1 = primary (transient), call 2 = fallback (transient)
     call_count = {"n": 0}
 
-    def fake_invoke(llm, messages):
+    def fake_invoke(llm, messages, messages_fn=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
             raise ProviderError("rate limit on primary")
@@ -198,6 +223,24 @@ def test_is_permanent_provider_error_non_transient():
     assert LLMCaller._is_transient_error(ProviderError("invalid model name")) is False
 
 
+def test_is_transient_provider_connection_error():
+    """ProviderError wrapping openai.APIConnectionError → 'Connection error.' must be transient.
+    This was the bug from the Azure incident — connection errors fell through as permanent."""
+    assert LLMCaller._is_transient_error(ProviderError("Chat failed with azure: Connection error.")) is True
+
+
+def test_is_transient_via_cause_chain_openai_apiconnectionerror():
+    """Detection works via __cause__ chain even if message lacks transient keywords."""
+
+    class APIConnectionError(Exception):
+        """Stand-in for openai.APIConnectionError (matched by class name)."""
+
+    underlying = APIConnectionError("network unreachable")
+    wrapped = ProviderError("Chat failed with azure: Boom")
+    wrapped.__cause__ = underlying
+    assert LLMCaller._is_transient_error(wrapped) is True
+
+
 # ---------------------------------------------------------------------------
 # Test 7: LLMTimeoutError triggers retry + failover (end-to-end)
 # ---------------------------------------------------------------------------
@@ -238,6 +281,19 @@ async def test_async_no_fallbacks_success():
     caller = LLMCaller(llm=mock_llm)
     result = await caller.call_llm_async([])
     assert result.content == "async-ok"
+
+
+@pytest.mark.asyncio
+@patch("asyncio.sleep", new_callable=AsyncMock)
+async def test_async_no_fallbacks_transient_error_retries(mock_sleep):
+    """Without fallbacks, transient errors retry on the primary provider."""
+    mock_llm = MagicMock()
+    mock_llm.chat_response = AsyncMock(side_effect=ProviderError("Connection error."))
+    caller = LLMCaller(llm=mock_llm, max_retries=2, base_delay=0.0)
+    with pytest.raises(ProviderError):
+        await caller.call_llm_async([])
+    # 1 initial + 2 retries
+    assert mock_llm.chat_response.call_count == 3
 
 
 @pytest.mark.asyncio

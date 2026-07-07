@@ -59,13 +59,19 @@ class TestCompressedTimelineConfig:
 class TestCompressedTimelineInitialization:
     """Test CompressedTimeline initialization."""
 
-    def test_initialization_with_defaults(self):
-        """Test initialization with default parameters."""
+    def test_initialization_with_defaults(self, monkeypatch):
+        """Default timeline uses env-resolved trigger (150k) when no explicit value."""
+        from dana.core.timeline import compact_trigger as ct
+
+        monkeypatch.delenv("DANA_COMPACT_TRIGGER_TOKENS", raising=False)
+        ct._reset_cache_for_tests()
         defaults = CompressedTimelineConfig()
         timeline = CompressedTimeline()
-        assert timeline.max_tokens_until_compression == defaults.max_tokens_until_compression
+        # Trigger now comes from env resolver (150k) rather than dataclass default (80k).
+        assert timeline.max_tokens_until_compression == ct.DEFAULT_TRIGGER
         assert timeline.max_recent_entries_to_keep == defaults.max_recent_entries_to_keep
-        assert timeline.cutoff_when_token_reach == int(0.3 * defaults.max_tokens_until_compression)
+        assert timeline.cutoff_when_token_reach == int(0.3 * ct.DEFAULT_TRIGGER)
+        ct._reset_cache_for_tests()
 
     def test_initialization_with_custom_parameters(self):
         """Test initialization with custom parameters."""
@@ -84,6 +90,65 @@ class TestCompressedTimelineInitialization:
         timeline = CompressedTimeline(agent=agent)
         assert timeline._agent == agent
         assert timeline._repository is not None
+
+    def test_context_tokens_independent_of_trigger(self, monkeypatch):
+        """Explicit max_context_tokens must NOT set the compression trigger.
+
+        Regression guard for the ``max_context_tokens`` ↔ trigger conflation
+        that previously made ``DANA_COMPACT_TRIGGER_TOKENS`` unreachable via the
+        agent path.
+        """
+        from dana.core.timeline import compact_trigger as ct
+
+        monkeypatch.delenv("DANA_COMPACT_TRIGGER_TOKENS", raising=False)
+        ct._reset_cache_for_tests()
+
+        timeline = CompressedTimeline(max_context_tokens=200_000)
+        assert timeline.max_context_tokens == 200_000
+        assert timeline.max_tokens_until_compression == ct.DEFAULT_TRIGGER
+        assert timeline._explicit_max_tokens_until_compression is None
+        ct._reset_cache_for_tests()
+
+    def test_env_trigger_wins_when_only_context_tokens_set(self, monkeypatch):
+        """With context budget explicit but trigger deferred, env governs the trigger."""
+        from dana.core.timeline import compact_trigger as ct
+
+        monkeypatch.setenv("DANA_COMPACT_TRIGGER_TOKENS", "80000")
+        ct._reset_cache_for_tests()
+
+        timeline = CompressedTimeline(max_context_tokens=200_000)
+        assert timeline.max_context_tokens == 200_000
+        assert timeline.max_tokens_until_compression == 80_000
+        assert timeline.cutoff_when_token_reach == int(0.3 * 80_000)
+        ct._reset_cache_for_tests()
+
+    def test_explicit_trigger_still_wins_over_env(self, monkeypatch):
+        """Callers who pin the trigger explicitly keep that contract."""
+        from dana.core.timeline import compact_trigger as ct
+
+        monkeypatch.setenv("DANA_COMPACT_TRIGGER_TOKENS", "80000")
+        ct._reset_cache_for_tests()
+
+        timeline = CompressedTimeline(
+            max_tokens_until_compression=50_000,
+            max_context_tokens=200_000,
+        )
+        assert timeline.max_context_tokens == 200_000
+        assert timeline.max_tokens_until_compression == 50_000
+        ct._reset_cache_for_tests()
+
+    def test_legacy_single_knob_still_aliases(self, monkeypatch):
+        """Backward compat: passing only the trigger still sets context budget to match."""
+        from dana.core.timeline import compact_trigger as ct
+
+        monkeypatch.delenv("DANA_COMPACT_TRIGGER_TOKENS", raising=False)
+        ct._reset_cache_for_tests()
+
+        timeline = CompressedTimeline(max_tokens_until_compression=10_000)
+        # When caller didn't specify max_context_tokens, it falls back to trigger.
+        assert timeline.max_context_tokens == 10_000
+        assert timeline.max_tokens_until_compression == 10_000
+        ct._reset_cache_for_tests()
 
 
 class TestCompressedTimelineNeedsCompression:
@@ -413,6 +478,103 @@ class TestCompressedTimelineToLLMMessages:
 
         assert summary_count1 == 1
         assert summary_count2 == 1
+
+
+class TestSubAgentResponseToolRole:
+    """SUB_AGENT_RESPONSE with tool_call_id must round-trip as role='tool'.
+
+    Regression for: openai 400 'tool_call_ids did not have response messages'
+    when resuming a timeline where the assistant called a sub-agent via a native
+    tool call and the sub-agent's response was stored as SUB_AGENT_RESPONSE.
+    The native-message conversion was defaulting these to role='assistant' and
+    dropping tool_call_id, which left the next LLM call's assistant tool_calls
+    unanswered on the wire.
+    """
+
+    def test_sub_agent_response_with_tool_call_id_maps_to_tool_role(self):
+        timeline = CompressedTimeline()
+        tool_call_id = "call_KU7CA5MtLbAEdSnYugJfwsV0"
+
+        timeline.add_entry(
+            TimelineEntry(
+                entry_type=TimelineEntryType.TOOL_CALL,
+                content="",
+                tool_calls=[
+                    {
+                        "function": "assistant__query",
+                        "arguments": {"message": "..."},
+                        "tool_call_id": tool_call_id,
+                    }
+                ],
+            )
+        )
+        timeline.add_entry(
+            TimelineEntry(
+                entry_type=TimelineEntryType.SUB_AGENT_RESPONSE,
+                content="sub-agent answer",
+                tool_call_id=tool_call_id,
+            )
+        )
+
+        msgs = timeline.to_llm_messages()
+        roles = [m.role for m in msgs]
+        assert roles == ["assistant", "tool"], roles
+        assert msgs[0].tool_calls and msgs[0].tool_calls[0]["id"] == tool_call_id
+        assert msgs[1].tool_call_id == tool_call_id
+
+    def test_sub_agent_response_without_tool_call_id_stays_assistant(self):
+        """Legacy XML sub-agent flow had no tool_call_id — keep as assistant."""
+        timeline = CompressedTimeline()
+        timeline.add_entry(
+            TimelineEntry(
+                entry_type=TimelineEntryType.SUB_AGENT_RESPONSE,
+                content="legacy sub-agent answer",
+            )
+        )
+        msgs = timeline.to_llm_messages()
+        assert [m.role for m in msgs] == ["assistant"]
+        assert msgs[0].tool_call_id is None
+
+    def test_resume_from_persisted_entries_preserves_tool_call_pairing(self):
+        """Reproduces the bug from the reported timeline JSON exactly."""
+        tool_call_id = "call_KU7CA5MtLbAEdSnYugJfwsV0"
+        entries = [
+            TimelineEntry(
+                entry_type=TimelineEntryType.USER_MESSAGE,
+                content="user request",
+                is_latest_user_message=True,
+            ),
+            TimelineEntry(
+                entry_type=TimelineEntryType.TOOL_CALL,
+                content="",
+                tool_calls=[
+                    {
+                        "function": "assistant__query",
+                        "arguments": {"message": "..."},
+                        "tool_call_id": tool_call_id,
+                    }
+                ],
+            ),
+            TimelineEntry(
+                entry_type=TimelineEntryType.SUB_AGENT_RESPONSE,
+                content="sub-agent answer",
+                tool_call_id=tool_call_id,
+            ),
+        ]
+
+        timeline = CompressedTimeline()
+        timeline.load_from_entries(entries)
+
+        msgs = timeline.to_llm_messages()
+        roles = [m.role for m in msgs]
+        assert roles == ["user", "assistant", "tool"], roles
+        # Every assistant tool_call must have a matching tool message right after.
+        for i, m in enumerate(msgs):
+            if m.role == "assistant" and m.tool_calls:
+                pairing = msgs[i + 1 : i + 1 + len(m.tool_calls)]
+                pair_ids = {p.tool_call_id for p in pairing if p.role == "tool"}
+                call_ids = {tc["id"] for tc in m.tool_calls}
+                assert call_ids <= pair_ids, f"unpaired tool_calls: {call_ids - pair_ids}"
 
 
 class TestCompressedTimelineLoadFromEntries:

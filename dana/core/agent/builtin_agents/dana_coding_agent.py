@@ -1,3 +1,5 @@
+import functools
+
 from dana.core.agent.builtin_agents.explore import ExploreAgent
 from dana.core.agent.star_agent import STARAgent
 from dana.core.knowledge.prompts.codecs import AbstractCodec, NativeToolsCodec
@@ -155,13 +157,19 @@ class DanaCodingAgent(STARAgent):
             )
         self._cwd = cwd
         _llm = self.llm_client
-        explore_agent = ExploreAgent(
-            agent_id="explore-test-123",
+        # Factory, not instance: each Task(subagent_type="explore") spawn gets a
+        # fresh ExploreAgent with a disjoint timeline/session. agent_id is pinned
+        # for stable session-storage namespacing; auto_register=False keeps
+        # spawns out of the global registry.
+        explore_factory = functools.partial(
+            ExploreAgent,
+            agent_id="explore",
             agent_type="explore_agent",
             llm_provider=llm_provider,
             model=model,
             max_context_tokens=100000,
             cwd=cwd,
+            auto_register=False,
         )
         self.with_resources(
             BashResource(resource_id="bash", working_directory=cwd),
@@ -175,7 +183,7 @@ class DanaCodingAgent(STARAgent):
             ToDoResource(resource_id="todo"),
             FileEditResource(resource_id="file-edit", base_path=cwd),
             SearchResource(resource_id="search", base_path=cwd),
-            TaskResource(resource_id="task", agents={"explore": explore_agent}),
+            TaskResource(resource_id="task", agents={"explore": explore_factory}),
             DanaSkillResource(resource_id="skills", agent=self),
         )
 

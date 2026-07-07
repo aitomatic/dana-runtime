@@ -1,10 +1,12 @@
 """OpenAI-compatible provider base class for OpenAI and Azure."""
 
+import hashlib
 import json
+import os
 from typing import Any
 
 import httpx
-from openai import APITimeoutError
+from openai import APIConnectionError, APITimeoutError, BadRequestError
 import structlog
 
 from ..types import (
@@ -52,6 +54,191 @@ MODEL_RESTRICTIONS: dict[str, dict] = {
 # Model prefixes that default to Responses API
 RESPONSES_API_PREFIXES = ("gpt-5", "o3-", "o4-", "o3", "o4")
 
+# Valid reasoning effort levels accepted by the OpenAI Responses API.
+# "minimal" is gpt-5-only; the SDK rejects unknown values, so validate at the wrapper.
+VALID_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
+
+# Generic fallback env var when no provider-specific override is set.
+GENERIC_REASONING_EFFORT_ENV = "LLM_REASONING_EFFORT"
+
+
+DEFAULT_REASONING_EFFORT = "low"
+
+# Generic fallback env var to force/disable Responses API across any provider.
+# Provider-specific vars (OPENAI_USE_RESPONSES_API / AZURE_USE_RESPONSES_API) win.
+GENERIC_USE_RESPONSES_API_ENV = "LLM_USE_RESPONSES_API"
+_RESPONSES_API_ENABLE_VALUES = frozenset({"1", "true", "on", "yes"})
+_RESPONSES_API_DISABLE_VALUES = frozenset({"0", "false", "off", "no"})
+
+
+def _serialize_output_item(item: Any) -> dict:
+    """Convert a Responses API output item to a JSON-serializable dict that's
+    safe to send back as ``input[]``.
+
+    Output-side reasoning items carry fields like ``status`` and ``content`` that
+    are server metadata only — the input schema rejects them with HTTP 400
+    ``unknown_parameter``. We restrict to the documented input-side fields:
+    ``type``, ``id``, ``summary``, ``encrypted_content``.
+
+    Falls back to manual extraction so schema drift never crashes capture —
+    storing partial state is better than dropping the entry entirely.
+    """
+    summary_list: list[dict] = []
+    for s in getattr(item, "summary", None) or []:
+        s_dump = getattr(s, "model_dump", None)
+        if callable(s_dump):
+            try:
+                summary_list.append(s_dump(exclude_none=False, mode="json"))
+                continue
+            except Exception:
+                pass
+        text = getattr(s, "text", None)
+        if text is not None:
+            summary_list.append({"type": getattr(s, "type", "summary_text"), "text": text})
+
+    return {
+        "type": getattr(item, "type", "reasoning"),
+        "id": getattr(item, "id", None),
+        "summary": summary_list,
+        "encrypted_content": getattr(item, "encrypted_content", None),
+    }
+
+
+def _looks_like_include_rejection(err: BadRequestError) -> bool:
+    """Heuristic — older Azure api-versions and non-trusted accounts reject
+    ``include=["reasoning.encrypted_content"]`` with varying messages. Match
+    loosely so the fallback fires in all observed forms."""
+    msg = str(err).lower()
+    return "include" in msg and ("reasoning" in msg or "encrypted" in msg or "unsupported" in msg)
+
+
+def _looks_like_reasoning_rejection(err: BadRequestError) -> bool:
+    """Heuristic for replayed-reasoning-item rejection. Covers:
+      - stale ``id`` ("not found", "expired", "session")
+      - item-shape mismatch ("unknown_parameter" pointing at ``input[N].*``)
+      - explicit reasoning-content rejection ("reasoning_item")
+    Matches loosely; false positives just trigger one extra request without
+    items, which is acceptable degradation."""
+    msg = str(err).lower()
+    return (
+        ("input[" in msg and "reasoning" not in msg.split("input[")[0])
+        or "reasoning_item" in msg
+        or ("reasoning" in msg and ("not found" in msg or "expired" in msg or "session" in msg))
+        or ("unknown_parameter" in msg and "input[" in msg)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reasoning-state replay (Phase 3)
+# ---------------------------------------------------------------------------
+
+REASONING_REPLAY_ENV = "LLM_REASONING_REPLAY"
+# Carrier keys threaded from LLMMessage → openai_messages → responses_input.
+# Underscore prefix flags them as non-API; the splicer reads + strips them.
+_RC_ITEMS = "_reasoning_items"
+_RC_FINGERPRINT = "_reasoning_fingerprint"
+_RC_RESPONSE_ID = "_response_id"
+_REPLAY_CARRIER_KEYS = (_RC_ITEMS, _RC_FINGERPRINT, _RC_RESPONSE_ID)
+
+
+def _replay_enabled() -> bool:
+    """Replay is on by default; ``LLM_REASONING_REPLAY=0`` disables it."""
+    raw = os.getenv(REASONING_REPLAY_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "off", "no")
+
+
+def _strip_replay_carriers(d: dict) -> dict:
+    """Return a copy of ``d`` with replay-carrier keys removed."""
+    return {k: v for k, v in d.items() if k not in _REPLAY_CARRIER_KEYS}
+
+
+def _resolve_reasoning_effort(provider_env_var: str | None) -> str:
+    """Resolve default reasoning effort from env, with validation.
+
+    Precedence:
+      1. provider-specific env var (e.g. ``AZURE_THINKING_EFFORT``)
+      2. generic ``LLM_REASONING_EFFORT``
+      3. hardcoded ``DEFAULT_REASONING_EFFORT`` ("low" — favors latency/cost;
+         operators can opt in to deeper reasoning per provider via env)
+
+    Invalid values are logged and ignored so a typo in env doesn't break calls.
+    """
+    for env_name in (provider_env_var, GENERIC_REASONING_EFFORT_ENV):
+        if not env_name:
+            continue
+        raw = os.getenv(env_name)
+        if not raw:
+            continue
+        normalized = raw.strip().lower()
+        if normalized in VALID_REASONING_EFFORTS:
+            return normalized
+        logger.warning(
+            "ignoring invalid reasoning effort env var",
+            env_var=env_name,
+            value=raw,
+            valid=sorted(VALID_REASONING_EFFORTS),
+        )
+    return DEFAULT_REASONING_EFFORT
+
+
+def _resolve_use_responses_api_env(provider_env_var: str | None) -> bool | None:
+    """Resolve an explicit Responses-API override from environment.
+
+    Precedence:
+      1. provider-specific env var (e.g. ``OPENAI_USE_RESPONSES_API``)
+      2. generic ``LLM_USE_RESPONSES_API``
+
+    Returns ``True``/``False`` when set, or ``None`` when unset so the caller
+    falls back to the config flag and then model/endpoint auto-detection.
+    Invalid values are logged and ignored so a typo doesn't silently flip routing.
+    """
+    for env_name in (provider_env_var, GENERIC_USE_RESPONSES_API_ENV):
+        if not env_name:
+            continue
+        raw = os.getenv(env_name)
+        if not raw:
+            continue
+        normalized = raw.strip().lower()
+        if normalized in _RESPONSES_API_ENABLE_VALUES:
+            return True
+        if normalized in _RESPONSES_API_DISABLE_VALUES:
+            return False
+        logger.warning(
+            "ignoring invalid use_responses_api env var",
+            env_var=env_name,
+            value=raw,
+            valid=sorted(_RESPONSES_API_ENABLE_VALUES | _RESPONSES_API_DISABLE_VALUES),
+        )
+    return None
+
+
+def make_logging_http_client(timeout_seconds: int) -> httpx.AsyncClient:
+    """Build an ``httpx.AsyncClient`` with request/response hooks.
+
+    The OpenAI SDK retries failed requests internally (default ``max_retries=2``).
+    Without these hooks those retry attempts are invisible — a single user-facing
+    "Connection error." can hide ~7+ minutes of silent retrying. Logging each
+    HTTP request surfaces the retry sequence in normal logs.
+    """
+
+    async def _on_request(request: httpx.Request) -> None:
+        logger.info("LLM HTTP request", method=request.method, url=str(request.url))
+
+    async def _on_response(response: httpx.Response) -> None:
+        if response.status_code >= 400:
+            logger.warning(
+                "LLM HTTP non-2xx response",
+                status=response.status_code,
+                url=str(response.request.url),
+            )
+
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout_seconds),
+        event_hooks={"request": [_on_request], "response": [_on_response]},
+    )
+
 
 class OpenAICompatibleProvider(LLMProvider):
     """Base for providers using OpenAI-compatible API (OpenAI, Azure)."""
@@ -59,6 +246,52 @@ class OpenAICompatibleProvider(LLMProvider):
     client: Any  # AsyncOpenAI or AsyncAzureOpenAI
     model: str
     _use_responses_api: bool | None = None
+    # Subclasses set this to expose a provider-specific knob, e.g.
+    # ``AZURE_THINKING_EFFORT`` or ``OPENAI_THINKING_EFFORT``. Resolved at call
+    # time so env changes take effect without process restart in tests.
+    _REASONING_EFFORT_ENV_VAR: str | None = None
+    # Provider-specific env var to force/disable Responses API, e.g.
+    # ``OPENAI_USE_RESPONSES_API`` / ``AZURE_USE_RESPONSES_API``. Resolved at
+    # call time; takes precedence over the ``use_responses_api`` config flag.
+    _RESPONSES_API_ENV_VAR: str | None = None
+
+    # Sticky flag — set after the first ``include=["reasoning.encrypted_content"]``
+    # rejection so we stop paying the round-trip cost of retry on every call.
+    _include_unsupported: bool = False
+
+    def _default_reasoning_effort(self) -> str:
+        return _resolve_reasoning_effort(self._REASONING_EFFORT_ENV_VAR)
+
+    @property
+    def name(self) -> str:
+        """Short provider identifier used in fingerprints. Subclasses override."""
+        return self.__class__.__name__.replace("Provider", "").lower()
+
+    @property
+    def model_family(self) -> str:
+        """Coarse model family for fingerprinting (e.g. 'gpt-5', 'o3').
+
+        Falls back to the full model name when no known family prefix matches —
+        keeps fingerprints distinct for unrecognized models rather than collapsing.
+        """
+        return self._get_model_family(self.model) or self.model
+
+    def _endpoint_url(self) -> str:
+        """Endpoint URL used for fingerprinting. Subclasses override."""
+        return ""
+
+    @property
+    def endpoint_hash(self) -> str:
+        """Stable 8-char hash of the endpoint URL — distinguishes deployments
+        without storing PII in metadata. Recomputed each access (cheap)."""
+        url = self._endpoint_url() or ""
+        return hashlib.sha256(url.encode("utf-8")).hexdigest()[:8]
+
+    @property
+    def fingerprint(self) -> str:
+        """provider:model_family:endpoint_hash — used as the gate key for
+        cross-turn reasoning-state replay. Mismatches fall back to text-flatten."""
+        return f"{self.name}:{self.model_family}:{self.endpoint_hash}"
 
     @property
     def supports_native_tools(self) -> bool:
@@ -174,6 +407,14 @@ class OpenAICompatibleProvider(LLMProvider):
                     }
                 )
             elif msg.role == "assistant":
+                # Carry reasoning replay metadata onto the wire-format dict via
+                # underscore-prefixed keys; ``_convert_to_responses_input``
+                # consumes + strips them so they never reach the API.
+                replay_carrier: dict[str, Any] = {}
+                if msg.reasoning_items:
+                    replay_carrier["_reasoning_items"] = msg.reasoning_items
+                    replay_carrier["_reasoning_fingerprint"] = msg.reasoning_fingerprint
+                    replay_carrier["_response_id"] = msg.response_id
                 if msg.tool_calls:
                     formatted_tool_calls = []
                     for tc in msg.tool_calls:
@@ -196,10 +437,11 @@ class OpenAICompatibleProvider(LLMProvider):
                             "role": "assistant",
                             "content": safe_content,
                             "tool_calls": formatted_tool_calls,
+                            **replay_carrier,
                         }
                     )
                 else:
-                    openai_messages.append({"role": "assistant", "content": safe_content})
+                    openai_messages.append({"role": "assistant", "content": safe_content, **replay_carrier})
         return system, openai_messages
 
     def prepare_tools(self, tools) -> list[dict]:
@@ -230,68 +472,258 @@ class OpenAICompatibleProvider(LLMProvider):
         return result
 
     async def chat(self, messages: list[LLMMessage], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
-        """Send messages and get a response via Chat Completions API."""
+        """Send messages and get a response.
+
+        Routes to the Responses API for reasoning models (gpt-5/o3/o4) when the
+        endpoint supports it, so callers get reasoning text in
+        ``LLMResponse.reasoning_content``. Falls back to Chat Completions
+        otherwise. Mirrors ``stream()`` routing.
+        """
         try:
-            _, openai_messages = self.prepare_messages(messages)
+            if self._should_use_responses_api():
+                return await self._chat_via_responses(messages, tools, **kwargs)
+            return await self._chat_via_chat_completions(messages, tools, **kwargs)
+        except (APITimeoutError, httpx.TimeoutException) as e:
+            raise LLMTimeoutError(f"OpenAI-compatible API timeout: {e}") from e
+        except APIConnectionError as e:
+            # Network failure — surface explicitly so it's not buried under a generic
+            # "OpenAI-compatible API error" line. Classified transient by LLMCaller.
+            logger.error(
+                "OpenAI-compatible API connection error",
+                error=str(e),
+                error_type=type(e).__name__,
+                exc_info=True,
+            )
+            raise
+        except Exception as e:
+            # Map OpenAI-compat context_length_exceeded to typed PromptTooLongError.
+            # Covers OpenAI, Azure, Moonshot uniformly.
+            try:
+                import openai as _openai
 
-            filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ["json_mode"] and v is not None}
-            filtered_kwargs = self._filter_params_for_model(self.model, filtered_kwargs)
+                if isinstance(e, _openai.APIStatusError):
+                    from dana.common.llm.types import PromptTooLongError
 
-            request_kwargs = {"model": self.model, "messages": openai_messages, **filtered_kwargs}
+                    err_body: dict = {}
+                    try:
+                        resp = getattr(e, "response", None)
+                        if resp is not None and hasattr(resp, "json"):
+                            err_body = (resp.json() or {}).get("error", {}) or {}
+                    except Exception:
+                        err_body = {}
+                    err_code = err_body.get("code") or getattr(e, "code", "") or ""
+                    err_msg = err_body.get("message") or str(e)
+                    if err_code == "context_length_exceeded":
+                        raise PromptTooLongError(f"OpenAI-compat: {err_msg}") from e
+            except ImportError:
+                pass
+            logger.error("OpenAI-compatible API error", error=str(e), error_type=type(e).__name__, exc_info=True)
+            raise
 
-            if tools:
-                request_kwargs["tools"] = self.prepare_tools(tools)
-                request_kwargs["tool_choice"] = "auto"
+    async def _chat_via_chat_completions(self, messages: list[LLMMessage], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
+        """Non-streaming chat via the legacy Chat Completions endpoint.
 
-            if kwargs.get("json_mode", False):
-                request_kwargs["response_format"] = {"type": "json_object"}
+        Used for non-reasoning models or when the Responses API isn't available
+        (e.g. Azure with api-version < 2025-03-01-preview). Reasoning text is not
+        surfaced on this path; only ``reasoning_tokens`` count if the API returns it.
+        """
+        _, openai_messages = self.prepare_messages(messages)
 
-            response = await self.client.chat.completions.create(
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ["json_mode"] and v is not None}
+        filtered_kwargs = self._filter_params_for_model(self.model, filtered_kwargs)
+
+        request_kwargs = {"model": self.model, "messages": openai_messages, **filtered_kwargs}
+
+        if tools:
+            request_kwargs["tools"] = self.prepare_tools(tools)
+            request_kwargs["tool_choice"] = "auto"
+
+        if kwargs.get("json_mode", False):
+            request_kwargs["response_format"] = {"type": "json_object"}
+
+        response = await self.client.chat.completions.create(
+            **request_kwargs,
+            timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
+        )
+
+        choice = response.choices[0]
+        message = choice.message
+        content = message.content or ""
+        tool_calls = message.tool_calls if (hasattr(message, "tool_calls") and message.tool_calls) else None
+
+        usage = None
+        reasoning_tokens = None
+        if response.usage:
+            usage = {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens,
+            }
+            if hasattr(response.usage, "prompt_tokens_details") and response.usage.prompt_tokens_details:
+                cached = getattr(response.usage.prompt_tokens_details, "cached_tokens", None)
+                if cached is not None:
+                    usage["cached_tokens"] = cached
+            if hasattr(response.usage, "completion_tokens_details") and response.usage.completion_tokens_details:
+                reasoning_tokens = getattr(response.usage.completion_tokens_details, "reasoning_tokens", None) or None
+
+        return LLMResponse(
+            content=content,
+            model=response.model,
+            usage=usage,
+            finish_reason=choice.finish_reason,
+            tool_calls=tool_calls,
+            reasoning_tokens=reasoning_tokens,
+        )
+
+    async def _chat_via_responses(self, messages: list[LLMMessage], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
+        """Non-streaming chat via the Responses API.
+
+        Surfaces reasoning summary text in ``LLMResponse.reasoning_content`` for
+        gpt-5/o3/o4 models. Tool calls are returned in the same Pydantic shape
+        Chat Completions emits (``ChatCompletionMessageToolCall``) so downstream
+        parsers (e.g. ``response_parser._to_tool_call_dicts``) see no difference.
+        """
+        from openai.types.chat import ChatCompletionMessageToolCall
+        from openai.types.chat.chat_completion_message_tool_call import Function
+
+        _, openai_messages = self.prepare_messages(messages)
+        responses_input = self._convert_to_responses_input(openai_messages)
+
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ["json_mode"] and v is not None}
+        filtered_kwargs = self._filter_params_for_model(self.model, filtered_kwargs)
+
+        request_kwargs = {"model": self.model, "input": responses_input, **filtered_kwargs}
+
+        # Default reasoning config:
+        #   effort  — without explicit effort, gpt-5* sometimes skips reasoning entirely,
+        #             making reasoning_content nondeterministic. Resolved from the provider's
+        #             env var (e.g. AZURE_THINKING_EFFORT) → LLM_REASONING_EFFORT → "low".
+        #             Caller-supplied reasoning.effort always wins.
+        #   summary="auto"  — required for reasoning summary text to be returned at all.
+        reasoning_cfg = dict(request_kwargs.get("reasoning") or {})
+        reasoning_cfg.setdefault("effort", self._default_reasoning_effort())
+        reasoning_cfg.setdefault("summary", "auto")
+        request_kwargs["reasoning"] = reasoning_cfg
+
+        if tools:
+            request_kwargs["tools"] = self._prepare_tools_for_responses(tools)
+
+        if kwargs.get("json_mode", False):
+            # Responses API uses text.format instead of response_format.
+            request_kwargs["text"] = {"format": {"type": "json_object"}}
+
+        # Opt in to encrypted reasoning state when account has trusted access.
+        # When unsupported, the API may either reject the call (handled below)
+        # or silently omit the field — both are safe; we degrade to summary-only.
+        if not self._include_unsupported:
+            existing_include = list(request_kwargs.get("include") or [])
+            if "reasoning.encrypted_content" not in existing_include:
+                request_kwargs["include"] = existing_include + ["reasoning.encrypted_content"]
+
+        try:
+            response = await self.client.responses.create(
                 **request_kwargs,
                 timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
             )
-
-            choice = response.choices[0]
-            message = choice.message
-
-            if hasattr(message, "tool_calls") and message.tool_calls:
-                content = message.content or ""
-                tool_calls = message.tool_calls
+        except BadRequestError as e:
+            # Sticky one-shot fallback: drop the include flag and retry. Subsequent
+            # calls skip the include flag entirely (no per-call retry cost).
+            if not self._include_unsupported and _looks_like_include_rejection(e):
+                logger.warning(
+                    "responses.create rejected include=reasoning.encrypted_content; falling back to summary-only reasoning capture",
+                    error=str(e),
+                )
+                self._include_unsupported = True
+                request_kwargs.pop("include", None)
+                response = await self.client.responses.create(
+                    **request_kwargs,
+                    timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
+                )
+            elif _looks_like_reasoning_rejection(e):
+                # Stale reasoning id, item-shape mismatch (e.g. unknown field
+                # like 'status' on input), or model refusing replay mid-turn.
+                # Strip reasoning items from input[] and retry once so the turn
+                # still completes — degrades to flat-text replay rather than
+                # failing the user's request entirely.
+                logger.warning(
+                    "responses.create rejected replayed reasoning items; retrying without items",
+                    error=str(e),
+                )
+                request_kwargs["input"] = [item for item in request_kwargs["input"] if item.get("type") != "reasoning"]
+                response = await self.client.responses.create(
+                    **request_kwargs,
+                    timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
+                )
             else:
-                content = message.content or ""
-                tool_calls = None
+                raise
 
-            usage = None
-            reasoning_tokens = None
-            if response.usage:
-                usage = {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens,
-                }
-                if hasattr(response.usage, "prompt_tokens_details") and response.usage.prompt_tokens_details:
-                    details = response.usage.prompt_tokens_details
-                    if hasattr(details, "cached_tokens"):
-                        usage["cached_tokens"] = details.cached_tokens
-                if hasattr(response.usage, "completion_tokens_details") and response.usage.completion_tokens_details:
-                    output_details = response.usage.completion_tokens_details
-                    if hasattr(output_details, "reasoning_tokens") and output_details.reasoning_tokens:
-                        reasoning_tokens = output_details.reasoning_tokens
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        reasoning_items: list[dict] = []
+        tool_calls_list: list = []
 
-            return LLMResponse(
-                content=content,
-                model=response.model,
-                usage=usage,
-                finish_reason=choice.finish_reason,
-                tool_calls=tool_calls,
-                reasoning_tokens=reasoning_tokens,
-            )
+        for item in response.output:
+            item_type = getattr(item, "type", None)
+            if item_type == "reasoning":
+                reasoning_items.append(_serialize_output_item(item))
+                for s in item.summary or []:
+                    text = getattr(s, "text", None)
+                    if text:
+                        reasoning_parts.append(text)
+            elif item_type == "message":
+                for c in item.content or []:
+                    if getattr(c, "type", None) == "output_text":
+                        text = getattr(c, "text", "") or ""
+                        if text:
+                            content_parts.append(text)
+            elif item_type == "function_call":
+                tool_calls_list.append(
+                    ChatCompletionMessageToolCall(
+                        id=item.call_id,
+                        type="function",
+                        function=Function(name=item.name, arguments=item.arguments or ""),
+                    )
+                )
 
-        except (APITimeoutError, httpx.TimeoutException) as e:
-            raise LLMTimeoutError(f"OpenAI-compatible API timeout: {e}") from e
-        except Exception as e:
-            logger.error("OpenAI-compatible API error", error=str(e))
-            raise
+        # Map Responses API status to a Chat-Completions-style finish_reason so
+        # callers don't need to know which path was used.
+        if tool_calls_list:
+            finish_reason = "tool_calls"
+        elif response.status == "incomplete":
+            details = getattr(response, "incomplete_details", None)
+            reason = getattr(details, "reason", None) if details else None
+            finish_reason = "length" if reason == "max_output_tokens" else "incomplete"
+        else:
+            finish_reason = "stop"
+
+        usage = None
+        reasoning_tokens = None
+        if response.usage:
+            usage = {
+                "prompt_tokens": response.usage.input_tokens,
+                "completion_tokens": response.usage.output_tokens,
+                "total_tokens": response.usage.total_tokens,
+            }
+            input_details = getattr(response.usage, "input_tokens_details", None)
+            if input_details:
+                cached = getattr(input_details, "cached_tokens", None)
+                if cached is not None:
+                    usage["cached_tokens"] = cached
+            output_details = getattr(response.usage, "output_tokens_details", None)
+            if output_details:
+                reasoning_tokens = getattr(output_details, "reasoning_tokens", None) or None
+
+        return LLMResponse(
+            content="".join(content_parts),
+            model=response.model,
+            usage=usage,
+            finish_reason=finish_reason,
+            tool_calls=tool_calls_list or None,
+            reasoning_tokens=reasoning_tokens,
+            reasoning_content="".join(reasoning_parts) or None,
+            reasoning_items=reasoning_items or None,
+            response_id=getattr(response, "id", None),
+        )
 
     # --- Embedding methods ---
 
@@ -431,10 +863,42 @@ class OpenAICompatibleProvider(LLMProvider):
         Responses API uses:
           {"type": "function_call", "id": "...", "call_id": "...", "name": "...", "arguments": "...", "status": "completed"}
           {"type": "function_call_output", "call_id": "...", "output": "..."}
+
+        Reasoning-state replay (Phase 3): when an assistant message carries
+        ``_reasoning_items`` with a fingerprint matching this provider, the raw
+        reasoning items are emitted into ``input[]`` *before* the assistant
+        message — the model picks up structured reasoning state across turns
+        instead of re-deriving it from flattened text. Carrier keys are stripped
+        so they never reach the API. Disabled when ``LLM_REASONING_REPLAY=0``.
         """
         result = []
+        replay_on = _replay_enabled()
+        my_fingerprint = self.fingerprint
+        replay_count = 0
         for msg in openai_messages:
             role = msg.get("role")
+            # Replay path — splice raw reasoning items before the assistant message
+            # whenever fingerprint matches and items exist. Cross-provider replays
+            # fall through to the flat-text path; carriers always get stripped.
+            if role == "assistant" and msg.get(_RC_ITEMS):
+                if replay_on and msg.get(_RC_FINGERPRINT) == my_fingerprint:
+                    items = msg.get(_RC_ITEMS) or []
+                    for item in items:
+                        result.append(dict(item))
+                    replay_count += len(items)
+                    msg = _strip_replay_carriers(msg)
+                    # The spliced reasoning item already carries the summary +
+                    # encrypted_content, so the visible thought text is now
+                    # redundant. Drop it from the assistant message: it is
+                    # duplicate context, and Azure's invalid_prompt / Prompt
+                    # Shield filter scans message-role content (but not
+                    # reasoning.summary), so replaying raw thoughts as assistant
+                    # text triggers false-positive rejections. Tool-call
+                    # narration is short and kept (emitted by the branch below).
+                    if not msg.get("tool_calls"):
+                        msg = {**msg, "content": ""}
+                else:
+                    msg = _strip_replay_carriers(msg)
             # Convert multimodal user messages to Responses API format
             if role == "user" and isinstance(msg.get("content"), list):
                 content = msg["content"]
@@ -486,6 +950,12 @@ class OpenAICompatibleProvider(LLMProvider):
                 )
             else:
                 result.append(msg)
+        if replay_count > 0:
+            logger.debug(
+                "reasoning replay",
+                items=replay_count,
+                fingerprint=my_fingerprint,
+            )
         return result
 
     async def _stream_responses(self, messages: list[LLMMessage], tools: list | None = None, **kwargs):
@@ -500,6 +970,15 @@ class OpenAICompatibleProvider(LLMProvider):
         filtered_kwargs = self._filter_params_for_model(self.model, filtered_kwargs)
 
         request_kwargs = {"model": self.model, "input": responses_input, "stream": True, **filtered_kwargs}
+
+        # Default reasoning config (mirrors _chat_via_responses):
+        #   effort  — env-driven default (provider env → LLM_REASONING_EFFORT → "low")
+        #             so gpt-5* deterministically reasons. Caller can override per-call.
+        #   summary="auto"  — required for reasoning summary delta events to fire.
+        reasoning_cfg = dict(request_kwargs.get("reasoning") or {})
+        reasoning_cfg.setdefault("effort", self._default_reasoning_effort())
+        reasoning_cfg.setdefault("summary", "auto")
+        request_kwargs["reasoning"] = reasoning_cfg
 
         if tools:
             request_kwargs["tools"] = self._prepare_tools_for_responses(tools)
@@ -529,16 +1008,46 @@ class OpenAICompatibleProvider(LLMProvider):
                         },
                     )
 
-            elif event.type == "response.reasoning.delta":
+            elif event.type in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
+                # Both summary deltas (when reasoning.summary="auto") and raw reasoning
+                # text deltas (trusted access) carry .delta strings; surface as "thinking".
                 yield LLMStreamChunk(type="thinking", content=event.delta)
+
+    def _responses_api_supported(self) -> bool:
+        """Whether the underlying endpoint exposes the Responses API at all.
+
+        OpenAI-compatible endpoints support it unconditionally. Azure subclasses
+        override this to gate on api-version (Responses API requires
+        api-version >= 2025-03-01-preview).
+        """
+        return True
 
     def _should_use_responses_api(self) -> bool:
         """Determine whether to use Responses API or Chat Completions.
 
-        Priority: config flag > model prefix > default (Chat Completions).
+        Priority: env override > config flag > endpoint capability + model prefix.
+
+        An explicit override (env or config) takes the caller's word and bypasses
+        the endpoint-capability gate — useful for forcing the path under test or
+        against a custom-configured resource. When forcing it on against an
+        endpoint that reports no support (e.g. an Azure api-version older than
+        2025-03-01), we log a warning since the request will likely 400.
         """
-        if self._use_responses_api is not None:
-            return self._use_responses_api
+        override = _resolve_use_responses_api_env(self._RESPONSES_API_ENV_VAR)
+        if override is None:
+            override = self._use_responses_api
+
+        if override is not None:
+            if override and not self._responses_api_supported():
+                logger.warning(
+                    "Responses API forced on but endpoint reports no support; request may fail",
+                    provider=self.name,
+                    model=self.model,
+                )
+            return override
+
+        if not self._responses_api_supported():
+            return False
 
         model_lower = self.model.lower()
         for prefix in RESPONSES_API_PREFIXES:
@@ -564,6 +1073,15 @@ class OpenAICompatibleProvider(LLMProvider):
                     yield chunk
         except (APITimeoutError, httpx.TimeoutException) as e:
             raise LLMTimeoutError(f"OpenAI-compatible stream timeout: {e}") from e
+        except APIConnectionError as e:
+            logger.error(
+                "OpenAI-compatible stream connection error",
+                model=self.model,
+                error=str(e),
+                error_type=type(e).__name__,
+                exc_info=True,
+            )
+            raise
         except Exception as e:
-            logger.error("Stream error", model=self.model, error=str(e))
+            logger.error("Stream error", model=self.model, error=str(e), error_type=type(e).__name__, exc_info=True)
             raise

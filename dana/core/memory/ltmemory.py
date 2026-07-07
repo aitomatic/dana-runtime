@@ -103,6 +103,7 @@ from datetime import datetime
 from pathlib import Path
 import re
 
+from dana.common.llm import LLM
 from dana.common.resource.rlm_resource import RLMResource
 
 
@@ -118,6 +119,7 @@ class LTMemory:
         path: str = "./memories/",
         llm_provider: str = "anthropic",
         llm_model: str = "claude-sonnet-4-20250514",
+        llm: LLM | None = None,
     ):
         """
         Initialize LTMemory.
@@ -126,6 +128,7 @@ class LTMemory:
             path: Directory path for memory storage
             llm_provider: LLM provider for RLM queries
             llm_model: LLM model for RLM queries
+            llm: Optional injected LLM instance
         """
         self.path = Path(path)
         self.memories_file = self.path / "memories.md"
@@ -137,12 +140,18 @@ class LTMemory:
         if not self.memories_file.exists():
             self.memories_file.write_text("")
 
-        # Initialize RLM for querying
+        # Initialize RLM for querying. An injected `llm` (provider instance wrapped
+        # in LLM) takes precedence over the provider name/model inside RLMResource.
         self._rlm = RLMResource(
             file=str(self.memories_file),
             llm_provider=llm_provider,
             llm_model=llm_model,
+            llm=llm,
         )
+
+    def set_llm(self, llm: LLM) -> None:
+        """Re-point the underlying RLM resource at a new LLM."""
+        self._rlm.set_llm(llm)
 
     def store(self, memory: dict) -> None:
         """

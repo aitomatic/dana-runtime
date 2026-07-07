@@ -9,7 +9,7 @@ import structlog
 
 from ...config import config_manager
 from ..types import read_media_as_base64, unsupported_placeholder
-from .openai_compatible_base import OpenAICompatibleProvider
+from .openai_compatible_base import OpenAICompatibleProvider, make_logging_http_client
 
 
 logger = structlog.get_logger()
@@ -36,11 +36,13 @@ class MoonshotProvider(OpenAICompatibleProvider):
         if base_url:
             self.base_url = base_url
         else:
-            self.base_url = (
-                config_manager.get_provider_base_url(MOONSHOT_PROVIDER_NAME) or "https://api.moonshot.ai/v1"
-            )
+            self.base_url = config_manager.get_provider_base_url(MOONSHOT_PROVIDER_NAME) or "https://api.moonshot.ai/v1"
 
-        self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
+        self.client = AsyncOpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            http_client=make_logging_http_client(self.DEFAULT_TIMEOUT_SECONDS),
+        )
 
         # Moonshot never uses Responses API
         self._use_responses_api = False

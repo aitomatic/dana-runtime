@@ -236,6 +236,10 @@ class Communicator:
         """
         Async interactive conversation loop with pluggable input handler.
 
+        Each turn relabels the session (keeps the in-memory timeline); it never
+        reloads from disk. To continue a persisted conversation, call the agent's
+        ``resume(session_id)`` before invoking this loop.
+
         Args:
             initial_message: Optional initial message to start the conversation
             session_id: Optional session identifier. If None, generates UUID.

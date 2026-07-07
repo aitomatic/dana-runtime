@@ -15,6 +15,7 @@ from dana.common.observable import observable
 from dana.common.protocols import DictParams, STARAgentProtocol
 from dana.common.protocols.types import LearningPhase
 from dana.core.agent.base_agent import BaseAgent
+from dana.core.llm.llm_caller import is_transient_llm_error
 from dana.core.runtime.protocols import StreamEvent, StreamEventType
 
 
@@ -22,6 +23,13 @@ logger = logging.getLogger(__name__)
 
 
 EXIT_STAR_LOOP_FLAG = "EXIT_STAR_LOOP_FLAG"
+
+# STAR loop retry budget for transient LLM errors (per iteration).
+# This sits ON TOP of LLMCaller's own retry — it covers cases where the network
+# recovers between iterations or the failure surfaces outside the LLM call itself.
+# Kept small to avoid pathological wait times when stacked with LLMCaller retries.
+_STAR_TRANSIENT_RETRIES = 1
+_STAR_TRANSIENT_BASE_DELAY = 1.0
 
 
 class BaseSTARAgent(BaseAgent, STARAgentProtocol):
@@ -169,40 +177,68 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
 
         @observable(name=f"Dana {self.agent_type}-agent-query")
         def _do_query(trace_inputs: DictParams) -> DictParams:
+            import time
+
             trace_outputs: DictParams = {}
 
-            for _ in range(self.MAX_ITERATIONS):
-                try:
-                    trace_percepts = self._see(trace_inputs.get("trace_inputs", {}))
-                    trace_thoughts = self._think(trace_percepts.get("trace_percepts", {}))
-                    trace_outputs = self._act(trace_thoughts.get("trace_thoughts", {}))
-
-                    # Trigger acquisitive learning asynchronously at end of each STAR loop
-                    if not self._do_exit_star_loop(trace_outputs.get("trace_outputs", {})):
-                        acquisitive_input = trace_outputs.get("trace_outputs", {}).copy()
-                        acquisitive_input["phase"] = LearningPhase.ACQUISITIVE
-
-                        # Sync path: use thread (no event loop available)
-                        def run_reflect(acq_input):
-                            try:
-                                self._reflect(acq_input)
-                            except Exception as reflect_err:
-                                logger.error("Reflection failed: %s", reflect_err, exc_info=True)
-
-                        threading.Thread(target=run_reflect, args=(acquisitive_input,), daemon=True).start()
-
-                    if self._do_exit_star_loop(trace_outputs.get("trace_outputs", {})):
+            for iteration in range(self.MAX_ITERATIONS):
+                # Inner loop retries the See/Think/Act cycle on transient LLM errors.
+                # LLMCaller already retries inside its own scope; this is a second-line
+                # defense for transient failures that escape (or whose retry budget
+                # was exhausted) before we mark the whole session as failed.
+                attempt = 0
+                star_failed = False
+                while True:
+                    try:
+                        trace_percepts = self._see(trace_inputs.get("trace_inputs", {}))
+                        trace_thoughts = self._think(trace_percepts.get("trace_percepts", {}))
+                        trace_outputs = self._act(trace_thoughts.get("trace_thoughts", {}))
+                        break
+                    except Exception as e:
+                        if is_transient_llm_error(e) and attempt < _STAR_TRANSIENT_RETRIES:
+                            delay = _STAR_TRANSIENT_BASE_DELAY * (2**attempt)
+                            logger.warning(
+                                "STAR iteration transient error, retrying (iteration=%d, attempt=%d/%d, delay=%.1fs): %s",
+                                iteration,
+                                attempt + 1,
+                                _STAR_TRANSIENT_RETRIES,
+                                delay,
+                                e,
+                                exc_info=True,
+                            )
+                            time.sleep(delay)
+                            attempt += 1
+                            continue
+                        logger.error(
+                            "Error in query (iteration=%d, transient=%s): %s",
+                            iteration,
+                            is_transient_llm_error(e),
+                            e,
+                            exc_info=True,
+                        )
+                        trace_outputs = {"trace_outputs": {"error": e}}
+                        star_failed = True
                         break
 
-                except Exception as e:
-                    import traceback
-
-                    logger.error("Error in query: %s\n%s", e, traceback.format_exc())
-                    trace_outputs = {"trace_outputs": {"error": e}}
+                if star_failed:
                     break
 
-            # _trace_episode["phase"] = LearningPhase.EPISODIC
-            # trace_learning = self._reflect(trace_outputs)
+                # Trigger acquisitive learning asynchronously at end of each STAR loop
+                if not self._do_exit_star_loop(trace_outputs.get("trace_outputs", {})):
+                    acquisitive_input = trace_outputs.get("trace_outputs", {}).copy()
+                    acquisitive_input["phase"] = LearningPhase.ACQUISITIVE
+
+                    # Sync path: use thread (no event loop available)
+                    def run_reflect(acq_input):
+                        try:
+                            self._reflect(acq_input)
+                        except Exception as reflect_err:
+                            logger.error("Reflection failed: %s", reflect_err, exc_info=True)
+
+                    threading.Thread(target=run_reflect, args=(acquisitive_input,), daemon=True).start()
+
+                if self._do_exit_star_loop(trace_outputs.get("trace_outputs", {})):
+                    break
 
             return trace_outputs
 
@@ -211,7 +247,7 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
             result = result.get("trace_outputs", {}) if result else {}
 
         except Exception as e:
-            logger.error("Error in query: %s", e)
+            logger.error("Error in query: %s", e, exc_info=True)
             result = {"error": e}
 
         return result
@@ -227,35 +263,64 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
         async def _do_aquery(trace_inputs: DictParams) -> DictParams:
             trace_outputs: DictParams = {}
 
-            for _ in range(self.MAX_ITERATIONS):
-                try:
-                    # _see is sync (no async ops needed)
-                    trace_percepts = self._see(trace_inputs.get("trace_inputs", {}))
-                    # _think_async uses native async LLM call
-                    trace_thoughts = await self._think_async(trace_percepts.get("trace_percepts", {}))
-                    # _act_async uses native async tool execution
-                    trace_outputs = await self._act_async(trace_thoughts.get("trace_thoughts", {}))
-
-                    # Trigger acquisitive learning asynchronously at end of each STAR loop
-                    if not self._do_exit_star_loop(trace_outputs.get("trace_outputs", {})):
-                        acquisitive_input = trace_outputs.get("trace_outputs", {}).copy()
-                        acquisitive_input["phase"] = LearningPhase.ACQUISITIVE
-
-                        # Async path: use asyncio.create_task (proper async, not threads)
-                        async def _async_reflect(acq_input):
-                            try:
-                                self._reflect(acq_input)
-                            except Exception as reflect_err:
-                                logger.error("Async reflection failed", error=str(reflect_err), exc_info=True)
-
-                        asyncio.create_task(_async_reflect(acquisitive_input))
-
-                    if self._do_exit_star_loop(trace_outputs.get("trace_outputs", {})):
+            for iteration in range(self.MAX_ITERATIONS):
+                # Inner loop retries the See/Think/Act cycle on transient LLM errors.
+                # See _do_query for rationale.
+                attempt = 0
+                star_failed = False
+                while True:
+                    try:
+                        # _see is sync (no async ops needed)
+                        trace_percepts = self._see(trace_inputs.get("trace_inputs", {}))
+                        # _think_async uses native async LLM call
+                        trace_thoughts = await self._think_async(trace_percepts.get("trace_percepts", {}))
+                        # _act_async uses native async tool execution
+                        trace_outputs = await self._act_async(trace_thoughts.get("trace_thoughts", {}))
+                        break
+                    except Exception as e:
+                        if is_transient_llm_error(e) and attempt < _STAR_TRANSIENT_RETRIES:
+                            delay = _STAR_TRANSIENT_BASE_DELAY * (2**attempt)
+                            logger.warning(
+                                "STAR iteration transient error, retrying (iteration=%d, attempt=%d/%d, delay=%.1fs): %s",
+                                iteration,
+                                attempt + 1,
+                                _STAR_TRANSIENT_RETRIES,
+                                delay,
+                                e,
+                                exc_info=True,
+                            )
+                            await asyncio.sleep(delay)
+                            attempt += 1
+                            continue
+                        logger.error(
+                            "Error in aquery (iteration=%d, transient=%s): %s",
+                            iteration,
+                            is_transient_llm_error(e),
+                            e,
+                            exc_info=True,
+                        )
+                        trace_outputs = {"trace_outputs": {"error": e}}
+                        star_failed = True
                         break
 
-                except Exception as e:
-                    logger.error("Error in aquery: %s", e)
-                    trace_outputs = {"trace_outputs": {"error": e}}
+                if star_failed:
+                    break
+
+                # Trigger acquisitive learning asynchronously at end of each STAR loop
+                if not self._do_exit_star_loop(trace_outputs.get("trace_outputs", {})):
+                    acquisitive_input = trace_outputs.get("trace_outputs", {}).copy()
+                    acquisitive_input["phase"] = LearningPhase.ACQUISITIVE
+
+                    # Async path: use asyncio.create_task (proper async, not threads)
+                    async def _async_reflect(acq_input):
+                        try:
+                            self._reflect(acq_input)
+                        except Exception as reflect_err:
+                            logger.error("Async reflection failed: %s", reflect_err, exc_info=True)
+
+                    asyncio.create_task(_async_reflect(acquisitive_input))
+
+                if self._do_exit_star_loop(trace_outputs.get("trace_outputs", {})):
                     break
 
             return trace_outputs
@@ -265,7 +330,7 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
             result = result.get("trace_outputs", {}) if result else {}
 
         except Exception as e:
-            logger.error("Error in aquery: %s", e)
+            logger.error("Error in aquery: %s", e, exc_info=True)
             result = {"error": e}
 
         return result

@@ -8,6 +8,7 @@ are @runtime_checkable so isinstance() checks work at runtime.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -37,6 +38,14 @@ class ParsedResponse:
     response: str | None
     tool_calls: list[dict[str, Any]]
     todo_list: list[TodoItem] | None = None
+    # Raw reasoning items from the OpenAI Responses API (carries summary + optional
+    # encrypted_content). Persisted in TimelineEntry.metadata so the same provider
+    # can replay structured reasoning state across turns instead of re-deriving it
+    # from flattened assistant text.
+    reasoning_items: list[dict] | None = None
+    # Server-side response id for audit/debugging and as a future fallback to
+    # previous_response_id mode.
+    response_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -92,9 +101,17 @@ class PromptBuilderProtocol(Protocol):
 class LLMCallerProtocol(Protocol):
     """Calls an LLM (sync and async variants)."""
 
-    def call_llm(self, messages: list[LLMMessage]) -> LLMResponse: ...
+    def call_llm(
+        self,
+        messages: list[LLMMessage],
+        messages_fn: Callable[[], list[LLMMessage]] | None = None,
+    ) -> LLMResponse: ...
 
-    async def call_llm_async(self, messages: list[LLMMessage]) -> LLMResponse: ...
+    async def call_llm_async(
+        self,
+        messages: list[LLMMessage],
+        messages_fn: Callable[[], list[LLMMessage]] | None = None,
+    ) -> LLMResponse: ...
 
 
 @runtime_checkable

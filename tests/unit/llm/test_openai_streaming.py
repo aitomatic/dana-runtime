@@ -253,9 +253,15 @@ class TestStreamResponses:
         assert results[0].tool_call["input"] == {"city": "Tokyo"}
 
     @pytest.mark.asyncio
-    async def test_reasoning_delta_yields_thinking(self):
+    @pytest.mark.parametrize(
+        "event_type",
+        # Real openai SDK event names. Old wrapper listened for "response.reasoning.delta"
+        # which never fires; the SDK emits these two instead.
+        ["response.reasoning_summary_text.delta", "response.reasoning_text.delta"],
+    )
+    async def test_reasoning_delta_yields_thinking(self, event_type):
         provider = _create_provider(model="o3")
-        events = [_make_responses_event("response.reasoning.delta", delta="Let me think...")]
+        events = [_make_responses_event(event_type, delta="Let me think...")]
         provider.client.responses.create = AsyncMock(return_value=_async_iter(events))
 
         results = []

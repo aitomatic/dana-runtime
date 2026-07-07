@@ -89,7 +89,23 @@ class SearchResource(BaseResource):
 
         Returns:
             Formatted search results based on output_mode.
+
+        Note:
+            When `path` points to a single file and `output_mode` is the
+            default "files_with_matches", the mode is auto-promoted to
+            "content". In files_with_matches mode a single-file search
+            returns only the bare path (which the caller already provided),
+            which LLM callers frequently misread as an empty result. A
+            header line prefixes the output to make the promotion explicit.
+            Pass `output_mode` explicitly to override.
         """
+        # Auto-promote output_mode when the target is a single file.
+        auto_promoted_from: str | None = None
+        if output_mode == "files_with_matches" and path is not None:
+            if self._resolve_path(path).is_file():
+                auto_promoted_from = output_mode
+                output_mode = "content"
+
         args = (
             pattern,
             path,
@@ -107,31 +123,39 @@ class SearchResource(BaseResource):
         )
 
         if self._mode == GREPMode.RIPGREP:
-            return await self._grep_ripgrep(*args)
+            result = await self._grep_ripgrep(*args)
         elif self._mode == GREPMode.GREP:
-            return await self._grep_system_grep(*args)
+            result = await self._grep_system_grep(*args)
         elif self._mode == GREPMode.PYTHON_NATIVE:
-            return await self._grep_python_native(*args)
+            result = await self._grep_python_native(*args)
         else:
-            e1, e2, e3 = None, None, None
-            try:
-                return await self._grep_ripgrep(*args)
-            except Exception as e:
-                e1 = e
+            errors: dict[str, Exception] = {}
+            for engine_name, engine in (
+                ("ripgrep", self._grep_ripgrep),
+                ("system grep", self._grep_system_grep),
+                ("python native", self._grep_python_native),
+            ):
+                try:
+                    result = await engine(*args)
+                    break
+                except Exception as e:
+                    errors[engine_name] = e
+            else:
+                raise ValueError(
+                    f"No grep implementation found for mode: {self._mode}. " + "; ".join(f"{k} error: {v}" for k, v in errors.items())
+                )
 
-            try:
-                return await self._grep_system_grep(*args)
-            except Exception as e:
-                e2 = e
-
-            try:
-                return await self._grep_python_native(*args)
-            except Exception as e:
-                e3 = e
-
-            raise ValueError(
-                f"No grep implementation found for mode: {self._mode}. \nRipgrep error: {e1}\nSystem grep error: {e2}\nPython native error: {e3}"
+        if auto_promoted_from is not None:
+            note = (
+                f"[Note: path is a single file, so output_mode was auto-promoted "
+                f"from '{auto_promoted_from}' to 'content'. In 'files_with_matches' "
+                f"mode a single-file search returns only the bare path, which is "
+                f"easily misread as an empty result. Pass output_mode explicitly "
+                f"(e.g. 'count' or 'files_with_matches') to override.]\n"
             )
+            result = note + result
+
+        return result
 
     async def _grep_python_native(
         self,

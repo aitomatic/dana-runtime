@@ -85,6 +85,29 @@ class ProviderError(LLMError):
     pass
 
 
+class PromptTooLongError(ProviderError):
+    """Raised when a provider signals the prompt exceeds its context window.
+
+    Providers map their native token-limit error to this type (Anthropic
+    `BadRequestError` with "prompt is too long"; OpenAI-compat
+    `APIStatusError` with `error.code='context_length_exceeded'`). Stays
+    OUT of LLMCaller `_TRANSIENT_KEYWORDS` so failover never retries it —
+    the caller-layer catches, calls `timeline.reactive_compact`, and retries.
+    """
+
+    pass
+
+
+class CompactCircuitOpenError(LLMError):
+    """Raised when `reactive_compact` exhausts its retry budget.
+
+    Marks a session's compaction subsystem as temporarily disabled;
+    recovery via time-based cooldown + half-open probe.
+    """
+
+    pass
+
+
 class LLMTimeoutError(ProviderError):
     """Exception raised when an LLM API call times out.
 
@@ -132,6 +155,14 @@ class LLMMessage:
     cache_control: dict | None = None  # For Anthropic prompt caching
     tool_calls: list | None = None  # For assistant messages with native tool calls
     tool_call_id: str | None = None  # For tool result messages (role="tool")
+    # Carriers for cross-turn reasoning-state replay (Responses API only).
+    # Populated when an assistant message originates from an AGENT_THOUGHTS entry
+    # whose metadata holds raw reasoning items. The provider checks fingerprint
+    # against its own at call-time and, when matched + replay enabled, splices
+    # raw items into the Responses API input[] in place of flattened text.
+    reasoning_items: list[dict] | None = None
+    reasoning_fingerprint: str | None = None
+    response_id: str | None = None
 
 
 @dataclass
@@ -177,8 +208,17 @@ class LLMResponse:
     usage: dict[str, int] | None = None
     finish_reason: str | None = None
     tool_calls: list | None = None  # For function calling support
-    reasoning_content: str | None = None  # From providers that expose thinking (DeepSeek, future Claude extended)
+    reasoning_content: str | None = None  # Summary text (DeepSeek, OpenAI Responses API summary deltas)
     reasoning_tokens: int | None = None  # Token count from OpenAI thinking models
+    # Raw reasoning items as returned by the OpenAI Responses API output[]. Each
+    # item is a JSON-serializable dict with at least {"type":"reasoning","id":...,
+    # "summary":[...]} and optionally "encrypted_content" (only set when account
+    # has trusted access). Persisted in TimelineEntry.metadata for cross-turn
+    # replay so gpt-5+ retains reasoning state across the conversation.
+    reasoning_items: list[dict] | None = None
+    # Server-side response ID, useful as a future fallback to previous_response_id
+    # mode and for debugging/audit. Only populated by Responses API path.
+    response_id: str | None = None
 
 
 @dataclass

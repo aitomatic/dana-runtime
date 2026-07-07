@@ -212,3 +212,63 @@ def test_execute_tools_parallel_uses_multiple_threads():
     assert len(results) == 4
     # At least one unique thread ID should appear (concurrent execution possible)
     assert len(observed_threads) == 4
+
+
+# ---------------------------------------------------------------------------
+# Test 7: Batch isolation — one failing call must not poison the batch
+# ---------------------------------------------------------------------------
+
+
+def _make_poison_registry() -> dict:
+    """Registry where good_* tools succeed and bad_tool raises during dispatch.
+
+    bad_tool maps to a bare object() with no such method, so `getattr` raises
+    AttributeError before the call is made — a dispatch-phase failure.
+    """
+    registry = _make_simple_registry(["good_a", "good_b"], ["ra", "rb"])
+    registry["bad_tool"] = (object(), "missing_method")
+    return registry
+
+
+@pytest.mark.asyncio
+async def test_execute_tools_async_isolates_failing_call():
+    """A dispatch-phase exception in one call must not abort the gather batch.
+
+    Every tool_call_id must still get a result — an unanswered tool call makes
+    the next OpenAI turn 400.
+    """
+    executor = _make_executor_with_registry(_make_poison_registry())
+    agent = MagicMock()
+
+    calls = [
+        _make_tool_call("good_a", tool_call_id="id-1"),
+        _make_tool_call("bad_tool", tool_call_id="id-2"),
+        _make_tool_call("good_b", tool_call_id="id-3"),
+    ]
+    results = await executor.execute_tools_async(agent, calls)
+
+    assert len(results) == 3
+    assert results[0]["success"] is True
+    assert results[1]["success"] is False  # failure isolated to the bad call
+    assert results[2]["success"] is True
+    assert [r["tool_call_id"] for r in results] == ["id-1", "id-2", "id-3"]
+
+
+def test_execute_tools_sync_isolates_failing_call():
+    """Sync sequential loop: a dispatch-phase exception in one call must not
+    abort the loop — every call still yields a result with its tool_call_id."""
+    executor = _make_executor_with_registry(_make_poison_registry())
+    agent = MagicMock()
+
+    calls = [
+        _make_tool_call("good_a", tool_call_id="id-1"),
+        _make_tool_call("bad_tool", tool_call_id="id-2"),
+        _make_tool_call("good_b", tool_call_id="id-3"),
+    ]
+    results = executor.execute_tools(agent, calls)
+
+    assert len(results) == 3
+    assert results[0]["success"] is True
+    assert results[1]["success"] is False
+    assert results[2]["success"] is True
+    assert [r["tool_call_id"] for r in results] == ["id-1", "id-2", "id-3"]

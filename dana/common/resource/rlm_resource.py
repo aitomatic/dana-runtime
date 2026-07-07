@@ -132,6 +132,7 @@ class RLMResource(BaseResource):
         file: str = "context.md",
         llm_provider: str = "anthropic",
         llm_model: str = "claude-sonnet-4-20250514",
+        llm: LLM | None = None,
         **kwargs,
     ):
         """
@@ -141,6 +142,7 @@ class RLMResource(BaseResource):
             file: Path to the context file (created if doesn't exist)
             llm_provider: LLM provider to use for queries
             llm_model: LLM model to use for queries
+            llm: Optional injected LLM instance (if provided, llm_provider and llm_model are ignored)
             **kwargs: Additional arguments passed to BaseResource
         """
         super().__init__(resource_type="rlm", **kwargs)
@@ -153,8 +155,13 @@ class RLMResource(BaseResource):
             self.file.parent.mkdir(parents=True, exist_ok=True)
             self.file.write_text("")
 
-        # Initialize LLM
-        self._llm = LLM(provider=llm_provider, model=llm_model)
+        # Initialize LLM: prefer an injected instance (e.g. a pre-built provider),
+        # otherwise build from provider name + model (legacy / env-keyed path).
+        self._llm = llm if llm is not None else LLM(provider=llm_provider, model=llm_model)
+
+    def set_llm(self, llm: LLM) -> None:
+        """Re-point this resource's sub-LLM (used for runtime provider injection)."""
+        self._llm = llm
 
     def _get_context(self) -> str:
         """Read the current context from file."""

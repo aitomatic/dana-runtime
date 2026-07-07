@@ -402,3 +402,70 @@ class TestLocalTimelineRepositoryRead:
             assert read_entries[1].content == "Response 1"
         finally:
             shutil.rmtree(temp_dir)
+
+
+class TestLocalTimelineRepositoryListSessions:
+    """Test list_sessions method added for repository-agnostic compression."""
+
+    def test_list_sessions_returns_empty_when_events_path_missing(self):
+        """No events_path created yet -> empty list (no exception)."""
+        temp_dir = tempfile.mkdtemp()
+        try:
+            config = FileStorageConfig(workspace_folder=temp_dir)
+            agent = MockAgent(storage_config=config)
+            repository = LocalTimelineRepository(config, agent)
+            # Do not save anything. _events_path should not exist yet.
+            assert not repository._events_path.exists()
+            assert repository.list_sessions() == []
+            assert repository.list_sessions(prefix="anything") == []
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_list_sessions_returns_single_session(self):
+        """One saved session -> list contains its ID."""
+        temp_dir = tempfile.mkdtemp()
+        try:
+            config = FileStorageConfig(workspace_folder=temp_dir)
+            agent = MockAgent(storage_config=config)
+            repository = LocalTimelineRepository(config, agent)
+
+            entry = TimelineEntry(
+                entry_type=TimelineEntryType.USER_MESSAGE,
+                content="Hello",
+                timestamp=datetime.now(),
+            )
+            repository.save("sess-1", [entry])
+
+            assert repository.list_sessions() == ["sess-1"]
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_list_sessions_filters_by_prefix_and_sorts(self):
+        """Multiple sessions, prefix filter returns only matches, sorted."""
+        temp_dir = tempfile.mkdtemp()
+        try:
+            config = FileStorageConfig(workspace_folder=temp_dir)
+            agent = MockAgent(storage_config=config)
+            repository = LocalTimelineRepository(config, agent)
+
+            entry = TimelineEntry(
+                entry_type=TimelineEntryType.USER_MESSAGE,
+                content="msg",
+                timestamp=datetime.now(),
+            )
+            # Intentionally out-of-order saves to verify sort.
+            for sid in ["base__compact__20260420T101500", "other-session", "base__compact__20260420T090000", "base"]:
+                repository.save(sid, [entry])
+
+            all_sessions = repository.list_sessions()
+            assert all_sessions == sorted(all_sessions)
+            assert "base" in all_sessions
+            assert "other-session" in all_sessions
+
+            compact_only = repository.list_sessions(prefix="base__compact__")
+            assert compact_only == [
+                "base__compact__20260420T090000",
+                "base__compact__20260420T101500",
+            ]
+        finally:
+            shutil.rmtree(temp_dir)

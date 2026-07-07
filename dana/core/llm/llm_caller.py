@@ -16,12 +16,14 @@ import structlog
 
 from dana.common.llm.llm import LLM
 from dana.common.llm.types import (
+    CompactCircuitOpenError,
     ConfigurationError,
     LLMError,
     LLMMessage,
     LLMResponse,
     LLMStreamChunk,
     LLMTimeoutError,
+    PromptTooLongError,
     ProviderError,
 )
 from dana.common.observable import observable
@@ -32,8 +34,53 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
-# Keywords that indicate a transient (retriable) provider error
-_TRANSIENT_KEYWORDS = ("rate limit", "timeout", "5xx", "503", "502", "429", "overloaded", "down", "unavailable", "unreachable")
+# Keywords that indicate a transient (retriable) provider error.
+# "connection" matches openai.APIConnectionError → wrapped as ProviderError("...: Connection error.").
+_TRANSIENT_KEYWORDS = (
+    "rate limit",
+    "timeout",
+    "5xx",
+    "503",
+    "502",
+    "429",
+    "overloaded",
+    "down",
+    "unavailable",
+    "unreachable",
+    "connection",
+)
+
+# OpenAI SDK exception class names that indicate transient network failures.
+# Checked via class-name match to avoid importing openai here (keeps llm_caller provider-agnostic).
+_TRANSIENT_OPENAI_EXC_NAMES = ("APIConnectionError", "APIConnectionTimeoutError")
+
+
+def is_transient_llm_error(exc: BaseException) -> bool:
+    """Module-level helper so other layers (e.g. STAR loop) can classify errors
+    using the same rules as :class:`LLMCaller`."""
+    return LLMCaller._is_transient_error(exc)
+
+
+def _resolve_timeline(agent: Any | None):
+    """Return the agent's timeline if it exposes `reactive_compact`, else None."""
+    if agent is None:
+        return None
+    tl = getattr(agent, "_timeline", None)
+    if tl is None or not hasattr(tl, "reactive_compact"):
+        return None
+    return tl
+
+
+def _reactive_enabled(timeline: Any) -> bool:
+    """Kill switch: env `DANA_DISABLE_REACTIVE_COMPACT=1` OR config flag False."""
+    import os
+
+    if os.getenv("DANA_DISABLE_REACTIVE_COMPACT") == "1":
+        return False
+    cfg = getattr(timeline, "_compressed_config", None)
+    if cfg is None:
+        return False
+    return bool(getattr(cfg, "enable_reactive_compact", True))
 
 
 @dataclass
@@ -117,18 +164,37 @@ class LLMCaller:
         self._llm = llm
 
     @observable
-    def call_llm(self, messages: list[LLMMessage]) -> LLMResponse:
-        """Synchronous LLM call. Returns an :class:`LLMResponse`."""
-        if self._fallback_providers:
-            return self._call_with_failover(messages)
-        return self._invoke_llm_sync(self._resolve_llm(), messages)
+    def call_llm(
+        self,
+        messages: list[LLMMessage],
+        messages_fn: Callable[[], list[LLMMessage]] | None = None,
+    ) -> LLMResponse:
+        """Synchronous LLM call with retry + exponential backoff.
+
+        Retry always runs for transient errors on the primary provider.
+        Failover only runs when ``fallback_providers`` is configured.
+
+        When ``messages_fn`` is provided, it is invoked to rebuild the message
+        list after each successful ``reactive_compact`` in the PTL retry loop,
+        so the retry observes the compacted timeline rather than a stale
+        snapshot. Non-PTL retries continue to use the original ``messages``.
+        """
+        return self._call_with_failover(messages, messages_fn)
 
     @observable
-    async def call_llm_async(self, messages: list[LLMMessage]) -> LLMResponse:
-        """Asynchronous LLM call. Returns an :class:`LLMResponse`."""
-        if self._fallback_providers:
-            return await self._call_with_failover_async(messages)
-        return await self._invoke_llm_async(self._resolve_llm(), messages)
+    async def call_llm_async(
+        self,
+        messages: list[LLMMessage],
+        messages_fn: Callable[[], list[LLMMessage]] | None = None,
+    ) -> LLMResponse:
+        """Asynchronous LLM call with retry + exponential backoff.
+
+        Retry always runs for transient errors on the primary provider.
+        Failover only runs when ``fallback_providers`` is configured.
+
+        See :meth:`call_llm` for ``messages_fn`` semantics.
+        """
+        return await self._call_with_failover_async(messages, messages_fn)
 
     async def call_llm_stream(self, messages: list[LLMMessage]) -> AsyncIterator[LLMStreamChunk]:
         """Stream LLM response, yielding typed LLMStreamChunk objects.
@@ -153,8 +219,12 @@ class LLMCaller:
     # Failover logic
     # ------------------------------------------------------------------
 
-    def _call_with_failover(self, messages: list[LLMMessage]) -> LLMResponse:
-        """Sync call with retry + exponential backoff + provider failover."""
+    def _call_with_failover(
+        self,
+        messages: list[LLMMessage],
+        messages_fn: Callable[[], list[LLMMessage]] | None = None,
+    ) -> LLMResponse:
+        """Sync call with retry + exponential backoff + optional provider failover."""
         providers: list[ProviderConfig | None] = [None, *(self._fallback_providers or [])]
         last_exc: Exception | None = None
 
@@ -164,22 +234,42 @@ class LLMCaller:
 
             for attempt in range(self._max_retries + 1):
                 try:
-                    return self._invoke_llm_sync(llm, messages)
+                    return self._invoke_llm_sync(llm, messages, messages_fn)
                 except Exception as exc:
                     if not self._is_transient_error(exc):
                         raise
                     last_exc = exc
                     if attempt < self._max_retries:
                         delay = self._base_delay * (2**attempt)
-                        logger.warning("llm_retry", provider=provider_label, attempt=attempt + 1, delay=delay, error=str(exc))
+                        logger.warning(
+                            "llm_retry",
+                            provider=provider_label,
+                            attempt=attempt + 1,
+                            max_attempts=self._max_retries + 1,
+                            delay=delay,
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                        )
                         time.sleep(delay)
+                    elif self._fallback_providers:
+                        logger.warning("llm_failover", from_provider=provider_label, error_type=type(exc).__name__, error=str(exc))
                     else:
-                        logger.warning("llm_failover", from_provider=provider_label, error=str(exc))
+                        logger.error(
+                            "llm_retries_exhausted",
+                            provider=provider_label,
+                            attempts=self._max_retries + 1,
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                        )
 
         raise last_exc  # type: ignore[misc]
 
-    async def _call_with_failover_async(self, messages: list[LLMMessage]) -> LLMResponse:
-        """Async call with retry + exponential backoff + provider failover."""
+    async def _call_with_failover_async(
+        self,
+        messages: list[LLMMessage],
+        messages_fn: Callable[[], list[LLMMessage]] | None = None,
+    ) -> LLMResponse:
+        """Async call with retry + exponential backoff + optional provider failover."""
         import asyncio
 
         providers: list[ProviderConfig | None] = [None, *(self._fallback_providers or [])]
@@ -191,17 +281,33 @@ class LLMCaller:
 
             for attempt in range(self._max_retries + 1):
                 try:
-                    return await self._invoke_llm_async(llm, messages)
+                    return await self._invoke_llm_async(llm, messages, messages_fn)
                 except Exception as exc:
                     if not self._is_transient_error(exc):
                         raise
                     last_exc = exc
                     if attempt < self._max_retries:
                         delay = self._base_delay * (2**attempt)
-                        logger.warning("llm_retry", provider=provider_label, attempt=attempt + 1, delay=delay, error=str(exc))
+                        logger.warning(
+                            "llm_retry",
+                            provider=provider_label,
+                            attempt=attempt + 1,
+                            max_attempts=self._max_retries + 1,
+                            delay=delay,
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                        )
                         await asyncio.sleep(delay)
+                    elif self._fallback_providers:
+                        logger.warning("llm_failover", from_provider=provider_label, error_type=type(exc).__name__, error=str(exc))
                     else:
-                        logger.warning("llm_failover", from_provider=provider_label, error=str(exc))
+                        logger.error(
+                            "llm_retries_exhausted",
+                            provider=provider_label,
+                            attempts=self._max_retries + 1,
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                        )
 
         raise last_exc  # type: ignore[misc]
 
@@ -209,36 +315,159 @@ class LLMCaller:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _invoke_llm_sync(self, llm: LLM, messages: list[LLMMessage]) -> LLMResponse:
-        """Execute a single synchronous LLM chat call."""
-        agent = self._agent_getter()
-        tools = self._native_tools_getter() or None
-        return llm.chat_response_sync(
-            messages,
-            agent_id=agent.object_id if agent else None,
-            agent_type=agent.agent_type if agent else None,
-            temperature=self._temperature,
-            max_tokens=self._max_tokens,
-            tools=tools,
-            json_mode=self._json_mode,
-        )
+    def _invoke_llm_sync(
+        self,
+        llm: LLM,
+        messages: list[LLMMessage],
+        messages_fn: Callable[[], list[LLMMessage]] | None = None,
+    ) -> LLMResponse:
+        """Execute a single synchronous LLM chat call with PTL reactive retry.
 
-    async def _invoke_llm_async(self, llm: LLM, messages: list[LLMMessage]) -> LLMResponse:
-        """Execute a single asynchronous LLM chat call."""
+        On `PromptTooLongError`, calls `timeline.reactive_compact(attempt)` and
+        retries up to 3 times with exponential backoff (1s, 3s). After each
+        successful `reactive_compact`, if ``messages_fn`` was provided, the
+        message list is rebuilt from it so the retry observes the compacted
+        timeline (CRITICAL-1 fix — without this, retries send the same
+        oversized payload and the circuit opens on recoverable sessions).
+        After 3 failures, `CompactCircuitOpenError` is raised. Kill switch via
+        `DANA_DISABLE_REACTIVE_COMPACT=1` or `timeline.config.enable_reactive_compact=False`.
+        """
         agent = self._agent_getter()
         tools = self._native_tools_getter() or None
-        return await llm.chat_response(
-            messages,
-            agent_id=agent.object_id if agent else None,
-            agent_type=agent.agent_type if agent else None,
-            temperature=self._temperature,
-            max_tokens=self._max_tokens,
-            tools=tools,
-            json_mode=self._json_mode,
-        )
+
+        def _do_call(msgs: list[LLMMessage]) -> LLMResponse:
+            return llm.chat_response_sync(
+                msgs,
+                agent_id=agent.object_id if agent else None,
+                agent_type=agent.agent_type if agent else None,
+                temperature=self._temperature,
+                max_tokens=self._max_tokens,
+                tools=tools,
+                json_mode=self._json_mode,
+            )
+
+        timeline = _resolve_timeline(agent)
+        if timeline is None or not _reactive_enabled(timeline):
+            return _do_call(messages)
+
+        backoff = {1: 1.0, 2: 3.0}
+        last_exc: PromptTooLongError | None = None
+        current_messages = messages
+        for attempt in range(1, 4):
+            try:
+                return _do_call(current_messages)
+            except PromptTooLongError as e:
+                last_exc = e
+                logger.warning(
+                    "prompt_too_long_reactive_compact",
+                    attempt=attempt,
+                    error=str(e),
+                )
+                try:
+                    timeline.reactive_compact(attempt)
+                except CompactCircuitOpenError:
+                    raise
+                current_messages = self._rebuild_messages_after_compact(current_messages, messages_fn, attempt)
+                if attempt < 3:
+                    time.sleep(backoff.get(attempt, 0))
+        # All 3 attempts exhausted — open circuit and surface.
+        timeline._consecutive_compact_failures = max(timeline._consecutive_compact_failures, 3)
+        timeline._compaction_disabled = True
+        from datetime import datetime as _dt
+
+        timeline._circuit_opened_at = _dt.now()
+        raise CompactCircuitOpenError(f"PTL retry exhausted after 3 attempts; last: {last_exc}") from last_exc
+
+    async def _invoke_llm_async(
+        self,
+        llm: LLM,
+        messages: list[LLMMessage],
+        messages_fn: Callable[[], list[LLMMessage]] | None = None,
+    ) -> LLMResponse:
+        """Async version of `_invoke_llm_sync` with PTL reactive retry.
+
+        See :meth:`_invoke_llm_sync` for the ``messages_fn`` rebuild semantics
+        (CRITICAL-1 fix).
+        """
+        import asyncio
+
+        agent = self._agent_getter()
+        tools = self._native_tools_getter() or None
+
+        async def _do_call(msgs: list[LLMMessage]) -> LLMResponse:
+            return await llm.chat_response(
+                msgs,
+                agent_id=agent.object_id if agent else None,
+                agent_type=agent.agent_type if agent else None,
+                temperature=self._temperature,
+                max_tokens=self._max_tokens,
+                tools=tools,
+                json_mode=self._json_mode,
+            )
+
+        timeline = _resolve_timeline(agent)
+        if timeline is None or not _reactive_enabled(timeline):
+            return await _do_call(messages)
+
+        backoff = {1: 1.0, 2: 3.0}
+        last_exc: PromptTooLongError | None = None
+        current_messages = messages
+        for attempt in range(1, 4):
+            try:
+                return await _do_call(current_messages)
+            except PromptTooLongError as e:
+                last_exc = e
+                logger.warning(
+                    "prompt_too_long_reactive_compact",
+                    attempt=attempt,
+                    error=str(e),
+                )
+                try:
+                    timeline.reactive_compact(attempt)
+                except CompactCircuitOpenError:
+                    raise
+                current_messages = self._rebuild_messages_after_compact(current_messages, messages_fn, attempt)
+                if attempt < 3:
+                    await asyncio.sleep(backoff.get(attempt, 0))
+        timeline._consecutive_compact_failures = max(timeline._consecutive_compact_failures, 3)
+        timeline._compaction_disabled = True
+        from datetime import datetime as _dt
+
+        timeline._circuit_opened_at = _dt.now()
+        raise CompactCircuitOpenError(f"PTL retry exhausted after 3 attempts; last: {last_exc}") from last_exc
 
     @staticmethod
-    def _is_transient_error(exc: Exception) -> bool:
+    def _rebuild_messages_after_compact(
+        current: list[LLMMessage],
+        messages_fn: Callable[[], list[LLMMessage]] | None,
+        attempt: int,
+    ) -> list[LLMMessage]:
+        """Re-invoke ``messages_fn`` after a successful ``reactive_compact`` so
+        the next retry sends the compacted payload. Falls back to ``current``
+        on failure or when no factory was provided.
+        """
+        if messages_fn is None:
+            return current
+        try:
+            rebuilt = messages_fn()
+            logger.info(
+                "ptl_messages_rebuilt",
+                attempt=attempt,
+                old_count=len(current),
+                new_count=len(rebuilt),
+            )
+            return rebuilt
+        except Exception as exc:
+            logger.warning(
+                "ptl_messages_fn_raised_keeping_stale",
+                attempt=attempt,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return current
+
+    @staticmethod
+    def _is_transient_error(exc: BaseException) -> bool:
         """Return True if the error is transient and should trigger a retry."""
         if isinstance(exc, ConfigurationError):
             return False
@@ -247,6 +476,15 @@ class LLMCaller:
             return True
         if isinstance(exc, TimeoutError | ConnectionError):
             return True
+        # Walk the __cause__ chain to detect openai.APIConnectionError without
+        # importing openai here (the SDK exception is preserved via `raise ... from e`).
+        cur: BaseException | None = exc
+        for _ in range(5):
+            if cur is None:
+                break
+            if type(cur).__name__ in _TRANSIENT_OPENAI_EXC_NAMES:
+                return True
+            cur = cur.__cause__
         if isinstance(exc, ProviderError):
             msg = str(exc).lower()
             return any(kw in msg for kw in _TRANSIENT_KEYWORDS)

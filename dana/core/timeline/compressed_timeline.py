@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from structlog import get_logger
 
 from dana.common.llm.types import LLMMessage
+from dana.core.timeline.compact_trigger import resolve_trigger_tokens
 from dana.core.timeline.compression_engine import CompressionMixin
 from dana.core.timeline.native_message import (
     COMPRESSED_CONTEXT_KEY,
@@ -80,6 +81,16 @@ class CompressedTimelineConfig(TimelineConfig):
     # Set to 0 or None to use the default calculation
     cutoff_when_token_reach: int | None = None
 
+    # Phase 2 (P6) — cheap shrink: stub old tool_result content before full
+    # summary. Off by default (opt-in).
+    enable_cheap_shrink_tool_results: bool = False
+
+    # Number of most-recent entries to exclude from shrink eligibility.
+    cheap_shrink_keep_recent: int = 10
+
+    # Phase 3 (P2) — reactive compaction kill switch.
+    enable_reactive_compact: bool = True
+
     def __post_init__(self) -> None:
         """Calculate default cutoff if not specified."""
         if self.cutoff_when_token_reach is None or self.cutoff_when_token_reach == 0:
@@ -113,7 +124,7 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
 
     def __init__(
         self,
-        max_tokens_until_compression: int = 80000,
+        max_tokens_until_compression: int | None = None,
         max_recent_entries_to_keep: int = 20,
         cutoff_when_token_reach: int | None = None,
         agent: BaseAgent | None = None,
@@ -121,37 +132,72 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
         llm_call_fn: Callable[[str], str] | None = None,
         llm_call_async_fn: Callable[[str], Any] | None = None,
         compression_enabled: bool = True,
+        system_tokens_fn: Callable[[], int] | None = None,
+        tools_tokens_fn: Callable[[], int] | None = None,
+        max_context_tokens: int | None = None,
     ):
         """
         Initialize the CompressedTimeline.
 
+        Two independent knobs:
+        - ``max_tokens_until_compression`` — the compression TRIGGER. When the
+          estimated token count (messages + system + tools) crosses this, the
+          next ``needs_compression()`` returns True. If None, resolves from the
+          ``DANA_COMPACT_TRIGGER_TOKENS`` env var (default 150k).
+        - ``max_context_tokens`` — the LLM context-window BUDGET used by
+          ``to_llm_messages()`` for sliding-window token limiting. Independent
+          from the trigger. If None, falls back to the resolved trigger (backward
+          compat with the pre-split behavior where they were the same number).
+
         Args:
-            max_tokens_until_compression: Maximum tokens before compression triggers
+            max_tokens_until_compression: Compression trigger threshold. None →
+                env (DANA_COMPACT_TRIGGER_TOKENS) or default.
             max_recent_entries_to_keep: Maximum number of recent entries to preserve
-            cutoff_when_token_reach: Token cutoff for recent entries (default 30% of max)
+            cutoff_when_token_reach: Token cutoff for recent entries (default 30% of trigger)
             agent: Agent instance (can be None, for backward compatibility)
             repository_factory: Repository factory to create the repository
             llm_call_fn: Synchronous function to call LLM for compression
             llm_call_async_fn: Async function to call LLM for compression
             compression_enabled: Whether compression is enabled (default True).
                 Set to False to disable compression and behave like plain Timeline.
+            system_tokens_fn: Optional callback returning system-prompt token estimate.
+            tools_tokens_fn: Optional callback returning tools-schema token estimate.
+            max_context_tokens: LLM context-window budget for ``to_llm_messages()``.
+                None → falls back to the resolved trigger.
         """
-        # Calculate cutoff if not specified
-        if cutoff_when_token_reach is None or cutoff_when_token_reach == 0:
-            cutoff_when_token_reach = int(0.3 * max_tokens_until_compression)
+        # Resolve trigger: explicit value wins, else env-resolved.
+        # _explicit flag preserved so needs_compression() can re-check env at
+        # resolve time when the caller deferred.
+        explicit_trigger = max_tokens_until_compression
+        effective_trigger = explicit_trigger if explicit_trigger is not None else resolve_trigger_tokens()
 
-        # Create config
+        # Resolve context-window budget independently. If unspecified, fall back
+        # to the trigger to preserve the legacy "one knob does both" behavior
+        # for callers that haven't been updated yet.
+        effective_context_tokens = max_context_tokens if max_context_tokens is not None else effective_trigger
+
+        # Calculate cutoff if not specified (tied to trigger, not budget —
+        # that's the legitimate coupling).
+        if cutoff_when_token_reach is None or cutoff_when_token_reach == 0:
+            cutoff_when_token_reach = int(0.3 * effective_trigger)
+
+        # Create config — context budget and trigger are now stored separately.
         self._compressed_config = CompressedTimelineConfig(
-            max_context_tokens=max_tokens_until_compression,
-            max_tokens_until_compression=max_tokens_until_compression,
+            max_context_tokens=effective_context_tokens,
+            max_tokens_until_compression=effective_trigger,
             max_recent_entries_to_keep=max_recent_entries_to_keep,
             cutoff_when_token_reach=cutoff_when_token_reach,
             compression_enabled=compression_enabled,
         )
 
-        # Initialize parent
+        # Track whether threshold was explicitly set so needs_compression()
+        # can prefer env at resolve time when caller deferred.
+        self._explicit_max_tokens_until_compression: int | None = explicit_trigger
+
+        # Initialize parent — pass the context budget (not the trigger) so
+        # to_llm_messages() sliding-window limits use the right number.
         super().__init__(
-            max_context_tokens=max_tokens_until_compression,
+            max_context_tokens=effective_context_tokens,
             agent=agent,
             repository_factory=repository_factory,
             config=self._compressed_config,
@@ -161,8 +207,36 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
         self._llm_call_fn = llm_call_fn
         self._llm_call_async_fn = llm_call_async_fn
 
+        # Optional token-count callbacks folded into needs_compression() estimate.
+        self._system_tokens_fn = system_tokens_fn
+        self._tools_tokens_fn = tools_tokens_fn
+
         # Internal storage for native message format
         self._native_messages: list[NativeMessage] = []
+
+        # Phase 2/3 — all mutators of compression state acquire this lock. A
+        # threading lock mirrors for sync paths that run off-loop.
+        import asyncio
+        import threading
+
+        self._compact_lock: asyncio.Lock = asyncio.Lock()
+        self._compact_sync_lock: threading.Lock = threading.Lock()
+
+        # Phase 3 — circuit breaker state.
+        self._consecutive_compact_failures: int = 0
+        self._compaction_disabled: bool = False
+        self._circuit_opened_at: datetime | None = None
+
+        # Compact-session persistence (repo-agnostic, post-GH-1):
+        # `_last_compression_at` is stamped by ``_apply_compression``. On the next
+        # ``save()``, the serializer detects a new compression event and mints a
+        # fresh logical session id of the form ``{base}__compact__{ISO-ts}`` which
+        # then receives all writes until the next compaction. Pre-compaction writes
+        # go to the caller-supplied base session id. Full audit retention — old
+        # compact sessions are never deleted.
+        self._last_compression_at: datetime | None = None
+        self._active_compact_session_id: str | None = None
+        self._active_compact_compression_at: datetime | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -182,6 +256,21 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
     def cutoff_when_token_reach(self) -> int:
         """Get token cutoff for recent entries."""
         return self._compressed_config.cutoff_when_token_reach or int(0.3 * self._compressed_config.max_tokens_until_compression)
+
+    # ------------------------------------------------------------------
+    # Token-count callback helper (used by needs_compression)
+    # ------------------------------------------------------------------
+
+    def _safe_call_tokens_fn(self, fn: Callable[[], int] | None) -> int:
+        """Invoke a tokens callback safely. Returns 0 on None / raise / invalid."""
+        if fn is None:
+            return 0
+        try:
+            v = fn()
+            return int(v) if v is not None and v >= 0 else 0
+        except Exception:
+            logger.debug("tokens callback raised; treating as 0", exc_info=True)
+            return 0
 
     # ------------------------------------------------------------------
     # LLM call function setters
@@ -234,10 +323,12 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
 
         Mapping rules:
         - USER_MESSAGE -> role='user'
-        - AGENT_RESPONSE, AGENT_THOUGHTS, AGENT_LEARNING, SUB_AGENT_RESPONSE, TODO_LIST
-          -> role='assistant'
+        - AGENT_RESPONSE, AGENT_THOUGHTS, AGENT_LEARNING, TODO_LIST -> role='assistant'
         - TOOL_CALL -> role='assistant' with tool_calls
         - RESOURCE_RESULT, WORKFLOW_RESULT -> role='tool' with tool_call_id
+        - SUB_AGENT_RESPONSE w/ tool_call_id -> role='tool' (sub-agent invoked as native tool)
+        - SUB_AGENT_RESPONSE w/o tool_call_id -> role='assistant' (legacy XML flow)
+        - UNKNOWN_TOOL_CALL / FAILED_TOOL_CALL w/ tool_call_id -> role='tool'
         - TIMELINE_SUMMARY, CONTEXT -> role='system'
         - Other -> role='assistant' (default)
 
@@ -327,17 +418,22 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
             in (
                 TimelineEntryType.UNKNOWN_TOOL_CALL.value,
                 TimelineEntryType.FAILED_TOOL_CALL.value,
+                TimelineEntryType.SUB_AGENT_RESPONSE.value,
             )
             and entry.tool_call_id
         ):
-            # Tool execution errors with a tool_call_id must be role="tool"
+            # Tool execution results / errors with a tool_call_id must be role="tool"
             # so the LLM API can match them to their corresponding tool_calls.
             # Without this, the API rejects with "tool_call_ids did not have response messages".
+            # SUB_AGENT_RESPONSE is produced by `_record_tool_results` for tool_type="agent"
+            # the same way RESOURCE_RESULT/WORKFLOW_RESULT are produced for resources/workflows,
+            # so it must be normalized to the same role when a tool_call_id is present.
             role = "tool"
             tool_call_id = entry.tool_call_id
         else:
-            # Default: AGENT_RESPONSE, AGENT_THOUGHTS, AGENT_LEARNING, SUB_AGENT_RESPONSE,
-            # TODO_LIST, UNKNOWN_TOOL_CALL (without tool_call_id), FAILED_TOOL_CALL (without tool_call_id)
+            # Default: AGENT_RESPONSE, AGENT_THOUGHTS, AGENT_LEARNING, TODO_LIST,
+            # SUB_AGENT_RESPONSE (without tool_call_id — legacy XML flow),
+            # UNKNOWN_TOOL_CALL/FAILED_TOOL_CALL (without tool_call_id)
             role = "assistant"
 
         return NativeMessage(

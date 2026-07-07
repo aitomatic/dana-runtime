@@ -16,6 +16,7 @@ import structlog
 
 from dana.common.config import config_manager
 from dana.common.llm import LLM
+from dana.common.llm.types import LLMMessage, LLMProvider
 from dana.common.observable import observable
 from dana.common.protocols import AgentProtocol, DictParams, Notifiable, ResourceProtocol, WorkflowProtocol
 from dana.common.protocols.types import LearningPhase
@@ -50,6 +51,7 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         agent_id: str | None = None,
         llm_provider: str | None = None,
         model: str | None = None,
+        llm_provider_instance: LLMProvider | None = None,
         config: dict[str, Any] | None = None,
         max_context_tokens: int = 4000,
         auto_register: bool = True,
@@ -68,6 +70,7 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         enable_assistant: bool = True,
         identity_override: str | None = None,
         compress_timeline: bool = True,
+        compress_trigger_tokens: int | None = None,
         **kwargs,
     ):
         """
@@ -110,15 +113,30 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         }
         super().__init__(**kwargs)
 
-        # Determine effective LLM provider: explicit > first available > anthropic fallback
-        if llm_provider is None:
-            llm_provider = config_manager.get_first_available_provider() or "anthropic"
+        # Normalize an injected provider instance to a single LLM, built once.
+        # Instance wins: when present, the llm_provider/model strings are ignored
+        # (the instance binds its own client + model).
+        #
+        # NOTE: this inline build mirrors _apply_llm_provider (the canonical post-init
+        # re-point path). Keep the two in sync — provider-name/model derivation and the
+        # _llm_client/_llm_config writes must match.
+        if llm_provider_instance is not None:
+            if llm_provider is not None or model is not None:
+                logger.debug("llm_provider_instance set; ignoring llm_provider/model args")
+            injected_llm = LLM(provider=llm_provider_instance)
+            provider_name = getattr(llm_provider_instance, "name", None) or "custom"
+            effective_model = getattr(llm_provider_instance, "model", None)
+        else:
+            injected_llm = None
+            provider_name = llm_provider or config_manager.get_first_available_provider() or "anthropic"
+            effective_model = model
 
-        # Initialize LLM (lazy - only created when first accessed)
-        self._llm_client = None  # Explicit init to avoid __getattr__ interception
+        # llm_client: eager when injected (provider carries its own client, no env
+        # needed), otherwise None so the lazy `llm_client` property builds it later.
+        self._llm_client = injected_llm
         self._llm_config = {
-            "provider": llm_provider,
-            "model": model,
+            "provider": provider_name,
+            "model": effective_model,
         }
 
         self._session_id = str(uuid4())
@@ -130,13 +148,17 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             from dana.core.runtime import RuntimeRegistry
 
             runtime = RuntimeRegistry.select_codec_runtime(
-                provider=llm_provider,
-                model=model,
+                provider=provider_name,
+                model=effective_model,
                 codec=codec,
                 use_native_tools=None,
             )
 
         self._runtime = runtime
+        # Sink 2: push the injected LLM into the runtime's LLMCaller so the actual
+        # call site uses it (set_llm sets LLMCaller._resolve_llm priority #1).
+        if injected_llm is not None:
+            self._runtime.set_llm(injected_llm)
 
         # Initialize other components
         self._communicator = Communicator(self)
@@ -152,22 +174,32 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
 
             self._ltmemory = LTMemory(
                 path=ltmemory_path,
-                llm_provider=llm_provider,
-                llm_model=model or config_manager.get_provider_default_model(llm_provider),
+                llm_provider=provider_name,
+                llm_model=effective_model or config_manager.get_provider_default_model(provider_name),
+                llm=injected_llm,  # Sink 3: injected provider drives RLM summarization
             )
         else:
             self._ltmemory = None
 
         # Determine storage_config for timeline and event_log
 
-        # Initialize timeline: use CompressedTimeline by default unless explicitly injected
-        # compress_timeline=False disables LLM-based compression (behaves like plain Timeline)
-        self._timeline = CompressedTimeline(
-            max_tokens_until_compression=max_context_tokens,
-            agent=self,
-            repository_factory=self._repository_factory,
-            compression_enabled=compress_timeline,
-        )
+        # Initialize timeline: use CompressedTimeline by default unless explicitly injected.
+        # compress_timeline=False disables LLM-based compression (behaves like plain Timeline).
+        # system/tools callbacks fold system-prompt + tools-schema size into needs_compression()
+        # estimate. Both use the existing len(str)//4 heuristic.
+        #
+        # Two independent knobs are threaded here:
+        #   - max_context_tokens → LLM context-window BUDGET for to_llm_messages()
+        #   - compress_trigger_tokens → compression TRIGGER (None → DANA_COMPACT_TRIGGER_TOKENS
+        #     env var wins, so ops can retune without code changes).
+        # Historically these were aliased to the same value; the split lets ops set
+        # the trigger via env while agent authors still pick an appropriate context budget.
+        # Persisted so set_session_id can rebuild an identically-configured
+        # timeline when the session boundary changes (see _build_timeline).
+        self._max_context_tokens = max_context_tokens
+        self._compress_trigger_tokens = compress_trigger_tokens
+        self._compression_enabled = compress_timeline
+        self._timeline = self._build_timeline()
 
         # Initialize EventLog API (only if observer AND codec provided)
         # Events ONLY come from Observer - no observer = no EventLog
@@ -182,6 +214,19 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         else:
             # No observer or codec = no EventLog (events only come from Observer)
             self._event_log = None
+
+        # CRITICAL-2 companion — auto-wire a resource that lets the LLM read
+        # back tool_results that were dumped to disk at ingest time. Opt out
+        # via env (used in tests that don't need a filesystem repository).
+        import os as _os
+
+        if _os.getenv("DANA_DISABLE_TOOL_RESULT_DUMP_RESOURCE") != "1":
+            try:
+                from dana.core.resource.tool_result_dump_resource import ToolResultDumpResource
+
+                self.with_resources(ToolResultDumpResource(agent=self, auto_register=False))
+            except Exception as _e:  # pragma: no cover — don't block agent boot on resource wiring
+                logger.warning("tool_result_dump_resource_wire_failed", error=str(_e))
 
         if enable_web_search:
             try:
@@ -221,9 +266,107 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         self._reminder_manager = ReminderManager()
         self._star_loop_count = 0  # Tracks iterations within current query
 
-    def set_session_id(self, session_id: str) -> None:
-        """Set the session id for the agent."""
+    def _build_timeline(self) -> CompressedTimeline:
+        """Construct a fresh, fully-configured CompressedTimeline.
+
+        Single source of truth for timeline construction — used by ``__init__``
+        and by ``set_session_id``. Building a new instance (rather than mutating
+        the existing one) resets ALL session-scoped state, including the
+        compaction-tracking fields (``_last_compression_at``,
+        ``_active_compact_session_id``, ``_active_compact_compression_at``) that
+        a bare ``rehydrate()`` would otherwise leak across sessions.
+        """
+        return CompressedTimeline(
+            max_context_tokens=self._max_context_tokens,
+            max_tokens_until_compression=self._compress_trigger_tokens,
+            agent=self,
+            repository_factory=self._repository_factory,
+            compression_enabled=self._compression_enabled,
+            system_tokens_fn=self._estimate_system_prompt_tokens,
+            tools_tokens_fn=self._estimate_tools_tokens,
+        )
+
+    def set_session_id(self, session_id: str, reload_timeline: bool = False) -> None:
+        """Switch the agent to a different session.
+
+        With ``reload_timeline=False`` (default) the call is a pure relabel:
+        the current in-memory timeline is kept and carried into the new session
+        id (it is persisted under the new id on the next ``save``). This is the
+        default because most callers — including subclasses that seed their own
+        timeline before the STAR loop — manage their own context.
+
+        With ``reload_timeline=True`` ``session_id`` becomes a real context
+        boundary:
+          1. Flushes the outgoing session's timeline to disk (no data loss).
+          2. Rebuilds the timeline from scratch — resets entries AND all
+             compaction-tracking state.
+          3. Rehydrates from the new session's persisted entries (compaction-
+             snapshot aware). An unknown session id yields an empty timeline.
+
+        This is the internal primitive; ``reload_timeline`` is not exposed on the
+        query methods. Prefer the public ``resume(session_id)`` wrapper for the
+        reload path (``TaskResource`` calls it per sub-agent spawn). Note:
+        skipping the rehydrate alone is not enough — the rebuild in step 2 would
+        still discard the caller's timeline — so the flag gates the whole reload.
+
+        Re-setting the current id is a no-op (no repository hit). Ordering is
+        load-bearing: ``_session_id`` is assigned before ``rehydrate()`` because
+        ``read_since`` reads the session id off the agent.
+
+        Args:
+            session_id: The session id to switch to.
+            reload_timeline: When True, rebuild + rehydrate the timeline from
+                the new session. When False (default), keep the current
+                timeline and only relabel.
+        """
+        if session_id == self._session_id:
+            return
+
+        if not reload_timeline:
+            # Pure relabel — caller owns the timeline; do not flush/rebuild.
+            self._session_id = session_id
+            self._invalidate_system_prompt_cache()
+            return
+
+        timeline = getattr(self, "_timeline", None)
+        if timeline is not None and getattr(timeline, "_repository", None) is not None and timeline.timeline:
+            timeline.save(self._session_id)
+
         self._session_id = session_id
+        self._invalidate_system_prompt_cache()
+        self._timeline = self._build_timeline()
+        self._timeline.rehydrate()
+
+    def _invalidate_system_prompt_cache(self) -> None:
+        runtime = getattr(self, "_runtime", None)
+        if runtime is not None and hasattr(runtime, "invalidate_system_prompt_cache"):
+            runtime.invalidate_system_prompt_cache()
+
+    def resume(self, session_id: str) -> None:
+        """Resume a persisted session by id, reloading its timeline from disk.
+
+        The single public entry point for a session reload. Thin wrapper over
+        ``set_session_id(session_id, reload_timeline=True)``: flushes the
+        current session, rebuilds the timeline (resetting all session-scoped
+        and compaction-tracking state), then rehydrates from ``session_id``'s
+        persisted entries. An unknown id yields an empty timeline.
+
+        Mutates instance state (timeline + session id) — must NOT be interleaved
+        with an in-flight query on a shared agent. ``TaskResource`` calls this on
+        a freshly built per-spawn instance, so isolation is guaranteed there.
+
+        Fork semantics: ``resume(A)`` followed by ``aquery(session_id=B)`` reads
+        from A and writes to B — A's history is branched into B and A on disk is
+        left untouched. Resuming and continuing in place means omitting
+        ``session_id`` on ``aquery`` (or passing the same id).
+
+        See ``resume_from_timeline`` to adopt an in-memory ``Timeline`` object
+        instead of loading by id.
+
+        Args:
+            session_id: The persisted session to load and continue.
+        """
+        self.set_session_id(session_id, reload_timeline=True)
 
     def resume_from_timeline(self, timeline: Timeline, session_id: str | None = None) -> None:
         """
@@ -272,6 +415,46 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         if self._reminder_manager is not None:
             self._reminder_manager.register(reminder)
 
+    def _apply_llm_provider(
+        self,
+        llm_provider_instance: LLMProvider | None = None,
+        llm_provider: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        """Build a single LLM and fan it out to every sink (agent client, runtime
+        call site, long-term memory). No-op when neither an instance nor a name is
+        given, so the legacy lazy path is preserved."""
+        if llm_provider_instance is not None:
+            if llm_provider is not None or model is not None:
+                logger.debug("llm_provider_instance set; ignoring llm_provider/model args")
+            llm = LLM(provider=llm_provider_instance)
+            self._llm_config = {
+                "provider": getattr(llm_provider_instance, "name", None) or "custom",
+                "model": getattr(llm_provider_instance, "model", None),
+            }
+        elif llm_provider is not None:
+            llm = LLM(provider=llm_provider, model=model)
+            self._llm_config = {"provider": llm_provider, "model": model}
+        else:
+            return
+
+        self._llm_client = llm
+        if getattr(self, "_runtime", None) is not None:
+            self._runtime.set_llm(llm)
+        if getattr(self, "_ltmemory", None) is not None:
+            self._ltmemory.set_llm(llm)
+
+    def set_llm_provider(
+        self,
+        llm_provider_instance: LLMProvider | None = None,
+        llm_provider: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        """Re-point this agent (and its runtime + LTMemory) at a new provider/LLM
+        mid-session. Pass `llm_provider_instance` for instance injection, or
+        `llm_provider` (name) + `model` for the legacy path. Instance wins."""
+        self._apply_llm_provider(llm_provider_instance, llm_provider, model)
+
     @property
     def llm_client(self) -> LLM:
         """Get the LLM client."""
@@ -281,10 +464,12 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
 
     @llm_client.setter
     def llm_client(self, value: LLM):
-        """Set the LLM client."""
+        """Set the LLM client. Prefer set_llm_provider() to swap providers (also keeps _llm_config in sync)."""
         self._llm_client = value
         if hasattr(self._runtime, "set_llm"):
             self._runtime.set_llm(value)
+        if getattr(self, "_ltmemory", None) is not None:
+            self._ltmemory.set_llm(value)
 
     # ============================================================================
     # PUBLIC API - AGENT IDENTITY & PROMPTS
@@ -386,7 +571,9 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                 self._timeline.save(session_id)
 
     async def aquery(self, **kwargs) -> DictParams:
-        # Generate session_id if not provided
+        # session_id relabels the in-memory session / write target (see
+        # set_session_id). To reload a persisted session from disk first, call
+        # resume(session_id) before aquery() — relabel never reloads.
         new_session_id = kwargs.get("session_id")
         if new_session_id is not None:
             self.set_session_id(new_session_id)
@@ -427,6 +614,10 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         input_handler: Callable[[], Awaitable[str]] | None = None,
     ) -> None:
         """Async interactive conversation loop with pluggable input handler.
+
+        The in-memory timeline is kept across turns (each turn relabels, never
+        reloads). To continue a persisted conversation, call ``resume(session_id)``
+        before ``aconverse``.
 
         Args:
             initial_message: Optional initial message to start the conversation
@@ -474,6 +665,31 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
     # TIMELINE COMPRESSION
     # ============================================================================
 
+    def _estimate_system_prompt_tokens(self) -> int:
+        """Return char/4 estimate of system prompt size for compression trigger."""
+        try:
+            prompt = self.system_prompt
+        except Exception:
+            return 0
+        if not prompt:
+            return 0
+        return len(str(prompt)) // 4
+
+    def _estimate_tools_tokens(self) -> int:
+        """Return char/4 estimate of tools-schema size for compression trigger."""
+        try:
+            tools = None
+            runtime = getattr(self, "_runtime", None)
+            if runtime is not None and hasattr(runtime, "get_tools"):
+                tools = runtime.get_tools(self)
+            if not tools:
+                return 0
+            import json as _json
+
+            return len(_json.dumps(tools, default=str)) // 4
+        except Exception:
+            return 0
+
     def _maybe_compress_timeline(self, timeline: Timeline) -> None:
         """
         Compress timeline if it exceeds the configured threshold.
@@ -513,6 +729,12 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                     summary_length=len(summary),
                 )
         except Exception as e:
+            # PTL must propagate so the caller-layer (llm_caller.py) can trigger
+            # reactive_compact + retry — don't let this summary path swallow it.
+            from dana.common.llm.types import PromptTooLongError
+
+            if isinstance(e, PromptTooLongError):
+                raise
             # Don't fail the main operation if compression fails
             logger.warning("Timeline compression failed", error=str(e))
 
@@ -549,6 +771,10 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                     summary_length=len(summary),
                 )
         except Exception as e:
+            from dana.common.llm.types import PromptTooLongError
+
+            if isinstance(e, PromptTooLongError):
+                raise
             logger.warning("Timeline compression failed", error=str(e))
 
     def _extract_compression_summary(self, content: str) -> str:
@@ -663,6 +889,35 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
     # SHARED HELPERS (used by both sync and async STAR methods)
     # ============================================================================
 
+    def _provider_fingerprint(self) -> str | None:
+        """Active provider's replay fingerprint, or None if unavailable.
+
+        Used to gate cross-turn reasoning replay — items captured from provider X
+        are only replayed when the same X handles the next call. Defensive lookup
+        so non-OpenAI providers without the property don't break agent flow.
+        """
+        try:
+            client = self._llm_client
+            if client is None:
+                return None
+            provider = getattr(client, "provider", None)
+            return getattr(provider, "fingerprint", None) if provider is not None else None
+        except Exception:
+            return None
+
+    def _build_thinking_metadata(self, reasoning_items: list[dict] | None, response_id: str | None) -> dict:
+        """Metadata payload attached to AGENT_THOUGHTS entries for replay.
+
+        Empty dict when there's nothing to replay — keeps existing entries clean.
+        """
+        if not reasoning_items:
+            return {}
+        return {
+            "reasoning_items": reasoning_items,
+            "fingerprint": self._provider_fingerprint(),
+            "response_id": response_id,
+        }
+
     def _record_think_results(
         self,
         timeline: Timeline,
@@ -673,6 +928,8 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         done: bool | None,
         todo_list: list | None,
         output_state: str,
+        reasoning_items: list[dict] | None = None,
+        response_id: str | None = None,
     ) -> DictParams:
         """Record think results to timeline and build output trace.
 
@@ -685,7 +942,26 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             done = True
             output_state = "exit"
 
+        thinking_metadata = self._build_thinking_metadata(reasoning_items, response_id)
+
         if not tool_calls or len(tool_calls) == 0:
+            # Persist reasoning even on direct-answer turns. Without this, the
+            # model's internal reasoning (LLMResponse.reasoning_content for
+            # gpt-5/o3/o4, or <thinking> tags / JSON reasoning fields for other
+            # codecs) is silently dropped whenever the agent answers without
+            # invoking a tool. Same emit pattern as the tool-calls branch below.
+            # Gate on reasoning_items, not summary text: GPT-5/o3/o4 low-summary
+            # turns return a reasoning item (rs_… + encrypted_content) with an
+            # empty summary. Skipping the entry there drops the encrypted item
+            # and the turn replays without reasoning state.
+            if (reasoning and len(reasoning) > 0) or thinking_metadata.get("reasoning_items"):
+                timeline.add_entry(
+                    TimelineEntry(
+                        entry_type=TimelineEntryType.AGENT_THOUGHTS,
+                        content=reasoning or "",
+                        metadata=dict(thinking_metadata),
+                    )
+                )
             response = response if (response and len(response) > 0) else "No response generated"
             timeline.add_entry(
                 TimelineEntry(
@@ -694,11 +970,14 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                 )
             )
         else:
-            if reasoning and len(reasoning) > 0:
+            # See gate rationale above — reasoning_items must persist even when
+            # the summary text is empty, or cross-turn replay loses the item.
+            if (reasoning and len(reasoning) > 0) or thinking_metadata.get("reasoning_items"):
                 timeline.add_entry(
                     TimelineEntry(
                         entry_type=TimelineEntryType.AGENT_THOUGHTS,
-                        content=reasoning,
+                        content=reasoning or "",
+                        metadata=dict(thinking_metadata),
                     )
                 )
 
@@ -813,6 +1092,19 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
 
                     result_content = json.dumps(result_content)
 
+                # CRITICAL-2: dump oversized content to a session-scoped file
+                # and leave a compact marker in the timeline. Prevents the
+                # "huge recent tool_result is unreclaimable" wedge where
+                # reactive_compact can't shed the offending entry because it's
+                # within the keep-recent window.
+                from dana.core.agent.tool_result_dump import maybe_dump_oversized_content, resolve_session_folder_for_agent
+
+                result_content = maybe_dump_oversized_content(
+                    result_content,
+                    tool_result.get("tool_call_id"),
+                    resolve_session_folder_for_agent(self),
+                )
+
                 self._timeline.add_entry(
                     TimelineEntry(
                         entry_type=entry_type,
@@ -880,12 +1172,21 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         trace_percepts.pop("timeline", None)
 
         self._maybe_compress_timeline(timeline)
-        llm_messages = self._runtime.build_prompt(self, timeline)
+
+        # Factory used by LLMCaller's PTL retry loop to rebuild messages after
+        # each reactive_compact so the retry observes the compacted timeline
+        # (CRITICAL-1 fix). Closes over self + timeline, not the messages list.
+        def _rebuild_llm_messages() -> list[LLMMessage]:
+            return self._runtime.build_prompt(self, timeline)
+
+        llm_messages = _rebuild_llm_messages()
 
         response, reasoning, tool_calls, done, todo_list = None, None, [], None, None
+        reasoning_items: list[dict] | None = None
+        response_id: str | None = None
         output_state = "retry"
         for attempt in range(self.MAX_THINK_RETRIES):
-            raw = self._runtime.call_llm(llm_messages)
+            raw = self._runtime.call_llm(llm_messages, messages_fn=_rebuild_llm_messages)
             parsed = self._runtime.parse_response(raw)
             response, reasoning, tool_calls, done, todo_list = (
                 parsed.response,
@@ -894,6 +1195,8 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                 parsed.done,
                 parsed.todo_list,
             )
+            reasoning_items = parsed.reasoning_items
+            response_id = parsed.response_id
 
             has_tool_calls = bool(tool_calls)
             has_response = bool(response and response.strip())
@@ -921,6 +1224,8 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             done,
             todo_list,
             output_state,
+            reasoning_items=reasoning_items,
+            response_id=response_id,
         )
 
     @observable
@@ -1022,17 +1327,30 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         trace_percepts.pop("timeline", None)
 
         await self._maybe_compress_timeline_async(timeline)
-        llm_messages = self._runtime.build_prompt(self, timeline)
+
+        # Factory used by LLMCaller's PTL retry loop to rebuild messages after
+        # each reactive_compact so the retry observes the compacted timeline
+        # (CRITICAL-1 fix).
+        def _rebuild_llm_messages_async() -> list[LLMMessage]:
+            return self._runtime.build_prompt(self, timeline)
+
+        llm_messages = _rebuild_llm_messages_async()
 
         response, reasoning, tool_calls, done, todo_list = None, None, [], None, None
+        reasoning_items: list[dict] | None = None
+        response_id: str | None = None
         output_state = "retry"
         for attempt in range(self.MAX_THINK_RETRIES):
             if hasattr(self._runtime, "call_llm_async"):
-                raw = await self._runtime.call_llm_async(llm_messages)
+                raw = await self._runtime.call_llm_async(llm_messages, messages_fn=_rebuild_llm_messages_async)
             else:
                 import asyncio
 
-                raw = await asyncio.to_thread(self._runtime.call_llm, llm_messages)
+                raw = await asyncio.to_thread(
+                    self._runtime.call_llm,
+                    llm_messages,
+                    messages_fn=_rebuild_llm_messages_async,
+                )
             parsed = self._runtime.parse_response(raw)
             response, reasoning, tool_calls, done, todo_list = (
                 parsed.response,
@@ -1041,6 +1359,8 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                 parsed.done,
                 parsed.todo_list,
             )
+            reasoning_items = parsed.reasoning_items
+            response_id = parsed.response_id
 
             has_tool_calls = bool(tool_calls)
             has_response = bool(response and response.strip())
@@ -1068,6 +1388,8 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             done,
             todo_list,
             output_state,
+            reasoning_items=reasoning_items,
+            response_id=response_id,
         )
 
     @observable

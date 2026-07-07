@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import abstractmethod
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from dana.common.llm.llm import LLM
@@ -97,13 +98,25 @@ class CodecRuntimeBase(AgentRuntime):
         prompt_api = self._get_prompt_api(agent)
         return prompt_api.system_prompt
 
-    def call_llm(self, messages: list[LLMMessage]) -> LLMResponse:
-        """Sync LLM call (no json_mode). Delegates to LLMCaller (observable fires there)."""
-        return self._llm_caller.call_llm(messages)
+    def invalidate_system_prompt_cache(self) -> None:
+        if self._prompt_api is not None:
+            self._prompt_api._system_prompt = None
 
-    async def call_llm_async(self, messages: list[LLMMessage]) -> LLMResponse:
+    def call_llm(
+        self,
+        messages: list[LLMMessage],
+        messages_fn: Callable[[], list[LLMMessage]] | None = None,
+    ) -> LLMResponse:
+        """Sync LLM call (no json_mode). Delegates to LLMCaller (observable fires there)."""
+        return self._llm_caller.call_llm(messages, messages_fn=messages_fn)
+
+    async def call_llm_async(
+        self,
+        messages: list[LLMMessage],
+        messages_fn: Callable[[], list[LLMMessage]] | None = None,
+    ) -> LLMResponse:
         """Async LLM call (no json_mode). Delegates to LLMCaller (observable fires there)."""
-        return await self._llm_caller.call_llm_async(messages)
+        return await self._llm_caller.call_llm_async(messages, messages_fn=messages_fn)
 
     def execute_tools(self, agent: STARAgent, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
         res = super().execute_tools(agent, tool_calls)
