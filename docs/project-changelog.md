@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- LangSmith as an alternative tracing backend. `@observable` (`dana/common/observable.py`) dispatches to `langsmith.traceable` when `LANGSMITH_TRACING=true` or `DANA_LANGSMITH_ENABLED` truthy; exclusive with Langfuse (LangSmith takes precedence). No call-site changes — all 30+ `@observable` sites traced automatically. Add via `pip install dana[observability]`. LangSmith API key: `LANGSMITH_API_KEY`.
 - Single-knob env trigger `DANA_COMPACT_TRIGGER_TOKENS` (default 150000, clamp `[8k, 2M]`) for compression threshold (P3).
 - Optional `system_tokens_fn` / `tools_tokens_fn` callbacks on `CompressedTimeline` — fold system-prompt and tools-schema size into `needs_compression()` estimate without coupling to any provider.
 - Client-side tool-result stubbing (`cheap_shrink_tool_results()`, P6) with predictive savings gate; opt-in via `enable_cheap_shrink_tool_results`.
@@ -14,6 +15,7 @@
 - AST-based unit test `test_log_field_allowlist.py` — fails CI when log `extra={...}` keys drift outside the allowlist.
 
 ### Changed
+- `@observable` (`dana/common/observable.py`): when no tracing backend is enabled, the decorator now returns the target function unchanged (identity) instead of wrapping it in a passthrough flush layer. No introspection-sensitive call sites affected; `inspect.signature()` on decorated functions now returns the real signature. Langfuse-path tracing behavior is unchanged.
 - `CompressedTimeline.__init__` default `max_tokens_until_compression` now defers to env trigger (150000) when unset. Explicit value continues to win.
 - `CompressedTimelineConfig` gains `enable_cheap_shrink_tool_results`, `cheap_shrink_keep_recent`, `enable_reactive_compact` fields.
 - `star_agent._maybe_compress_timeline` (sync + async) re-raises `PromptTooLongError` from summary path instead of swallowing — lets caller-layer retry kick in.
