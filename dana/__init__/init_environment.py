@@ -84,6 +84,31 @@ def _install_langfuse_shim() -> None:
         sys.modules["langfuse"] = shim
 
 
+def _install_langsmith_shim() -> None:
+    """Install a no-op `langsmith` shim when the package is absent.
+
+    Mirrors `_install_langfuse_shim()`: registers a passthrough `traceable`
+    decorator so `from langsmith import traceable` never crashes and
+    `dana.common.observable` stays importable without the extra installed.
+    """
+    try:
+        import langsmith  # noqa: F401
+    except ModuleNotFoundError:
+        shim = types.ModuleType("langsmith")
+
+        def traceable(*args: object, **kwargs: object):
+            def decorator(func):
+                return func
+
+            if len(args) == 1 and callable(args[0]) and not kwargs:
+                return args[0]
+            return decorator
+
+        shim.traceable = traceable
+
+        sys.modules["langsmith"] = shim
+
+
 def init_environment(verbose: bool = False):
     """Load environment variables from .env file.
 
@@ -92,6 +117,7 @@ def init_environment(verbose: bool = False):
     """
     _install_structlog_shim()
     _install_langfuse_shim()
+    _install_langsmith_shim()
     dotenv_path = find_dotenv()
     if verbose:
         print(f"Loading environment variables from {dotenv_path}")

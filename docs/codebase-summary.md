@@ -258,7 +258,23 @@ dana/
 - data: pandas, matplotlib
 - memory: lancedb, sentence-transformers
 - knowledge: rdflib, rank-bm25
-- observability: langfuse
+- observability: langfuse, langsmith (alternative tracing backend, exclusive with langfuse)
+
+### Tracing Backends (exclusive)
+
+`@observable` (`dana/common/observable.py`) dispatches to ONE tracing backend per process, selected at decoration time. Toggle via env, not code.
+
+| Precedence | Trigger | Backend |
+|------------|---------|---------|
+| 1 (highest) | `LANGSMITH_TRACING=true` OR `DANA_LANGSMITH_ENABLED=true|1|yes` (+ `langsmith` installed) | LangSmith `@traceable` (background-thread batching, no per-call flush) |
+| 2 | `LANGFUSE_ENABLED=true|1|yes` (+ `langfuse` installed) | Langfuse `@observe` + per-call flush |
+| 3 (default) | neither set | no-op passthrough |
+
+**LangSmith env vars:** `LANGSMITH_TRACING` (enable, case-sensitive `true`), `DANA_LANGSMITH_ENABLED` (dana-namespace alias), `LANGSMITH_API_KEY` (required for emission), `LANGSMITH_PROJECT` / `LANGSMITH_ENDPOINT` (optional).
+
+If both `LANGSMITH_TRACING` and `LANGFUSE_ENABLED` are set, LangSmith wins. Install via `pip install dana[observability]`.
+
+**Silent no-op caveat:** if `LANGSMITH_TRACING=true` (or `DANA_LANGSMITH_ENABLED`) is set but the `langsmith` package is not installed, an import shim makes `@observable` a silent no-op (no error, no traces). The same applies to `LANGFUSE_ENABLED=true` without `langfuse`. Always install the backend package when enabling its env flag to avoid silent misconfiguration.
 
 ## Key Files by Importance
 
