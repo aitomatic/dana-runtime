@@ -1,26 +1,19 @@
 # Branching Strategy
 
-Dana Runtime uses a **Gitflow-based vertical branching** model with long-lived branches and short-lived branch types.
+Dana Runtime uses a **simplified two-branch model**: one integration branch and one release branch.
 
-![Branching Diagram](assets/gitflow-vertical-branching.svg)
+```
+feature/* ──PR──> develop ──PR──> master
+                                  |
+                     hotfix/* ────┘ (branched from master; merged back to master + develop)
+```
 
 ## Long-lived Branches
 
-| Branch    | Purpose                                                                  | Accepts PRs from     |
-|-----------|--------------------------------------------------------------------------|----------------------|
-| `stable`  | Production-ready code. Every commit is tagged with a release version.    | `main/*`, `hotfix/*` |
-| `develop` | Integration branch. All feature work merges here first.                  | `feature/*`          |
-
-## Release Branches (`main/*`)
-
-Each release gets its own branch under the `main/` prefix.
-
-- Naming: `main/<version>` (e.g. `main/1.0`, `main/2.0`)
-- Created from `develop` when a release is ready for stabilization
-- **Only bugfixes** are allowed on release branches
-- Bugfixes on `main/*` merge back into `develop` to stay in sync
-- Once stable, merges into `stable` and a version tag is created
-- Accepts PRs from: `develop`, `hotfix/*`
+| Branch    | Purpose                                                               | Accepts PRs from     |
+|-----------|----------------------------------------------------------------------|----------------------|
+| `develop` | Integration branch. All feature work merges here first. **Default branch.** | `feature/*`          |
+| `master`  | Release branch. Every merge produces a version tag + GitHub Release.  | `develop`, `hotfix/*` |
 
 ## Short-lived Branches
 
@@ -28,41 +21,44 @@ Each release gets its own branch under the `main/` prefix.
 
 - Branch from `develop`
 - Merge back into `develop` via PR
-- Naming: `feature/<descriptive-slug>` (e.g. `feature/login`, `feature/timeline-compression`)
+- Naming: `feature/<descriptive-slug>` (e.g. `feature/timeline-compression`)
 - Delete after merge
 
 ### Hotfix branches (`hotfix/*`)
 
-- Branch from `stable` for critical production bugs
-- Merge into **both** `stable` and `develop` (to keep develop in sync)
-- Naming: `hotfix/<version-or-slug>` (e.g. `hotfix/0.1.1`, `hotfix/fix-crash`)
-- A new tag is created on `stable` after merge
+- Branch from `master` for critical production bugs
+- Merge into **both** `master` and `develop` (keep develop in sync)
+- Bump the version on the hotfix branch manually before merging into `master`
+- Naming: `hotfix/<version-or-slug>` (e.g. `hotfix/fix-crash`)
 - Delete after merge
 
 ## Release Flow
 
 1. `develop` accumulates features via merged feature branches
-2. When ready for release, create `main/<version>` from `develop`
-3. Only bugfixes are committed on `main/<version>` during stabilization
-4. Bugfixes on `main/<version>` merge back into `develop` to stay in sync
-5. Once stable, `main/<version>` merges into `stable` and a version tag is created
-6. `main/<version>` also merges back into `develop` to include final bugfixes
+2. When ready for release, set the target version in `pyproject.toml` on `develop`
+3. Open a PR `develop → master`. CI auto-bumps the patch version if `develop` is not already ahead
+4. Merge the PR → [`release-on-merge-to-master`](../.github/workflows/release-on-merge-to-master.yml) tags `v<version>` and creates a GitHub Release
+
+## Versioning
+
+- Source of truth: `version` in [`pyproject.toml`](../pyproject.toml)
+- To ship a **minor/major** bump (e.g. `0.2.0`, `1.0.0`), set it on `develop` before opening the release PR — the auto-bumper detects `develop` is already ahead and skips
+- Otherwise the auto-bumper raises the patch component (`0.1.3` → `0.1.4`)
+- Tags follow `v<version>` (e.g. `v0.2.0`)
 
 ## Branch Protection
 
-Enforced by [`.github/workflows/branch-policy.yml`](../.github/workflows/branch-policy.yml):
+Enforced by [`.github/workflows/branch-policy.yml`](../.github/workflows/branch-policy.yml) plus repository rulesets:
 
-- **`stable`** only accepts PRs from `main/*` or `hotfix/*`
-- **`main/*`** only accepts PRs from `develop` or `hotfix/*`
-
-Any PR violating these rules is automatically rejected by CI.
+- **`master`** only accepts PRs from `develop` or `hotfix/*`
+- Direct pushes to `master` are blocked (no non-fast-forward, no deletion); merges require review + signatures
+- Any PR violating the source-branch rule is rejected by the `check-branch-policy` job
 
 ## Quick Reference
 
 ```text
-feature/* ──PR──> develop ──PR──> main/<version> ──PR──> stable
-                     ^                                     |
-                     |            hotfix/* ────────PR──> stable
-                     +----------- hotfix/* (also merged back)
-                     +----------- main/<version> bugfixes (merged back)
+feature/* ──PR──> develop ──PR──> master ──> tag vX.Y.Z + GitHub Release
+                     ^                |
+                     |     hotfix/* ──┘  (also merged back to develop)
+                     +-------------------+
 ```

@@ -1,14 +1,15 @@
-name: Bump version on PR to stable
+name: Bump version on PR to master
 
 on:
   pull_request:
     types: [opened, synchronize]
-    branches: [stable]
+    branches: [master]
 
 jobs:
   bump-version:
-    # Only run for main/* branches
-    if: startsWith(github.head_ref, 'main/')
+    # Only run for the develop → master release train.
+    # Hotfix branches bump their version manually before opening the PR.
+    if: github.head_ref == 'develop'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -23,20 +24,21 @@ jobs:
       - name: Read versions and compare
         id: compare
         run: |
-          # Read version from source branch (main/*)
+          # Read version from source branch (develop)
           SOURCE_VERSION=$(grep -m1 '^version' pyproject.toml | sed 's/.*"\(.*\)"/\1/')
           echo "source=$SOURCE_VERSION" >> "$GITHUB_OUTPUT"
 
-          # Read version from stable
-          git fetch origin stable
-          STABLE_VERSION=$(git show origin/stable:pyproject.toml | grep -m1 '^version' | sed 's/.*"\(.*\)"/\1/')
-          echo "stable=$STABLE_VERSION" >> "$GITHUB_OUTPUT"
+          # Read version from master
+          git fetch origin master
+          MASTER_VERSION=$(git show origin/master:pyproject.toml | grep -m1 '^version' | sed 's/.*"\(.*\)"/\1/')
+          echo "master=$MASTER_VERSION" >> "$GITHUB_OUTPUT"
 
-          echo "Source: $SOURCE_VERSION | Stable: $STABLE_VERSION"
+          echo "Source: $SOURCE_VERSION | Master: $MASTER_VERSION"
 
-          # Compare using sort -V (version sort)
-          HIGHER=$(printf '%s\n%s' "$SOURCE_VERSION" "$STABLE_VERSION" | sort -V | tail -1)
-          if [ "$SOURCE_VERSION" != "$STABLE_VERSION" ] && [ "$SOURCE_VERSION" = "$HIGHER" ]; then
+          # Compare using sort -V (version sort). If develop is already ahead
+          # (e.g. a manual minor/major bump), no patch bump is needed.
+          HIGHER=$(printf '%s\n%s' "$SOURCE_VERSION" "$MASTER_VERSION" | sort -V | tail -1)
+          if [ "$SOURCE_VERSION" != "$MASTER_VERSION" ] && [ "$SOURCE_VERSION" = "$HIGHER" ]; then
             echo "needs_bump=false" >> "$GITHUB_OUTPUT"
             echo "Source is already ahead, no bump needed"
           else
@@ -48,7 +50,7 @@ jobs:
         if: steps.compare.outputs.needs_bump == 'true'
         id: next
         run: |
-          IFS='.' read -r MAJOR MINOR PATCH <<< "${{ steps.compare.outputs.stable }}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "${{ steps.compare.outputs.master }}"
           PATCH=$((PATCH + 1))
           echo "version=$MAJOR.$MINOR.$PATCH" >> "$GITHUB_OUTPUT"
           echo "Next version: $MAJOR.$MINOR.$PATCH"
