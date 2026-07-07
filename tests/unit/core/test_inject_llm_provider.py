@@ -1,8 +1,19 @@
+import pytest
+
 from dana.common.llm import LLM
 from dana.common.llm.providers import OpenAIProvider
 from dana.common.resource.rlm_resource import RLMResource
 from dana.core.agent.star_agent import STARAgent
 from dana.core.memory import LTMemory
+
+
+@pytest.fixture(autouse=True)
+def _dummy_provider_env_keys(monkeypatch):
+    """Tests here verify provider wiring/identity, not real API calls.
+    String-path construction (llm_provider='openai'/'anthropic') reads env
+    keys at provider build time; supply dummies so it succeeds offline."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
 
 
 def test_rlm_resource_uses_injected_llm(tmp_path):
