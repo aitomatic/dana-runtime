@@ -245,7 +245,18 @@ class Misc:
                     class_name = parts[-2]  # Get class name before method name
         # If class_name is still None at this point, it's a standalone function
 
-        sig = inspect.signature(method)
+        # Defensive signature introspection. inspect.signature is recursive
+        # internally and can blow up on pathological __wrapped__ chains, or
+        # when the interpreter's recursion budget is already exhausted (e.g.
+        # after a tracing cascade). build_prompt must not die on one bad
+        # resource method — fall back to no-follow, then re-raise the original.
+        try:
+            sig = inspect.signature(method)
+        except (RecursionError, ValueError, TypeError) as _sig_err:
+            try:
+                sig = inspect.signature(method, follow_wrapped=False)
+            except Exception:
+                raise _sig_err
         docstring = inspect.getdoc(method) or ""
 
         # Parse docstring sections

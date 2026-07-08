@@ -488,13 +488,20 @@ class Timeline:
             self._repository = None
 
     def __repr__(self) -> str:
-        """
-        Return a string representation of the timeline.
+        """Return a bounded, recursion-safe string representation.
 
-        Returns:
-            String representation of the timeline
+        Entries hold arbitrary objects in ``metadata`` and ``content``
+        (tool/resource payloads) that can be cyclic or non-serializable.
+        Eagerly deep-formatting them sends ``repr()`` into infinite
+        recursion, which crashes tracers (LangSmith ``str()`` fallback)
+        and every error handler that logs the timeline. Keep this cheap
+        and safe; use ``get_timeline_summary()`` / ``to_dict()`` for detail.
         """
-        return f"Timeline(max_context_tokens={self.max_context_tokens}, timeline={self.timeline[-10:]})"
+        try:
+            entry_count = len(self.timeline)
+        except Exception:
+            entry_count = -1
+        return f"Timeline(entries={entry_count}, max_context_tokens={self.max_context_tokens})"
 
     def add_entry(self, entry: TimelineEntry) -> None:
         """

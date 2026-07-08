@@ -685,3 +685,51 @@ class TestTimelineWithRepository:
         # Verify final response
         assert read_entries[3].entry_type == TimelineEntryType.AGENT_RESPONSE
         assert "72F" in read_entries[3].content
+
+
+class TestTimelineReprSafety:
+    """Regression tests for recursion-safe __repr__.
+
+    Entries hold arbitrary objects in metadata (tool/resource payloads). A
+    cyclic or non-serializable object there used to make repr() recurse
+    infinitely, which crashed LangSmith tracing (str() fallback) and every
+    error handler that logged the timeline. repr() must stay bounded.
+    """
+
+    def test_repr_with_cyclic_entry_metadata_does_not_recurse(self):
+        from dataclasses import dataclass
+        from typing import Any
+
+        @dataclass
+        class _CyclicMeta:
+            name: str = "payload"
+            back: Any = None
+
+        cyclic = _CyclicMeta()
+        cyclic.back = cyclic  # self-reference → dataclass repr would recurse
+
+        entry = TimelineEntry(
+            entry_type=TimelineEntryType.RESOURCE_RESULT,
+            content="ok",
+            metadata={"payload": cyclic},
+        )
+        timeline = Timeline(max_context_tokens=1000)
+        timeline.add_entry(entry)
+
+        # Must not raise RecursionError; must be a bounded string.
+        rendered = repr(timeline)
+        assert isinstance(rendered, str)
+        assert len(rendered) < 500
+        assert "Timeline" in rendered
+        assert "entries=1" in rendered
+
+    def test_repr_is_stable_for_large_timeline(self):
+        timeline = Timeline(max_context_tokens=1000)
+        for i in range(500):
+            timeline.add_entry(TimelineEntry(entry_type=TimelineEntryType.USER_MESSAGE, content=f"msg {i}"))
+
+        rendered = repr(timeline)
+        # Bounded regardless of entry count — no deep formatting.
+        assert isinstance(rendered, str)
+        assert len(rendered) < 500
+        assert "entries=500" in rendered
