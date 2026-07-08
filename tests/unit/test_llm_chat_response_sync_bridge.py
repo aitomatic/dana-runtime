@@ -1,10 +1,16 @@
-"""Regression tests for chat_response_sync sync→async bridging.
+"""Regression tests for chat_response_sync loop handling.
 
-When a caller invokes the sync LLM API from inside a running asyncio loop
-(e.g. a framework that mixes sync/async), ``run_until_complete`` cannot
-nest inside that loop. ``chat_response_sync`` must bridge via a dedicated
-background daemon-thread loop instead of raising
-"Cannot run the event loop while another loop is running".
+``chat_response_sync`` runs the async ``chat_response`` via
+``loop.run_until_complete``, which cannot nest inside a running event loop.
+Rather than silently bridging (which would mask misuse and block the caller's
+loop), the sync API must FAIL LOUD with guidance toward the async path
+(``await llm.chat_response()`` / ``await agent.aquery()``) when called from
+within a running loop.
+
+The previous guard here was dead — its explicit ``raise RuntimeError`` was
+caught by the surrounding ``except RuntimeError: pass``, so callers got the
+cryptic "Cannot run the event loop while another loop is running" instead of
+the actionable message.
 """
 
 import asyncio
@@ -33,7 +39,7 @@ def _user_msg() -> list[LLMMessage]:
 
 
 def test_sync_works_without_running_loop():
-    """Baseline: plain sync call uses the run_until_complete path."""
+    """Baseline: plain sync call (no running loop) uses run_until_complete."""
     expected = LLMResponse(content="ok", model="test-model")
     llm = _llm_returning(expected)
 
@@ -41,29 +47,27 @@ def test_sync_works_without_running_loop():
     assert result is expected
 
 
-def test_sync_works_inside_running_loop():
-    """Regression: sync API called from within a running loop must not crash.
+def test_sync_raises_loud_inside_running_loop():
+    """Sync API called from within a running loop must raise a clear, actionable error.
 
-    Previously raised:
-      RuntimeError: Cannot run the event loop while another loop is running
+    Previously: the dead guard let it fall through to run_until_complete →
+    "Cannot run the event loop while another loop is running" (cryptic).
     """
-    expected = LLMResponse(content="ok", model="test-model")
-    llm = _llm_returning(expected)
+    llm = _llm_returning(LLMResponse(content="ok", model="m"))
 
     async def caller():
-        # We are now inside a running loop on this thread.
         return llm.chat_response_sync(_user_msg())
 
-    result = asyncio.run(caller())
-    assert result is expected
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(caller())
+    msg = str(exc_info.value)
+    assert "chat_response_sync" in msg
+    assert "aquery" in msg or "chat_response" in msg
 
 
-def test_sync_propagates_exception_inside_running_loop():
-    """Errors raised by the coroutine surface to the sync caller via the bridge."""
+def test_sync_propagates_exception_without_running_loop():
+    """Coroutine errors surface to the sync caller via run_until_complete."""
     llm = _llm_returning(LLMResponse(content="x", model="m"), raise_exc=RuntimeError("boom"))
 
-    async def caller():
-        return llm.chat_response_sync(_user_msg())
-
     with pytest.raises(RuntimeError, match="boom"):
-        asyncio.run(caller())
+        llm.chat_response_sync(_user_msg())

@@ -29,7 +29,6 @@ logger = structlog.get_logger()
 import asyncio
 import atexit
 import os
-import threading
 import time
 
 from dana.common.observable import observable
@@ -57,35 +56,6 @@ def _get_or_create_event_loop() -> asyncio.AbstractEventLoop:
         _sync_event_loop = asyncio.new_event_loop()
         # Don't set as the default loop to avoid interfering with other async code
     return _sync_event_loop
-
-
-# Dedicated background event loop running in a daemon thread. Used to bridge
-# sync→async calls when the caller already has a running loop on its own
-# thread: ``run_until_complete`` refuses to nest inside a running loop, so we
-# ship the coroutine here via ``run_coroutine_threadsafe`` and block on it.
-_background_loop: asyncio.AbstractEventLoop | None = None
-_background_loop_lock = threading.Lock()
-
-
-def _get_or_create_background_loop() -> asyncio.AbstractEventLoop:
-    """Return a singleton event loop running in a daemon thread.
-
-    The background loop spins independently of the caller's thread, so a
-    coroutine scheduled on it makes progress even while the caller blocks on
-    ``future.result()`` — no deadlock.
-    """
-    global _background_loop
-    with _background_loop_lock:
-        if _background_loop is None or _background_loop.is_closed():
-            loop = asyncio.new_event_loop()
-            thread = threading.Thread(
-                target=loop.run_forever,
-                daemon=True,
-                name="dana-sync-async-bridge",
-            )
-            thread.start()
-            _background_loop = loop
-        return _background_loop
 
 
 def _cleanup_event_loop():
@@ -325,27 +295,30 @@ class LLM:
             ValueError: If messages list is empty
             ProviderError: If the provider operation fails
         """
-        # Bridge sync→async. Two calling contexts:
-        # 1) No loop running on this thread  → drive the coroutine on the
-        #    persistent sync loop directly.
-        # 2) A loop is already running on this thread (caller invoked the sync
-        #    API from inside async code, e.g. via a framework that mixes
-        #    sync/async). run_until_complete cannot nest inside a running loop,
-        #    so ship the coroutine to a dedicated background loop on a daemon
-        #    thread and block on the result. The background loop runs in its own
-        #    thread, so the coroutine progresses while this thread blocks — no
-        #    deadlock. Caller's loop is blocked for the call's duration; callers
-        #    that need concurrency should use the async chat_response() instead.
-        coro = self.chat_response(messages, **kwargs)
+        # Fail loud when called from within a running event loop. The sync API
+        # cannot nest inside a running loop (run_until_complete refuses), and
+        # silently bridging via a background thread would mask the misuse and
+        # block the caller's loop. The async path (chat_response / agent.aquery)
+        # is the correct entry point from async code.
+        #
+        # The previous guard here was dead: its explicit `raise RuntimeError`
+        # was caught by the surrounding `except RuntimeError: pass`, so callers
+        # got the cryptic "Cannot run the event loop while another loop is
+        # running" instead of guidance.
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            loop = _get_or_create_event_loop()
-            return loop.run_until_complete(coro)
+            pass  # No running loop on this thread — sync path is valid here.
+        else:
+            raise RuntimeError(
+                "chat_response_sync() was called from within a running event loop. "
+                "Use 'await llm.chat_response()' (or 'await agent.aquery()') instead. "
+                "If you reached here from a sync REPL, ensure it routes through the "
+                "async converse/aquery path."
+            )
 
-        bg_loop = _get_or_create_background_loop()
-        future = asyncio.run_coroutine_threadsafe(coro, bg_loop)
-        return future.result()
+        loop = _get_or_create_event_loop()
+        return loop.run_until_complete(self.chat_response(messages, **kwargs))
 
     async def ask(self, question: str, system_prompt: str | None = None, **kwargs) -> str:
         """
