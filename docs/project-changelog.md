@@ -16,6 +16,7 @@
 
 ### Changed
 - `@observable` (`dana/common/observable.py`): when no tracing backend is enabled, the decorator now returns the target function unchanged (identity) instead of wrapping it in a passthrough flush layer. No introspection-sensitive call sites affected; `inspect.signature()` on decorated functions now returns the real signature. Langfuse-path tracing behavior is unchanged.
+- `@observable` LangSmith path now sanitizes Dana runtime objects before SDK serialization. Live agents/timelines are logged as compact summaries, avoiding `RecursionError` crashes on cyclic `CompressedTimeline` graphs.
 - `CompressedTimeline.__init__` default `max_tokens_until_compression` now defers to env trigger (150000) when unset. Explicit value continues to win.
 - `CompressedTimelineConfig` gains `enable_cheap_shrink_tool_results`, `cheap_shrink_keep_recent`, `enable_reactive_compact` fields.
 - `star_agent._maybe_compress_timeline` (sync + async) re-raises `PromptTooLongError` from summary path instead of swallowing — lets caller-layer retry kick in.
