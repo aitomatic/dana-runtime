@@ -8,7 +8,9 @@ No real network calls: backends are monkeypatched.
 import asyncio
 import builtins
 import importlib
+import json
 import sys
+import types
 
 import pytest
 
@@ -32,6 +34,15 @@ def clean_env(monkeypatch):
 
 def _install_backend_mocks(monkeypatch, *, traceable=None, observe=None):
     """Patch the real langsmith/langsmith attributes observable binds at import."""
+    if "langsmith" not in sys.modules:
+        shim = types.ModuleType("langsmith")
+        shim.traceable = lambda *a, **k: (lambda f: f)
+        monkeypatch.setitem(sys.modules, "langsmith", shim)
+    if "langfuse" not in sys.modules:
+        shim = types.ModuleType("langfuse")
+        shim.observe = lambda *a, **k: (lambda f: f)
+        shim.Langfuse = lambda *a, **k: None
+        monkeypatch.setitem(sys.modules, "langfuse", shim)
     if traceable is not None:
         monkeypatch.setattr("langsmith.traceable", traceable)
     if observe is not None:
@@ -303,3 +314,40 @@ def test_langsmith_exclusive_over_langfuse_under_async(monkeypatch, clean_env):
 
     assert asyncio.run(f()) == 5
     assert not observe_calls, "langfuse.observe must not be called under async either"
+
+
+def test_langsmith_processors_sanitize_cyclic_timeline_inputs(monkeypatch, clean_env):
+    """LangSmith must not receive raw Dana timelines; SDK JSON serialization
+    recurses through live agent/timeline graphs and can crash the caller.
+    """
+    from dana.core.timeline.timeline import Timeline, TimelineEntry, TimelineEntryType
+
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    captured: dict = {}
+
+    def fake_traceable(*a, **k):
+        captured.update(k)
+        return lambda f: f
+
+    _install_backend_mocks(monkeypatch, traceable=fake_traceable)
+    obs = _reload_observable()
+
+    @obs.observable(name="x")
+    def f(timeline):
+        return timeline
+
+    timeline = Timeline()
+    entry = TimelineEntry(TimelineEntryType.USER_MESSAGE, "hello")
+    entry.metadata["timeline"] = timeline
+    timeline.add_entry(entry)
+
+    assert f(timeline) is timeline
+    safe_inputs = captured["process_inputs"]({"timeline": timeline, "entry": entry})
+    safe_outputs = captured["process_outputs"](timeline)
+
+    json.dumps(safe_inputs)
+    json.dumps(safe_outputs)
+    assert safe_inputs["timeline"]["__class__"] == "Timeline"
+    assert safe_inputs["timeline"]["entry_count"] == 1
+    assert safe_inputs["entry"]["metadata"]["timeline"]["__class__"] == "Timeline"
+    assert safe_outputs["output"]["__class__"] == "Timeline"

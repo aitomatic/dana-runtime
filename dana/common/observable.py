@@ -20,6 +20,8 @@ import inspect
 import os
 from typing import cast
 
+from dana.common.trace_sanitizer import safe_trace_inputs, safe_trace_outputs
+
 
 # --- Langfuse (existing backend) ---
 try:
@@ -88,6 +90,8 @@ def _langsmith_kwargs(kwargs: dict) -> dict:
         meta["user_id"] = kwargs["user_id"]
     if meta:
         ls["metadata"] = meta
+    ls["process_inputs"] = kwargs.get("process_inputs", safe_trace_inputs)
+    ls["process_outputs"] = kwargs.get("process_outputs", safe_trace_outputs)
     return ls
 
 

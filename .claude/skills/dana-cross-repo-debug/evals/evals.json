@@ -1,0 +1,23 @@
+{
+  "skill_name": "dana-cross-repo-debug",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "The console-bug tmux session is running mise run console:dev. Chatting with dana-librarian in the Playground crashes, but dana-runtime tests pass locally. Debug it end to end and tell me what is actually running.",
+      "expected_output": "Agent should inspect tmux logs, check ports, verify dana-os dependency source, confirm imported dana path, reproduce through /api/sessions, and avoid claiming success from local tests alone.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "We fixed dana/common/observable.py in dana-runtime, but the Playground still shows the old LangSmith RecursionError. Figure out why and make the console use my local runtime checkout.",
+      "expected_output": "Agent should identify the remote git pin in dana-os pyproject/uv.lock, switch dana source to local editable ../dana-runtime for debugging, run uv lock, restart tmux console, and verify import paths.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "I need a clean repro for the dana-librarian bug without clicking around the UI. Use the running console backend to trigger the same agent.ask path and inspect the tmux log.",
+      "expected_output": "Agent should use /api/sessions agent.find, agent.describe, and agent.ask curl calls, then capture tmux logs and classify the first real failure.",
+      "files": []
+    }
+  ]
+}
