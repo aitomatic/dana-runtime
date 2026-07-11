@@ -5,8 +5,8 @@ are automatically queried when building context via PromptBuilder (retrieved con
 """
 
 from dana.common.llm.types import LLMMessage
-from dana.core.timeline.timeline import TimelineEntry, TimelineEntryType
 from dana.core.prompt.prompt_builder import PromptBuilder
+from dana.core.timeline.timeline import TimelineEntry, TimelineEntryType
 
 
 class DummyTimeline:
@@ -58,7 +58,7 @@ def _build_prompt_messages(resource: DummyResource, task: str) -> list[LLMMessag
         identity_fn=lambda a: "IDENTITY",
         template_fn=lambda native: "{{identity}}",
         format_tool_fn=lambda sig: "",
-        system_prompt_fn=lambda: "SYSTEM",
+        system_prompt_fn=lambda _agent: "SYSTEM",
         skip_retrieved_context=False,  # Enable context retrieval
     )
     timeline = DummyTimeline(task)

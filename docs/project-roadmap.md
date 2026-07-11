@@ -54,6 +54,7 @@
 - [ ] Performance tuning & profiling
 - [ ] Additional resources (MCP, Skills)
 - [ ] Error recovery mechanisms
+- [x] Public full-system-prompt template override API (ephemeral by default; codec-only repository persistence)
 
 **Planned Deliverables:**
 
