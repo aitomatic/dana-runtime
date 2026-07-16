@@ -86,6 +86,14 @@ class DanaACPAgent:
         self._sessions: dict[str, AgentSession] = {}
         self._repository: JournalRepository | None = None
         self._conn: Any = None
+        # Feature flag: DANA_SESSION_JOURNAL_AUTHORITY=0 selects legacy
+        # compatibility mode (no journal persistence, ephemeral sessions only).
+        # Default is "1" — journal-backed (the D1 cutover default). Full legacy
+        # fallback (Timeline-based ACP agent) is documented in
+        # ``docs/session-journal-storage.md`` and deferred to a later phase.
+        # The flag is parsed now so the rollback switch is operational and
+        # discoverable; the legacy code path itself is a future wiring point.
+        self._journal_authority = os.environ.get("DANA_SESSION_JOURNAL_AUTHORITY", "1") != "0"
 
     # ------------------------------------------------------------------
     # Connection
@@ -100,6 +108,16 @@ class DanaACPAgent:
             os.makedirs(os.path.dirname(self._journal_path) or ".", exist_ok=True)
             self._repository = await SQLiteJournalRepository.open(self._journal_path)
         return self._repository
+
+    @property
+    def journal_authority_enabled(self) -> bool:
+        """Whether the Session Journal is the durable authority for this agent.
+
+        ``True`` (the default) means all session turns are journaled.
+        ``False`` (set via ``DANA_SESSION_JOURNAL_AUTHORITY=0``) is the
+        documented rollback switch; full legacy fallback is deferred.
+        """
+        return self._journal_authority
 
     # ------------------------------------------------------------------
     # ACP protocol: initialize

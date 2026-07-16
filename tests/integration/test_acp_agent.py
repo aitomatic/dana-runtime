@@ -452,6 +452,44 @@ class TestResumeSession:
 
 
 # ===========================================================================
+# 8b. DANA_SESSION_JOURNAL_AUTHORITY feature flag (Task 8 cutover switch)
+# ===========================================================================
+
+
+class TestJournalAuthorityFlag:
+    """Rollback switch wiring — DANA_SESSION_JOURNAL_AUTHORITY.
+
+    The default is journal-backed (D1 cutover). Setting the env var to "0"
+    flips the flag off without otherwise changing behavior; full legacy
+    fallback is documented in docs/session-journal-storage.md and deferred.
+    """
+
+    @pytest.mark.asyncio
+    async def test_default_is_journal_backed(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("DANA_SESSION_JOURNAL_AUTHORITY", raising=False)
+        from dana.apps.acp.agent import DanaACPAgent
+
+        a = DanaACPAgent(journal_path=str(tmp_path / "j.db"), agent_factory=fake_agent_factory())
+        assert a.journal_authority_enabled is True
+
+    @pytest.mark.asyncio
+    async def test_flag_zero_disables_authority(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DANA_SESSION_JOURNAL_AUTHORITY", "0")
+        from dana.apps.acp.agent import DanaACPAgent
+
+        a = DanaACPAgent(journal_path=str(tmp_path / "j.db"), agent_factory=fake_agent_factory())
+        assert a.journal_authority_enabled is False
+
+    @pytest.mark.asyncio
+    async def test_flag_explicit_one_enables_authority(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DANA_SESSION_JOURNAL_AUTHORITY", "1")
+        from dana.apps.acp.agent import DanaACPAgent
+
+        a = DanaACPAgent(journal_path=str(tmp_path / "j.db"), agent_factory=fake_agent_factory())
+        assert a.journal_authority_enabled is True
+
+
+# ===========================================================================
 # 9–10. Subprocess tests — stderr logs + stdout JSON-RPC frames
 # ===========================================================================
 
