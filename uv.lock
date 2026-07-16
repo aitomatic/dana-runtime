@@ -593,7 +593,9 @@ name = "dana"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
+    { name = "aiosqlite" },
     { name = "anthropic" },
+    { name = "asyncpg" },
     { name = "beautifulsoup4" },
     { name = "google-genai" },
     { name = "html2text" },
@@ -671,7 +673,9 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiosqlite", specifier = ">=0.20.0" },
     { name = "anthropic", specifier = ">=0.40.0" },
+    { name = "asyncpg", specifier = ">=0.30.0" },
     { name = "beautifulsoup4", specifier = ">=4.12.0" },
     { name = "build", marker = "extra == 'dev'", specifier = ">=1.0.0" },
     { name = "dana", extras = ["web", "local", "data", "memory", "knowledge", "observability"], marker = "extra == 'full'" },

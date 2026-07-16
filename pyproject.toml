@@ -53,6 +53,9 @@ dependencies = [
     "html2text>=2024.2.26",
     "rich>=14.2.0",
     "langfuse>=4.0.1",
+    # Session Journal persistence (Phase 01 — durable conversation)
+    "aiosqlite>=0.20.0",
+    "asyncpg>=0.30.0",
 ]
 
 # Command-line entry points
@@ -246,6 +249,8 @@ known-third-party = [
     "lxml",
     "readability",
     "html2text",
+    "aiosqlite",
+    "asyncpg",
 ]
 section-order = [
     "future",
@@ -280,6 +285,7 @@ disallow_untyped_defs = true
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+asyncio_default_fixture_loop_scope = "function"
 markers = [
     "windows_console: marks tests that require Windows console features (deselect with '-m \"not windows_console\"')",
     "live: marks tests that use live LLM calls (deselect with '-m \"not live\"')",
