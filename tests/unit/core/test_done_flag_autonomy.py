@@ -214,5 +214,5 @@ def test_prompt_contains_output_format():
     agent = STARAgent(agent_type="prompt", auto_register=False, enable_web_search=False, enable_skills=False)
     system_prompt = agent.system_prompt
 
-    assert '"done"' in system_prompt
-    assert "JSON" in system_prompt
+    assert "<output_format>" in system_prompt
+    assert "RESPONSE FORMAT" in system_prompt

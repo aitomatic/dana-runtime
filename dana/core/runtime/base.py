@@ -176,6 +176,16 @@ When you need to call tools, use the function calling API directly — do NOT in
             return self.SYSTEM_PROMPT_TEMPLATE_NATIVE_TOOLS
         return self.SYSTEM_PROMPT_TEMPLATE_JSON
 
+    def override_system_prompt_template(self, agent: Any, template: str, *, persist: bool = False) -> None:
+        """Replace the complete system prompt template for this runtime instance.
+
+        Repository persistence is available on codec runtimes through
+        ``LocalPromptAPI``. Base runtimes keep overrides in memory only.
+        """
+        if persist:
+            raise NotImplementedError(f"{self.__class__.__name__} does not support persistent system prompt templates")
+        agent._system_prompt_template_override = template
+
     def get_identity(self, agent) -> str:
         """Return the agent's identity description.
 

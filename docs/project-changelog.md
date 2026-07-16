@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Public `STARAgent.override_system_prompt_template(template, persist=False)` API for replacing the complete system prompt template used by LLM requests. The default is an ephemeral, agent-instance override with no repository write; `persist=True` is codec-runtime-only and writes to the configured prompt repository. Because defaults are not merged, replacements must retain required tool-usage and output-format instructions.
 - LangSmith as an alternative tracing backend. `@observable` (`dana/common/observable.py`) dispatches to `langsmith.traceable` when `LANGSMITH_TRACING=true` or `DANA_LANGSMITH_ENABLED` truthy; exclusive with Langfuse (LangSmith takes precedence). No call-site changes — all 30+ `@observable` sites traced automatically. Add via `pip install dana[observability]`. LangSmith API key: `LANGSMITH_API_KEY`.
 - Single-knob env trigger `DANA_COMPACT_TRIGGER_TOKENS` (default 150000, clamp `[8k, 2M]`) for compression threshold (P3).
 - Optional `system_tokens_fn` / `tools_tokens_fn` callbacks on `CompressedTimeline` — fold system-prompt and tools-schema size into `needs_compression()` estimate without coupling to any provider.

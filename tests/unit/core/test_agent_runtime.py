@@ -1,3 +1,5 @@
+import pytest
+
 from dana.common.llm.types import LLMMessage, LLMResponse
 from dana.core.agent.star_agent import STARAgent
 from dana.core.resource.base_resource import BaseResource
@@ -60,6 +62,85 @@ def test_default_runtime_build_prompt():
     assert isinstance(messages, list)
     assert messages
     assert isinstance(messages[0], LLMMessage)
+
+
+def test_default_runtime_system_prompt_override_reaches_built_messages():
+    class MockLLM:
+        pass
+
+    runtime = DefaultRuntime(llm=MockLLM())
+    agent = STARAgent(
+        agent_type="runtime-test",
+        runtime=runtime,
+        auto_register=False,
+        enable_assistant=False,
+        enable_web_search=False,
+        enable_skills=False,
+        enable_code_execution=False,
+    )
+    timeline = Timeline(agent=agent)
+
+    agent.override_system_prompt_template("runtime override")
+    messages = runtime.build_prompt(agent, timeline)
+
+    assert agent.system_prompt == "runtime override"
+    assert messages[0].content.endswith("runtime override")
+
+
+def test_default_runtime_rejects_persistent_system_prompt_override():
+    runtime = DefaultRuntime()
+    agent = STARAgent(
+        agent_type="runtime-test",
+        runtime=runtime,
+        auto_register=False,
+        enable_assistant=False,
+        enable_web_search=False,
+        enable_skills=False,
+        enable_code_execution=False,
+    )
+
+    with pytest.raises(NotImplementedError, match="does not support persistent"):
+        agent.override_system_prompt_template("persistent override", persist=True)
+
+
+def test_system_prompt_override_wins_over_custom_runtime_template_hook():
+    class CustomRuntime(DefaultRuntime):
+        def get_system_prompt_template(self, native_tools: bool) -> str:
+            return "custom runtime hook"
+
+    runtime = CustomRuntime()
+    agent = STARAgent(
+        agent_type="runtime-test",
+        runtime=runtime,
+        auto_register=False,
+        enable_assistant=False,
+        enable_web_search=False,
+        enable_skills=False,
+        enable_code_execution=False,
+    )
+
+    agent.override_system_prompt_template("explicit override")
+
+    assert agent.system_prompt == "explicit override"
+
+
+def test_shared_default_runtime_keeps_overrides_agent_scoped():
+    runtime = DefaultRuntime()
+    common = {
+        "runtime": runtime,
+        "auto_register": False,
+        "enable_assistant": False,
+        "enable_web_search": False,
+        "enable_skills": False,
+        "enable_code_execution": False,
+    }
+    first = STARAgent(agent_type="first", agent_id="first", **common)
+    second = STARAgent(agent_type="second", agent_id="second", **common)
+
+    first.override_system_prompt_template("first override")
+
+    assert first.system_prompt == "first override"
+    assert second.system_prompt != "first override"
 
 
 def test_default_runtime_parse_response_done_true():

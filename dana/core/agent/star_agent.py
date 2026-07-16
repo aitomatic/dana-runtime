@@ -143,6 +143,7 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         self._repository_factory = repository_factory
         self._codec = codec
         self._identity_override = identity_override
+        self._system_prompt_template_override: str | None = None
 
         if runtime is None:
             from dana.core.runtime import RuntimeRegistry
@@ -527,6 +528,17 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         if hasattr(self._runtime, "system_prompt"):
             return self._runtime.system_prompt(self)
         return super().system_prompt
+
+    def override_system_prompt_template(self, template: str, *, persist: bool = False) -> None:
+        """Replace the complete system prompt template used for LLM requests.
+
+        Args:
+            template: Full prompt template. Runtime-supported ``{{variables}}``
+                continue to render normally.
+            persist: Save the template when the runtime has a prompt repository.
+                Defaults to an in-memory override scoped to this agent instance.
+        """
+        self._runtime.override_system_prompt_template(self, template, persist=persist)
 
     # ============================================================================
     # PUBLIC API - STATE & CONTEXT MANAGEMENT

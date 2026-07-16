@@ -317,10 +317,18 @@ DANA_MOCK_LLM=true make test
 ```python
 agent = STARAgent(
     model: str,                      # e.g., "gpt-4.1"
-    system_prompt: Optional[str],    # Custom system prompt
     tools: Optional[list[str]],      # Enabled tool names
     max_tokens: int = 4096,          # Context limit
     compression_threshold: float = 0.8  # Auto-compress at %
+)
+
+# Ephemeral replacement for this agent instance (no repository write)
+agent.override_system_prompt_template("You are a domain specialist.")
+
+# Only codec runtimes can persist the replacement to their prompt repository
+agent.override_system_prompt_template(
+    "You are a persistent domain specialist.",
+    persist=True,
 )
 
 # Process message
@@ -334,6 +342,13 @@ async for token in agent.stream_response(message: str):
 timeline = agent.state.timeline
 messages = await timeline.get_entries()
 ```
+
+`persist=False` is the default: the override is ephemeral, scoped to the agent
+instance, and never written to the prompt repository. `persist=True` is supported
+only by codec runtimes and writes to their configured prompt repository; base
+runtimes raise `NotImplementedError`. The template fully replaces, rather than
+extends, the default system prompt, so retain every required tool-usage and
+output-format instruction in the replacement.
 
 ### Custom Resources
 
