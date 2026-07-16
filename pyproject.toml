@@ -56,6 +56,7 @@ dependencies = [
     # Session Journal persistence (Phase 01 — durable conversation)
     "aiosqlite>=0.20.0",
     "asyncpg>=0.30.0",
+    "agent-client-protocol>=0.10,<0.11",
 ]
 
 # Command-line entry points
@@ -65,6 +66,7 @@ dana-agent-repl = "dana.apps.repl.__main__:main"
 dana-code = "dana.apps.code.__main__:main"
 dana-memory = "dana.lib.memory.cli:main"
 dana-init = "dana.apps.init.__main__:main"
+dana-acp = "dana.apps.acp.__main__:main"
 
 # Optional dependency groups
 [project.optional-dependencies]
