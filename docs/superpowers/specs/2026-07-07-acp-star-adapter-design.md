@@ -2,7 +2,7 @@
 
 **Original date:** 2026-07-07
 **Revised:** 2026-07-16
-**Status:** Proposed revision for review
+**Status:** Approved design
 **Compatibility target:** `~/Desktop/repos/dana-os-docs-update/dana-console`
 **Reference implementation:** `~/Desktop/repos/hermes-agent/acp_adapter` (read-only evidence, not a template)
 **Domain language:** [`CONTEXT.md`](../../../CONTEXT.md)
