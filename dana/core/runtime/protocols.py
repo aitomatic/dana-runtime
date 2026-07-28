@@ -49,7 +49,9 @@ class ParsedResponse:
 
 
 # ---------------------------------------------------------------------------
-# Approval types (defined before ApprovalProtocol so it can reference them)
+# Approval result type. The former tool-hook/approval protocol scaffold was
+# removed in M3 (tool intercept now routes through the EventBus); this
+# dataclass is retained for potential vNext reuse (see ext/permission.py).
 # ---------------------------------------------------------------------------
 
 
@@ -137,23 +139,3 @@ class ToolExecutorProtocol(Protocol):
     def execute_tools(self, agent: Any, tool_calls: list[dict], parallel: bool = False) -> list[dict]: ...
 
     async def execute_tools_async(self, agent: Any, tool_calls: list[dict]) -> list[dict]: ...
-
-
-@runtime_checkable
-class ToolHookProtocol(Protocol):
-    """Lifecycle hooks called around individual tool executions."""
-
-    async def before_tool_call(self, agent: Any, tool_call: dict) -> dict | None: ...
-
-    async def after_tool_call(self, agent: Any, tool_call: dict, result: dict) -> dict: ...
-
-
-@runtime_checkable
-class ApprovalProtocol(Protocol):
-    """Requests human (or automated) approval before executing tool calls."""
-
-    async def request_approval(
-        self,
-        agent: Any,
-        tool_calls: list[dict],
-    ) -> ApprovalResult: ...

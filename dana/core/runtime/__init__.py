@@ -5,7 +5,6 @@ from .base import AgentRuntime
 from .default import DefaultRuntime
 from .openai import OpenAIRuntime
 from .protocols import (
-    ApprovalProtocol,
     ApprovalResult,
     LLMCallerProtocol,
     ParsedResponse,
@@ -15,7 +14,6 @@ from .protocols import (
     StreamEventType,
     TodoItem,
     ToolExecutorProtocol,
-    ToolHookProtocol,
 )
 from .selector import RuntimeRegistry
 
@@ -34,7 +32,5 @@ __all__ = [
     "LLMCallerProtocol",
     "ResponseParserProtocol",
     "ToolExecutorProtocol",
-    "ToolHookProtocol",
-    "ApprovalProtocol",
     "RuntimeRegistry",
 ]
