@@ -213,6 +213,9 @@ data/
 plans/
 .repomixignore
 AGENTS.md
+CLAUDE.md
+/sprint/
+/v2/
 release-manifest.json
 repomix-output.xml
 
