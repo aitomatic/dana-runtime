@@ -15,6 +15,7 @@ from dana.common.observable import observable
 from dana.common.protocols import DictParams, STARAgentProtocol
 from dana.common.protocols.types import LearningPhase
 from dana.core.agent.base_agent import BaseAgent
+from dana.core.ext.event_bus import EventBus
 from dana.core.llm.llm_caller import is_transient_llm_error
 from dana.core.runtime.protocols import StreamEvent, StreamEventType
 
@@ -364,6 +365,23 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
             )
             return
         yield StreamEvent(event_type=StreamEventType.DONE, data=None, iteration=0)
+
+    # ============================================================================
+    # EXTENSIBILITY (S1)
+    # ============================================================================
+
+    @property
+    def event_bus(self) -> EventBus:
+        """Per-agent intercept-capable event bus.
+
+        Lazily created on first access so the mount point adds zero cost to
+        agent construction and no ``__init__`` coupling. Each agent owns its own
+        bus (correct session scope; never a global).
+        """
+        bus = getattr(self, "_event_bus", None)
+        if bus is None:
+            self._event_bus = bus = EventBus()
+        return bus
 
     # ============================================================================
     # UTILITIES
