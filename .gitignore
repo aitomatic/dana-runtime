@@ -216,13 +216,12 @@ AGENTS.md
 CLAUDE.md
 /sprint/
 /v2/
-# agent tool dirs / local scratch
+# agent tool dirs / local scratch (NOT project source — analogous to .claude/.opencode)
 .agents/
 .codegraph/
 .codex/
 .superpowers/
 memories/
-/tests/unit/core/guard/
 release-manifest.json
 repomix-output.xml
 
