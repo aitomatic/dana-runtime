@@ -7,9 +7,10 @@ without implementation details like LLM integration or rich state management.
 
 from abc import abstractmethod
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 import logging
 import threading
+from typing import TYPE_CHECKING, Any
 
 from dana.common.observable import observable
 from dana.common.protocols import DictParams, STARAgentProtocol
@@ -19,6 +20,10 @@ from dana.core.ext.event_bus import Event, EventBus
 from dana.core.ext.events import ACT_END, REFLECT_END, SEE_END, THINK_END
 from dana.core.llm.llm_caller import is_transient_llm_error
 from dana.core.runtime.protocols import StreamEvent, StreamEventType
+
+
+if TYPE_CHECKING:
+    from dana.core.ext.extensions import ExtensionManager
 
 
 logger = logging.getLogger(__name__)
@@ -460,6 +465,46 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
             bus = EventBus()
             self.__dict__["_event_bus"] = bus
         return bus
+
+    def on(self, event_type: str, handler: Callable[..., Any]) -> Callable[[], None]:
+        """Subscribe ``handler`` to ``event_type`` on this agent's bus. M4.
+
+        Thin alias for ``self.event_bus.subscribe(event_type, handler)``, exposed
+        as the extension-facing registration API (``setup(agent): agent.on(...)``).
+        Returns the unsubscribe callable.
+        """
+        return self.event_bus.subscribe(event_type, handler)
+
+    @property
+    def extensions(self) -> "ExtensionManager":
+        """Per-agent extension manager (lazy, ``self.__dict__`` storage). M4.
+
+        Like ``event_bus``, MUST use ``__dict__`` (not ``getattr``) to avoid
+        ``STARAgent.__getattr__`` returning a magic-method stub.
+        """
+        from dana.core.ext.extensions import ExtensionManager
+
+        mgr = self.__dict__.get("_extensions")
+        if not isinstance(mgr, ExtensionManager):
+            mgr = ExtensionManager(self)
+            self.__dict__["_extensions"] = mgr
+        return mgr
+
+    def load_extensions(self) -> Any:
+        """Discover + load drop-in extensions (global always, project if trusted). M4.
+
+        NOT auto-called at construction (hosts call this after creating an agent).
+        Returns a ``LoadReport``.
+        """
+        return self.extensions.load_all()
+
+    def reload_extensions(self) -> Any:
+        """Hot-reload extensions: unsubscribe old, re-discover, re-load. M4.
+
+        MUST be called at idle (not concurrent with a turn). Emits
+        ``session_reload``. Returns a ``LoadReport``.
+        """
+        return self.extensions.reload_all()
 
     # ============================================================================
     # UTILITIES
