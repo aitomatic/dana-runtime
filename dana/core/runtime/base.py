@@ -393,7 +393,20 @@ When you need to call tools, use the function calling API directly — do NOT in
         return None
 
     def _build_native_tools_if_supported(self, agent) -> None:
-        """Build native tool schemas if the LLM provider supports native tool calling."""
+        """Build native tool schemas if the LLM provider supports native tool calling.
+
+        Schemas are cached after first build. They depend only on structural
+        agent members (``_agents``/``_resources``/``_workflows``), the static
+        provider capability, and the init-time ``_use_native_tools`` flag —
+        none change per turn. Rebuilding every ``build_prompt`` call re-runs
+        ``inspect.signature`` on every resource method under the tracer-laden
+        per-turn chain; on long sessions that exhausts the interpreter's
+        recursion budget and surfaces as a RecursionError at
+        ``inspect.signature``. Build once.
+        """
+        if self._native_tools is not None:
+            return
+
         llm = self._resolve_llm()
         if not hasattr(llm, "provider"):
             return
