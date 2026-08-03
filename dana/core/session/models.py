@@ -59,8 +59,9 @@ class PayloadSanitizationError(ValueError):
 
 
 class FactType(Enum):
-    """Typed statements about session activity (D1 text-only conversation set)."""
+    """Typed statements about session activity (D1 text-only conversation set + D2 tool lifecycle)."""
 
+    # D1: Text-only conversation
     SESSION_CREATED = "session_created"
     SESSION_LOADED = "session_loaded"
     SESSION_RESUMED = "session_resumed"
@@ -73,6 +74,20 @@ class FactType(Enum):
     TURN_ERROR = "turn_error"
     TURN_CANCELLED = "turn_cancelled"
     LEGACY_TIMELINE_MIGRATED = "legacy_timeline_migrated"
+
+    # D2: Tool lifecycle facts (ADR-002, ADR-005)
+    # Non-terminal facts
+    TOOL_REQUESTED = "tool_requested"
+    TOOL_AUTHORIZED_OR_DENIED = "tool_authorized_or_denied"
+    TOOL_STARTED = "tool_started"
+    TOOL_PROGRESS = "tool_progress"
+    TOOL_CANCELLATION_REQUESTED = "tool_cancellation_requested"
+    # Terminal facts — exactly one per tool call
+    TOOL_RESULT = "tool_result"
+    TOOL_FAILURE = "tool_failure"
+    TOOL_ACKNOWLEDGED = "tool_acknowledged"
+    TOOL_TIMED_OUT = "tool_timed_out"
+    TOOL_EFFECT_UNKNOWN = "tool_effect_unknown"
 
 
 def validate_payload(payload: Mapping[str, JSONValue]) -> Mapping[str, JSONValue]:
