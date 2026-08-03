@@ -47,10 +47,9 @@ class _InFlight:
     ``started_at``   — monotonic timestamp when execution began.
     ``cancelled``    — whether cancellation was requested.
     ``result``       — the result once execution completes (or None).
-    ``done``         — event set when execution finishes.
     """
 
-    __slots__ = ("tool_call_id", "entry", "started_at", "_cancelled", "_result", "_done")
+    __slots__ = ("tool_call_id", "entry", "started_at", "_cancelled", "_result")
 
     def __init__(self, tool_call_id: str, entry: ToolCatalogEntry) -> None:
         self.tool_call_id = tool_call_id
@@ -58,7 +57,6 @@ class _InFlight:
         self.started_at = time.monotonic()
         self._cancelled = False
         self._result: dict[str, Any] | None = None
-        self._done = asyncio.Event()
 
     def cancel(self) -> None:
         """Request cancellation of this in-flight tool."""
@@ -70,19 +68,10 @@ class _InFlight:
 
     def set_result(self, result: dict[str, Any]) -> None:
         self._result = result
-        self._done.set()
 
     @property
     def result(self) -> dict[str, Any] | None:
         return self._result
-
-    async def wait(self, timeout: float | None = None) -> bool:
-        """Wait for the tool to complete. Returns True if completed, False if timed out."""
-        try:
-            await asyncio.wait_for(self._done.wait(), timeout=timeout)
-            return True
-        except TimeoutError:
-            return False
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +131,9 @@ class ToolExecutionEngine:
 
         try:
             if entry.isolated:
-                return self._execute_isolated_sync(entry, tool_call, tool_call_id)
+                in_flight = _InFlight(tool_call_id, entry)
+                self._in_flight[tool_call_id] = in_flight
+                return self._execute_isolated_sync(entry, tool_call, tool_call_id, in_flight)
             return self._execute_cooperative_sync(entry, tool_call, tool_call_id)
         except Exception as exc:
             return create_tool_error(
@@ -173,7 +164,9 @@ class ToolExecutionEngine:
 
         try:
             if entry.isolated:
-                return await self._execute_isolated_async(entry, tool_call, tool_call_id)
+                in_flight = _InFlight(tool_call_id, entry)
+                self._in_flight[tool_call_id] = in_flight
+                return await self._execute_isolated_async(entry, tool_call, tool_call_id, in_flight)
             return await self._execute_cooperative_async(entry, tool_call, tool_call_id)
         except Exception as exc:
             return create_tool_error(
@@ -377,7 +370,10 @@ class ToolExecutionEngine:
         """Get or create a worker process manager for the given entry."""
         worker_id = self._worker_id_for(entry)
         if worker_id not in self._worker_managers:
-            self._worker_managers[worker_id] = WorkerProcessManager(worker_id=worker_id)
+            manager = WorkerProcessManager(worker_id=worker_id)
+            existing = self._worker_managers.setdefault(worker_id, manager)
+            if existing is not manager:
+                return existing
         return self._worker_managers[worker_id]
 
     def _execute_isolated_sync(
@@ -385,14 +381,19 @@ class ToolExecutionEngine:
         entry: ToolCatalogEntry,
         tool_call: dict[str, Any],
         tool_call_id: str,
+        in_flight: _InFlight,
     ) -> dict[str, Any]:
         """Execute an isolated (non-cooperative) tool synchronously.
 
         The tool runs in a separate worker process with process-group isolation.
         If the worker crashes or times out, the entire process group is killed.
         """
-        in_flight = _InFlight(tool_call_id, entry)
-        self._in_flight[tool_call_id] = in_flight
+        if in_flight.is_cancelled:
+            return create_tool_error(
+                "cancelled",
+                entry.identity.name,
+                "Cancelled before worker started",
+            )
 
         try:
             manager = self._get_or_create_worker(entry)
@@ -408,7 +409,13 @@ class ToolExecutionEngine:
 
             response = manager.send_request(request)
 
-            if response.status == WorkerStatus.SUCCESS:
+            if in_flight.is_cancelled:
+                final = create_tool_error(
+                    "cancelled",
+                    entry.identity.name,
+                    "Cancelled during execution",
+                )
+            elif response.status == WorkerStatus.SUCCESS:
                 final = create_tool_success("resource", entry.identity.name, response.result)
             elif response.status == WorkerStatus.CANCELLED:
                 final = create_tool_error(
@@ -439,6 +446,7 @@ class ToolExecutionEngine:
         entry: ToolCatalogEntry,
         tool_call: dict[str, Any],
         tool_call_id: str,
+        in_flight: _InFlight,
     ) -> dict[str, Any]:
         """Execute an isolated tool asynchronously.
 
@@ -452,6 +460,7 @@ class ToolExecutionEngine:
             entry,
             tool_call,
             tool_call_id,
+            in_flight,
         )
 
     # ------------------------------------------------------------------
