@@ -22,8 +22,9 @@ from dana.core.session.models import FactType, JournalFact, JSONValue
 
 
 class HostEventType(Enum):
-    """Host-visible event kinds (D1 text-only lifecycle + streaming set)."""
+    """Host-visible event kinds (D1 text-only lifecycle + D2 tool lifecycle + thought)."""
 
+    # D1: Text-only conversation lifecycle
     SESSION_CREATED = "session_created"
     SESSION_LOADED = "session_loaded"
     SESSION_RESUMED = "session_resumed"
@@ -35,6 +36,21 @@ class HostEventType(Enum):
     TURN_INTERRUPTED = "turn_interrupted"
     TURN_ERROR = "turn_error"
     TURN_CANCELLED = "turn_cancelled"
+
+    # D2: Agent thought (not journaled as a fact — emitted live by the agent)
+    THOUGHT = "thought"
+
+    # D2: Tool lifecycle (projected from tool journal facts)
+    TOOL_REQUESTED = "tool_requested"
+    TOOL_AUTHORIZED_OR_DENIED = "tool_authorized_or_denied"
+    TOOL_STARTED = "tool_started"
+    TOOL_PROGRESS = "tool_progress"
+    TOOL_CANCELLATION_REQUESTED = "tool_cancellation_requested"
+    TOOL_RESULT = "tool_result"
+    TOOL_FAILURE = "tool_failure"
+    TOOL_ACKNOWLEDGED = "tool_acknowledged"
+    TOOL_TIMED_OUT = "tool_timed_out"
+    TOOL_EFFECT_UNKNOWN = "tool_effect_unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +90,17 @@ _FACT_TO_EVENT: Mapping[FactType, HostEventType] = {
     FactType.TURN_INTERRUPTED: HostEventType.TURN_INTERRUPTED,
     FactType.TURN_ERROR: HostEventType.TURN_ERROR,
     FactType.TURN_CANCELLED: HostEventType.TURN_CANCELLED,
+    # D2: Tool lifecycle facts
+    FactType.TOOL_REQUESTED: HostEventType.TOOL_REQUESTED,
+    FactType.TOOL_AUTHORIZED_OR_DENIED: HostEventType.TOOL_AUTHORIZED_OR_DENIED,
+    FactType.TOOL_STARTED: HostEventType.TOOL_STARTED,
+    FactType.TOOL_PROGRESS: HostEventType.TOOL_PROGRESS,
+    FactType.TOOL_CANCELLATION_REQUESTED: HostEventType.TOOL_CANCELLATION_REQUESTED,
+    FactType.TOOL_RESULT: HostEventType.TOOL_RESULT,
+    FactType.TOOL_FAILURE: HostEventType.TOOL_FAILURE,
+    FactType.TOOL_ACKNOWLEDGED: HostEventType.TOOL_ACKNOWLEDGED,
+    FactType.TOOL_TIMED_OUT: HostEventType.TOOL_TIMED_OUT,
+    FactType.TOOL_EFFECT_UNKNOWN: HostEventType.TOOL_EFFECT_UNKNOWN,
 }
 
 # Fact types whose payload carries a displayable "text" field.

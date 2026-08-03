@@ -11,6 +11,11 @@ terminal fact per turn.
 D1 is text-only: the agent is driven through
 :meth:`~dana.core.agent.star_agent_streaming.STARAgentStreamingMixin.aquery_text_stream`,
 which yields immediate text deltas without buffering or emitting THINKING events.
+
+D2 adds tool lifecycle wiring: the session can emit thought events and tool
+lifecycle events (requested, started, progress, result, cancellation) as
+:class:`HostEvent` values. The :class:`ToolExecutionEngine` is wired in to
+execute tool calls and journal tool lifecycle facts.
 """
 
 from __future__ import annotations
@@ -61,6 +66,52 @@ class TurnTerminal:
     error: str | None = None
 
 
+# ---------------------------------------------------------------------------
+# D2: Agent stream event types — richer than text-only
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class AgentThought:
+    """A thought/thinking chunk emitted by the agent during a turn.
+
+    The session yields a :attr:`HostEventType.THOUGHT` host event for each
+    thought chunk.
+    """
+
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class AgentToolCallRequest:
+    """A tool call request emitted by the agent.
+
+    The session routes this through the :class:`ToolExecutionEngine` and
+    yields tool lifecycle host events.
+    """
+
+    tool_call_id: str
+    tool_name: str
+    arguments: dict[str, Any]
+    kind: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AgentToolResult:
+    """A tool result emitted by the agent (after the engine executed it).
+
+    The session yields a :attr:`HostEventType.TOOL_RESULT` host event.
+    """
+
+    tool_call_id: str
+    result: dict[str, Any] | None = None
+    error: str | None = None
+
+
+# Union of all event types the agent can yield in its stream.
+AgentStreamEvent = str | AgentThought | AgentToolCallRequest | AgentToolResult
+
+
 class SessionBusy(Exception):
     """Raised when a prompt conflicts with an already-active turn."""
 
@@ -96,6 +147,8 @@ class AgentSession:
         repository: JournalRepository,
         agent_factory: Callable[[], Any],
         protected_state_codec: ProtectedStateCodec | None = None,
+        tool_engine: Any | None = None,
+        use_legacy_executor: bool = False,
     ) -> None:
         self._owner_scope = owner_scope
         self._session_id = session_id
@@ -109,6 +162,10 @@ class AgentSession:
         self._agent: Any = None
         self._current_version: int = 0
         self._last_terminal: TurnTerminal | None = None
+        # D2: Tool execution engine (optional — None for text-only sessions)
+        self._tool_engine = tool_engine
+        # D2: Rollback flag — selects legacy executor for non-ACP hosts
+        self._use_legacy_executor = use_legacy_executor
 
     @property
     def last_terminal(self) -> TurnTerminal | None:
@@ -443,3 +500,320 @@ class AgentSession:
         if entries is None:
             return
         entries.append(TimelineEntry(entry_type=TimelineEntryType.USER_MESSAGE, content=text))
+
+    # ------------------------------------------------------------------
+    # D2: Tool lifecycle — emit host events and journal tool facts
+    # ------------------------------------------------------------------
+
+    async def emit_thought(self, text: str, correlation_id: str) -> HostEvent:
+        """Emit a thought event (not journaled — live-only)."""
+        event = HostEvent(
+            event_type=HostEventType.THOUGHT,
+            sequence=0,
+            correlation_id=correlation_id,
+            timestamp=datetime.now(UTC),
+            text=text,
+        )
+        return event
+
+    async def journal_tool_requested(
+        self,
+        tool_call_id: str,
+        tool_name: str,
+        correlation_id: str,
+        arguments: dict[str, Any] | None = None,
+        kind: str | None = None,
+    ) -> HostEvent:
+        """Journal a TOOL_REQUESTED fact and return the host event."""
+        facts = [
+            NewJournalFact(
+                fact_type=FactType.TOOL_REQUESTED,
+                correlation_id=correlation_id,
+                causation_id=correlation_id,
+                payload={
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "arguments": arguments or {},
+                    "kind": kind,
+                },
+            )
+        ]
+        result = await self._repository.append(self._owner_scope, self._session_id, self._current_version, facts)
+        self._current_version = result.new_version
+        return HostEvent(
+            event_type=HostEventType.TOOL_REQUESTED,
+            sequence=result.appended_facts[0].sequence,
+            correlation_id=correlation_id,
+            timestamp=result.appended_facts[0].timestamp,
+            metadata={
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "kind": kind,
+                "raw_input": arguments,
+            },
+        )
+
+    async def journal_tool_authorized_or_denied(
+        self,
+        tool_call_id: str,
+        correlation_id: str,
+        authorized: bool = True,
+        reason: str | None = None,
+    ) -> HostEvent:
+        """Journal a TOOL_AUTHORIZED_OR_DENIED fact and return the host event."""
+        facts = [
+            NewJournalFact(
+                fact_type=FactType.TOOL_AUTHORIZED_OR_DENIED,
+                correlation_id=correlation_id,
+                causation_id=correlation_id,
+                payload={
+                    "tool_call_id": tool_call_id,
+                    "authorized": authorized,
+                    "reason": reason,
+                },
+            )
+        ]
+        result = await self._repository.append(self._owner_scope, self._session_id, self._current_version, facts)
+        self._current_version = result.new_version
+        return HostEvent(
+            event_type=HostEventType.TOOL_AUTHORIZED_OR_DENIED,
+            sequence=result.appended_facts[0].sequence,
+            correlation_id=correlation_id,
+            timestamp=result.appended_facts[0].timestamp,
+            metadata={
+                "tool_call_id": tool_call_id,
+                "authorized": authorized,
+                "reason": reason,
+            },
+        )
+
+    async def journal_tool_started(
+        self,
+        tool_call_id: str,
+        correlation_id: str,
+    ) -> HostEvent:
+        """Journal a TOOL_STARTED fact and return the host event."""
+        facts = [
+            NewJournalFact(
+                fact_type=FactType.TOOL_STARTED,
+                correlation_id=correlation_id,
+                causation_id=correlation_id,
+                payload={"tool_call_id": tool_call_id},
+            )
+        ]
+        result = await self._repository.append(self._owner_scope, self._session_id, self._current_version, facts)
+        self._current_version = result.new_version
+        return HostEvent(
+            event_type=HostEventType.TOOL_STARTED,
+            sequence=result.appended_facts[0].sequence,
+            correlation_id=correlation_id,
+            timestamp=result.appended_facts[0].timestamp,
+            metadata={"tool_call_id": tool_call_id},
+        )
+
+    async def journal_tool_progress(
+        self,
+        tool_call_id: str,
+        correlation_id: str,
+        progress: dict[str, Any] | None = None,
+    ) -> HostEvent:
+        """Journal a TOOL_PROGRESS fact and return the host event."""
+        facts = [
+            NewJournalFact(
+                fact_type=FactType.TOOL_PROGRESS,
+                correlation_id=correlation_id,
+                causation_id=correlation_id,
+                payload={
+                    "tool_call_id": tool_call_id,
+                    "progress": progress or {},
+                },
+            )
+        ]
+        result = await self._repository.append(self._owner_scope, self._session_id, self._current_version, facts)
+        self._current_version = result.new_version
+        return HostEvent(
+            event_type=HostEventType.TOOL_PROGRESS,
+            sequence=result.appended_facts[0].sequence,
+            correlation_id=correlation_id,
+            timestamp=result.appended_facts[0].timestamp,
+            metadata={"tool_call_id": tool_call_id, "progress": progress},
+        )
+
+    async def journal_tool_cancellation_requested(
+        self,
+        tool_call_id: str,
+        correlation_id: str,
+    ) -> HostEvent:
+        """Journal a TOOL_CANCELLATION_REQUESTED fact and return the host event."""
+        facts = [
+            NewJournalFact(
+                fact_type=FactType.TOOL_CANCELLATION_REQUESTED,
+                correlation_id=correlation_id,
+                causation_id=correlation_id,
+                payload={"tool_call_id": tool_call_id},
+            )
+        ]
+        result = await self._repository.append(self._owner_scope, self._session_id, self._current_version, facts)
+        self._current_version = result.new_version
+        return HostEvent(
+            event_type=HostEventType.TOOL_CANCELLATION_REQUESTED,
+            sequence=result.appended_facts[0].sequence,
+            correlation_id=correlation_id,
+            timestamp=result.appended_facts[0].timestamp,
+            metadata={"tool_call_id": tool_call_id},
+        )
+
+    async def journal_tool_terminal(
+        self,
+        tool_call_id: str,
+        correlation_id: str,
+        terminal_type: FactType,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> HostEvent:
+        """Journal a terminal tool fact and return the host event.
+
+        Args:
+            terminal_type: One of TOOL_RESULT, TOOL_FAILURE, TOOL_ACKNOWLEDGED,
+                TOOL_TIMED_OUT, TOOL_EFFECT_UNKNOWN.
+        """
+        payload: dict[str, Any] = {"tool_call_id": tool_call_id}
+        if result is not None:
+            payload["result"] = result
+        if error is not None:
+            payload["error"] = error
+
+        facts = [
+            NewJournalFact(
+                fact_type=terminal_type,
+                correlation_id=correlation_id,
+                causation_id=correlation_id,
+                payload=payload,
+            )
+        ]
+        result_obj = await self._repository.append(self._owner_scope, self._session_id, self._current_version, facts)
+        self._current_version = result_obj.new_version
+
+        # Map terminal fact type to host event type
+        event_type_map = {
+            FactType.TOOL_RESULT: HostEventType.TOOL_RESULT,
+            FactType.TOOL_FAILURE: HostEventType.TOOL_FAILURE,
+            FactType.TOOL_ACKNOWLEDGED: HostEventType.TOOL_ACKNOWLEDGED,
+            FactType.TOOL_TIMED_OUT: HostEventType.TOOL_TIMED_OUT,
+            FactType.TOOL_EFFECT_UNKNOWN: HostEventType.TOOL_EFFECT_UNKNOWN,
+        }
+        host_type = event_type_map[terminal_type]
+
+        meta: dict[str, Any] = {"tool_call_id": tool_call_id}
+        if result is not None:
+            meta["result"] = result
+        if error is not None:
+            meta["error"] = error
+
+        return HostEvent(
+            event_type=host_type,
+            sequence=result_obj.appended_facts[0].sequence,
+            correlation_id=correlation_id,
+            timestamp=result_obj.appended_facts[0].timestamp,
+            metadata=meta,
+        )
+
+    async def execute_tool_call(
+        self,
+        tool_call_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        correlation_id: str,
+        kind: str | None = None,
+    ) -> AsyncIterator[HostEvent]:
+        """Execute a single tool call through the engine, yielding lifecycle events.
+
+        Yields host events for each lifecycle stage: requested, started,
+        progress (if any), and terminal (result/failure/cancellation).
+
+        If ``_use_legacy_executor`` is set, routes through the legacy executor
+        (non-ACP host fallback per ADR-012).
+        """
+        # 1. Journal TOOL_REQUESTED
+        yield await self.journal_tool_requested(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            correlation_id=correlation_id,
+            arguments=arguments,
+            kind=kind,
+        )
+
+        # 2. Authorize (default: authorized)
+        yield await self.journal_tool_authorized_or_denied(
+            tool_call_id=tool_call_id,
+            correlation_id=correlation_id,
+            authorized=True,
+        )
+
+        # 3. Journal TOOL_STARTED
+        yield await self.journal_tool_started(
+            tool_call_id=tool_call_id,
+            correlation_id=correlation_id,
+        )
+
+        if self._tool_engine is None:
+            # No engine — emit a result with a stub
+            yield await self.journal_tool_terminal(
+                tool_call_id=tool_call_id,
+                correlation_id=correlation_id,
+                terminal_type=FactType.TOOL_RESULT,
+                result={"success": True, "message": f"Tool {tool_name} executed (no engine)"},
+            )
+            return
+
+        # 4. Execute via engine
+        try:
+            tool_call = {
+                "tool_call_id": tool_call_id,
+                "function": tool_name,
+                "arguments": arguments,
+            }
+
+            if self._use_legacy_executor:
+                # Legacy executor path (non-ACP host fallback)
+                result_dict = self._tool_engine.execute(tool_call)
+            else:
+                result_dict = await self._tool_engine.execute_async(tool_call)
+
+            # 5. Journal terminal outcome
+            if result_dict.get("success"):
+                yield await self.journal_tool_terminal(
+                    tool_call_id=tool_call_id,
+                    correlation_id=correlation_id,
+                    terminal_type=FactType.TOOL_RESULT,
+                    result=result_dict.get("result") or result_dict,
+                )
+            else:
+                error = result_dict.get("error", str(result_dict.get("message", "Tool execution failed")))
+                yield await self.journal_tool_terminal(
+                    tool_call_id=tool_call_id,
+                    correlation_id=correlation_id,
+                    terminal_type=FactType.TOOL_FAILURE,
+                    error=error,
+                )
+
+        except asyncio.CancelledError:
+            # Tool was cancelled — journal cancellation states
+            yield await self.journal_tool_cancellation_requested(
+                tool_call_id=tool_call_id,
+                correlation_id=correlation_id,
+            )
+            yield await self.journal_tool_terminal(
+                tool_call_id=tool_call_id,
+                correlation_id=correlation_id,
+                terminal_type=FactType.TOOL_ACKNOWLEDGED,
+                result={"cancellation": "acknowledged"},
+            )
+
+        except Exception as exc:
+            yield await self.journal_tool_terminal(
+                tool_call_id=tool_call_id,
+                correlation_id=correlation_id,
+                terminal_type=FactType.TOOL_FAILURE,
+                error=str(exc),
+            )
