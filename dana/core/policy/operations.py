@@ -65,6 +65,9 @@ def build_policy_operation(
     matching catalog entry (per ADR-004). When no catalog or no match is found,
     the operation is treated as unknown/sensitive (fail cautious).
 
+    ``affected_locations`` is populated from common argument names
+    (``path``, ``file``, ``url``, ``target``, ``directory``).
+
     Args:
         tool_call: The raw tool call dict from the model.
         catalog: Optional ToolCatalog to resolve effect metadata.
@@ -95,10 +98,23 @@ def build_policy_operation(
         tool_identity = ToolIdentity(name=function_name)
         effects = EffectMetadata.unknown()
 
+    # Extract affected locations from common argument names
+    _LOCATION_KEYS = frozenset({"path", "file", "url", "target", "directory"})
+    affected_locations: list[str] = []
+    for key in _LOCATION_KEYS:
+        val = arguments.get(key)
+        if isinstance(val, str) and val:
+            affected_locations.append(val)
+        elif isinstance(val, list):
+            for item in val:
+                if isinstance(item, str) and item:
+                    affected_locations.append(item)
+
     return Operation(
         tool_identity=tool_identity,
         arguments=arguments,
         effects=effects,
+        affected_locations=tuple(affected_locations),
         owner=owner,
         workspace=workspace,
         session_context=session_context or {},

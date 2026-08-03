@@ -145,7 +145,7 @@ def grant_matches_operation(
 
     # Location check — empty location means "any location"
     if grant.location:
-        if not any(grant.location in loc for loc in operation.affected_locations):
+        if not any(loc == grant.location or loc.startswith(grant.location.rstrip("/") + "/") for loc in operation.affected_locations):
             return False
 
     return True

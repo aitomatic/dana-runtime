@@ -13,6 +13,7 @@ import pytest
 import pytest_asyncio
 
 from dana.core.policy.effects import Effect, EffectKind, EffectMetadata
+from dana.core.policy.evaluator import PolicyDecision, PolicyEvaluator
 from dana.core.policy.grants import (
     GrantConflict,
     GrantDecision,
@@ -21,6 +22,7 @@ from dana.core.policy.grants import (
     PolicyGrant,
     grant_matches_operation,
 )
+from dana.core.policy.hard_policy import HardPolicy
 from dana.core.policy.modes import PermissionMode
 from dana.core.policy.operations import Operation
 from dana.core.policy.scope import OwnerScope, ScopeMatch, scope_matches
@@ -680,25 +682,94 @@ class TestSQLiteGrantStore:
 
 
 class TestFailClosed:
-    """Timeout/disconnect/cancel all result in deny (fail-closed)."""
+    """Timeout/disconnect/cancel all result in deny (fail-closed).
+
+    The PolicyEvaluator chains HardPolicy → GrantStore → PermissionMode.
+    When no grant matches and the mode doesn't auto-allow, the result is
+    NEEDS_PROMPT — which the runtime treats as deny if prompting is not
+    possible (e.g. timeout, disconnect, cancel).
+    """
 
     def test_timeout_denies(self):
         """Timeout results in deny — no grant match possible."""
-        # The policy layer treats a timeout as "no decision" → fail-closed → deny.
-        # This is enforced by the policy evaluator, not the grant store.
-        # Here we verify the grant store returns no match for a timed-out context.
-        assert True  # Verified at the policy evaluation layer
+
+        hard_policy = HardPolicy()
+        grant_store = _NoOpGrantStore()
+        evaluator = PolicyEvaluator(hard_policy, grant_store, PermissionMode.DEFAULT)
+
+        op = Operation(
+            tool_identity=ToolIdentity(name="read_file"),
+            arguments={},
+            effects=EffectMetadata(
+                effects=(Effect(kind=EffectKind.READ),),
+                is_sensitive=False,
+            ),
+            owner="user-1",
+            workspace="default",
+        )
+        scope = OwnerScope(owner_id="user-1", workspace="default")
+
+        # In DEFAULT mode with no grants, the result is NEEDS_PROMPT
+        # (not ALLOW). The runtime treats NEEDS_PROMPT as deny when
+        # prompting is not possible (timeout/disconnect/cancel).
+        import asyncio
+
+        result = asyncio.run(evaluator.evaluate(op, scope))
+        assert result.decision is PolicyDecision.NEEDS_PROMPT
+        assert "no matching grant" in result.reason
 
     def test_disconnect_denies(self):
         """Disconnect results in deny — same as timeout."""
-        assert True  # Verified at the policy evaluation layer
+
+        hard_policy = HardPolicy()
+        grant_store = _NoOpGrantStore()
+        evaluator = PolicyEvaluator(hard_policy, grant_store, PermissionMode.DEFAULT)
+
+        op = Operation(
+            tool_identity=ToolIdentity(name="bash_tool"),
+            arguments={"command": "ls"},
+            effects=EffectMetadata(
+                effects=(Effect(kind=EffectKind.EXECUTE),),
+                is_sensitive=False,
+            ),
+            owner="user-1",
+            workspace="default",
+        )
+        scope = OwnerScope(owner_id="user-1", workspace="default")
+
+        import asyncio
+
+        result = asyncio.run(evaluator.evaluate(op, scope))
+        # No grant, DEFAULT mode, not hard-denied → NEEDS_PROMPT
+        assert result.decision is PolicyDecision.NEEDS_PROMPT
 
     def test_cancel_denies(self):
         """Cancel results in deny — same as timeout."""
-        assert True  # Verified at the policy evaluation layer
 
-    def test_no_matching_grant_is_deny(self):
-        """When no grant matches, the result is None (no decision) → fail-closed."""
+        hard_policy = HardPolicy()
+        grant_store = _NoOpGrantStore()
+        evaluator = PolicyEvaluator(hard_policy, grant_store, PermissionMode.DEFAULT)
+
+        op = Operation(
+            tool_identity=ToolIdentity(name="delete_file"),
+            arguments={"path": "/tmp/x"},
+            effects=EffectMetadata(
+                effects=(Effect(kind=EffectKind.DELETE),),
+                is_sensitive=False,
+            ),
+            owner="user-1",
+            workspace="default",
+        )
+        scope = OwnerScope(owner_id="user-1", workspace="default")
+
+        import asyncio
+
+        result = asyncio.run(evaluator.evaluate(op, scope))
+        # No grant, DEFAULT mode, not hard-denied → NEEDS_PROMPT
+        assert result.decision is PolicyDecision.NEEDS_PROMPT
+
+    def test_no_matching_grant_is_needs_prompt(self):
+        """When no grant matches, the result is NEEDS_PROMPT (fail-closed)."""
         match = GrantMatch(matched=None)
         assert match.decision is None
         assert match.grant_id is None
@@ -824,6 +895,34 @@ class TestPolicyGrant:
 # =========================================================================
 
 
+class _NoOpGrantStore:
+    """A grant store that never matches any operation."""
+
+    async def find_matching_grants(self, scope, operation):
+        from dana.core.policy.grants import GrantMatch
+
+        return GrantMatch(matched=None)
+
+    async def create_grant(self, grant):
+        pass
+
+    async def get_grant(self, scope, grant_id):
+        from dana.core.policy.grants import GrantNotFound
+
+        raise GrantNotFound(grant_id)
+
+    async def list_grants(self, scope, *, active_only=True):
+        return []
+
+    async def revoke_grant(self, scope, grant_id):
+        from dana.core.policy.grants import GrantNotFound
+
+        raise GrantNotFound(grant_id)
+
+    async def close(self):
+        pass
+
+
 class TestEdgeCases:
     """Edge cases for permission modes, grants, and scoping."""
 
@@ -846,16 +945,34 @@ class TestEdgeCases:
         assert grant_matches_operation(grant, read_operation) is False
 
     def test_race_between_grant_creation_and_operation(self, owner_a):
-        """A grant created after an operation is queued does not affect it.
+        """A grant created after an operation is evaluated does not affect it.
 
         Edge case: The grant store is checked at operation evaluation time.
         A grant created after that point does not retroactively apply.
         """
-        # This is a temporal ordering concern, not a grant store concern.
-        # The policy evaluator checks the store at evaluation time.
-        # Verified by the store's find_matching_grants returning only
-        # grants that exist at call time.
-        assert True
+        op = Operation(
+            tool_identity=ToolIdentity(name="read_file"),
+            arguments={},
+            effects=EffectMetadata(
+                effects=(Effect(kind=EffectKind.READ),),
+                is_sensitive=False,
+            ),
+            owner="user-1",
+            workspace="default",
+        )
+        grant = PolicyGrant(
+            grant_id="g1",
+            owner_scope=owner_a,
+            decision=GrantDecision.ALLOW,
+            tool_identity="read_file",
+            effect_kind=EffectKind.READ,
+        )
+        # Grant matches the operation
+        assert grant_matches_operation(grant, op) is True
+        # If the grant is created after evaluation, it doesn't retroactively apply.
+        # This is a temporal ordering concern enforced by the evaluator calling
+        # find_matching_grants at evaluation time, not by the grant model itself.
+        # The grant model correctly reports match; the evaluator controls timing.
 
     def test_cross_owner_isolation_concurrent_sessions(self, owner_a, owner_b):
         """Cross-owner isolation holds under concurrent sessions.
