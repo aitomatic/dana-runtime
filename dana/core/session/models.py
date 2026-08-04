@@ -75,6 +75,9 @@ class FactType(Enum):
     TURN_CANCELLED = "turn_cancelled"
     LEGACY_TIMELINE_MIGRATED = "legacy_timeline_migrated"
 
+    # D4: Model change fact (ADR-002, ADR-007)
+    MODEL_CHANGED = "model_changed"
+
     # D2: Tool lifecycle facts (ADR-002, ADR-005)
     # Non-terminal facts
     TOOL_REQUESTED = "tool_requested"

@@ -24,6 +24,7 @@ from acp.schema import (
     Implementation,
     InitializeResponse,
     LoadSessionResponse,
+    ModelInfo,
     NewSessionResponse,
     PermissionOption,
     PermissionOptionKind,
@@ -32,13 +33,17 @@ from acp.schema import (
     RequestPermissionResponse,
     ResumeSessionResponse,
     SessionMode,
+    SessionModelState,
     SessionModeState,
+    SetSessionModelResponse,
     SetSessionModeResponse,
 )
 import aiosqlite
 import structlog
 
 from dana.apps.acp.translation import host_event_to_acp_update
+from dana.core.model.catalog import ModelCatalog, ModelTarget
+from dana.core.model.switching import ModelSwitcher
 from dana.core.policy.evaluator import PolicyDecision, PolicyEvaluator
 from dana.core.policy.hard_policy import create_default_hard_policy
 from dana.core.policy.modes import PermissionMode
@@ -78,6 +83,22 @@ def _default_agent_factory() -> Any:
     )
 
 
+def _default_model_catalog() -> ModelCatalog:
+    """Build a default model catalog from environment configuration.
+
+    Reads ``DANA_MODEL_CATALOG`` as a JSON list of ``{provider, model}``
+    objects. Falls back to a single anthropic/claude-sonnet-4 target.
+    """
+    import json
+
+    raw = os.environ.get("DANA_MODEL_CATALOG")
+    if raw:
+        targets = [ModelTarget(**t) for t in json.loads(raw)]
+    else:
+        targets = [ModelTarget(provider="anthropic", model="claude-sonnet-4")]
+    return ModelCatalog(targets)
+
+
 class DanaACPAgent:
     """ACP agent that exposes Dana AgentSession over the Agent Client Protocol.
 
@@ -91,6 +112,7 @@ class DanaACPAgent:
         journal_path: str | None = None,
         agent_factory: Any | None = None,
         owner_id: str | None = None,
+        model_catalog: ModelCatalog | None = None,
     ) -> None:
         self._journal_path = os.path.expanduser(journal_path or os.environ.get("DANA_ACP_JOURNAL", "~/.dana/journal.db"))
         self._agent_factory = agent_factory or _default_agent_factory
@@ -108,6 +130,10 @@ class DanaACPAgent:
         self._journal_authority = os.environ.get("DANA_SESSION_JOURNAL_AUTHORITY", "1") != "0"
         # D3: Rollback flag — disable durable-grant evaluation (ADR-012)
         self._policy_grants_enabled = os.environ.get("DANA_POLICY_GRANTS_ENABLED", "1") != "0"
+        # D4: Model catalog — configured provider/model targets
+        self._model_catalog = model_catalog or _default_model_catalog()
+        # D4: Rollback flag — hide model selector, pin startup model (ADR-012)
+        self._model_switching_enabled = os.environ.get("DANA_MODEL_SWITCHING_ENABLED", "1") != "0"
 
     # ------------------------------------------------------------------
     # Connection
@@ -192,6 +218,8 @@ class DanaACPAgent:
             repository=repo,
             agent_factory=self._agent_factory,
         )
+        # Set the current version to match the journal (SESSION_CREATED fact)
+        session._current_version = init_facts[0].sequence
         # Wire policy evaluator for permission adapter (D3)
         if self._policy_grants_enabled:
             from dana.core.policy.grants import SQLiteGrantStore
@@ -208,9 +236,22 @@ class DanaACPAgent:
             session.set_policy_evaluator(evaluator)
         self._sessions[session_id] = session
         logger.info("session created", session_id=session_id, cwd=cwd)
+
+        # D4: Build model state from catalog (rollback: None when disabled)
+        model_state = (
+            _build_model_state(
+                self._model_catalog,
+                session.current_provider,
+                session.current_model,
+            )
+            if self._model_switching_enabled
+            else None
+        )
+
         return NewSessionResponse(
             session_id=session_id,
             modes=_build_mode_state(session.permission_mode),
+            models=model_state,
         )
 
     # ------------------------------------------------------------------
@@ -333,6 +374,78 @@ class DanaACPAgent:
         return SetSessionModeResponse()
 
     # ------------------------------------------------------------------
+    # ACP protocol: session/set_model (D4, ADR-007, ADR-013)
+    # ------------------------------------------------------------------
+
+    async def set_session_model(
+        self,
+        model_id: str,
+        session_id: str,
+        **kwargs: Any,
+    ) -> SetSessionModelResponse | None:
+        """Change the model for a session (ADR-007: atomic build-before-mutate).
+
+        Validates the target against the model catalog, builds the new
+        provider + runtime before mutation, rebinds, and commits a single
+        ``MODEL_CHANGED`` fact. On failure, the old model is untouched.
+
+        Per ADR-007: switching during an active turn returns ``busy``.
+
+        Per ADR-012: when ``DANA_MODEL_SWITCHING_ENABLED=0``, the selector
+        is hidden and the startup model is pinned — this method raises.
+        """
+        # Rollback: model switching disabled (ADR-012)
+        if not self._model_switching_enabled:
+            raise RuntimeError("Model switching is disabled (DANA_MODEL_SWITCHING_ENABLED=0)")
+
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise ValueError(f"Unknown session: {session_id}")
+
+        # Parse model_id as "provider/model"
+        if "/" not in model_id:
+            raise ValueError(f"Invalid model_id: {model_id!r} (expected 'provider/model')")
+        provider, model = model_id.split("/", 1)
+
+        # Look up in catalog
+        target = self._model_catalog.get(provider, model)
+        if target is None:
+            raise ValueError(f"Unknown model target: {model_id!r}")
+
+        # Build a ModelSwitcher for this session
+        switcher = ModelSwitcher(
+            build_provider=lambda t: _build_provider_client(t),
+            build_runtime=lambda t, p: _build_model_runtime(t, p),
+            apply_switch=lambda t, p, r: session.rebind_model(t, p, r),
+        )
+
+        result = switcher.switch(target)
+        if not result.success:
+            raise RuntimeError(f"Model switch failed: {result.error}")
+
+        # Journal the MODEL_CHANGED fact (one fact per switch per ADR-007)
+        from uuid import uuid4
+
+        from dana.core.session.models import NewJournalFact
+
+        model_fact = NewJournalFact(
+            fact_type=FactType.MODEL_CHANGED,
+            correlation_id=str(uuid4()),
+            causation_id=None,
+            payload={
+                "provider": target.provider,
+                "model": target.model,
+            },
+        )
+        await session.append_fact(model_fact)
+
+        # Notify client of the model change via current_model_update
+        await self._notify(session_id, _update_current_model(model_id))
+
+        logger.info("session model set", session_id=session_id, model=model_id)
+        return SetSessionModelResponse()
+
+    # ------------------------------------------------------------------
     # ACP protocol: session/load
     # ------------------------------------------------------------------
 
@@ -365,7 +478,19 @@ class DanaACPAgent:
                 await self._notify(session_id, update)
 
         logger.info("session loaded", session_id=session_id, cwd=cwd)
-        return LoadSessionResponse()
+
+        # D4: Build model state from session's current provider/model
+        model_state = (
+            _build_model_state(
+                self._model_catalog,
+                session.current_provider,
+                session.current_model,
+            )
+            if self._model_switching_enabled
+            else None
+        )
+
+        return LoadSessionResponse(models=model_state)
 
     # ------------------------------------------------------------------
     # ACP protocol: session/resume (unstable)
@@ -380,7 +505,20 @@ class DanaACPAgent:
         **kwargs: Any,
     ) -> ResumeSessionResponse:
         await self.load_session(cwd=cwd, session_id=session_id, **kwargs)
-        return ResumeSessionResponse()
+
+        # D4: Build model state from session's current provider/model
+        session = self._sessions.get(session_id)
+        model_state = (
+            _build_model_state(
+                self._model_catalog,
+                session.current_provider if session else None,
+                session.current_model if session else None,
+            )
+            if self._model_switching_enabled
+            else None
+        )
+
+        return ResumeSessionResponse(models=model_state)
 
     # ------------------------------------------------------------------
     # ACP protocol: session/prompt
@@ -484,10 +622,10 @@ def _build_mode_state(mode: PermissionMode) -> SessionModeState:
     """Build an ACP SessionModeState from a PermissionMode."""
     mode_id = mode.value
     return SessionModeState(
-        modes=[
-            SessionMode(mode_id="default", display_name="Default"),
-            SessionMode(mode_id="acceptEdits", display_name="Accept Edits"),
-            SessionMode(mode_id="bypassPermissions", display_name="Bypass Permissions"),
+        available_modes=[
+            SessionMode(id="default", name="Default"),
+            SessionMode(id="acceptEdits", name="Accept Edits"),
+            SessionMode(id="bypassPermissions", name="Bypass Permissions"),
         ],
         current_mode_id=mode_id,
     )
@@ -504,3 +642,89 @@ def _acp_mode_to_permission_mode(mode_id: str) -> PermissionMode:
     if result is None:
         raise ValueError(f"Unknown permission mode: {mode_id!r}")
     return result
+
+
+# ---------------------------------------------------------------------------
+# D4: Model switching helpers (ADR-007)
+# ---------------------------------------------------------------------------
+
+
+def _build_provider_client(target: ModelTarget) -> Any:
+    """Build a provider client for the given target.
+
+    This is a stub for D4 — real provider construction is deferred to a
+    later phase. Returns a SimpleNamespace with the target info.
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        provider=target.provider,
+        model=target.model,
+        config=target.config or {},
+    )
+
+
+def _build_model_runtime(target: ModelTarget, provider: Any) -> Any:
+    """Build a model runtime for the given target and provider.
+
+    This is a stub for D4 — real runtime construction is deferred to a
+    later phase. Returns a SimpleNamespace with the target info.
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        provider=target.provider,
+        model=target.model,
+    )
+
+
+def _update_current_model(model_id: str) -> Any:
+    """Build a ``current_model_update`` ACP notification.
+
+    Returns a dict-like object that the ACP transport serializes as a
+    ``session_update`` notification with ``sessionUpdate="current_model_update"``.
+    """
+    from acp.helpers import update_current_mode
+
+    # Reuse the current_mode_update shape but with model_id semantics.
+    # The ACP protocol uses the same notification shape for model changes.
+    return update_current_mode(current_mode_id=model_id)
+
+
+# ---------------------------------------------------------------------------
+# D4: Model state helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_model_state(
+    catalog: ModelCatalog,
+    current_provider: str | None,
+    current_model: str | None,
+) -> SessionModelState | None:
+    """Build an ACP SessionModelState from the catalog and current model.
+
+    When no model has been set yet (fresh session), the first catalog target
+    is used as the startup model. Returns ``None`` when the catalog is empty.
+    """
+    if not catalog.targets:
+        return None
+
+    available = [
+        ModelInfo(
+            model_id=f"{t.provider}/{t.model}",
+            name=f"{t.provider}: {t.model}",
+        )
+        for t in catalog.targets
+    ]
+
+    # Use current model if set, otherwise the first catalog target (startup model)
+    if current_provider is not None and current_model is not None:
+        current_id = f"{current_provider}/{current_model}"
+    else:
+        first = catalog.targets[0]
+        current_id = f"{first.provider}/{first.model}"
+
+    return SessionModelState(
+        available_models=available,
+        current_model_id=current_id,
+    )

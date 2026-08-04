@@ -106,3 +106,36 @@ class ProtectedStateCodec:
         nonce = ciphertext[:_NONCE_LEN]
         body = ciphertext[_NONCE_LEN:]
         return aesgcm.decrypt(nonce, body, aad)
+
+
+def is_protected_state_compatible(
+    protected_payload: bytes | None,
+    fact_provider: str | None,
+    current_provider: str | None,
+) -> bool:
+    """Check whether a protected payload is compatible with the current provider.
+
+    Per ADR-007/ADR-010: protected replay state is included in the Conversation
+    View only when its provider matches the current provider. Incompatible
+    protected state is excluded to prevent cross-provider data leakage.
+
+    Args:
+        protected_payload: The encrypted protected payload, or ``None``.
+        fact_provider: The provider that produced this protected payload
+            (from the fact's payload or context).
+        current_provider: The current provider key for the session.
+
+    Returns:
+        ``True`` if the protected payload should be included (compatible),
+        ``False`` if it should be excluded.
+    """
+    if protected_payload is None:
+        return False
+    if current_provider is None:
+        # No current provider — include (pre-switch state is still valid).
+        return True
+    if fact_provider is None:
+        # No fact provider — include only if there is no current provider
+        # (defensive: unknown provenance is excluded when a provider is set).
+        return False
+    return fact_provider == current_provider

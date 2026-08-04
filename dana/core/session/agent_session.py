@@ -171,6 +171,9 @@ class AgentSession:
         self._permission_mode: PermissionMode = PermissionMode.DEFAULT
         # D3: Policy evaluator (optional — wired by ACP agent for permission adapter)
         self._policy_evaluator: Any = None
+        # D4: Model state — current provider and model for compatibility gating
+        self._current_provider: str | None = None
+        self._current_model: str | None = None
 
     @property
     def last_terminal(self) -> TurnTerminal | None:
@@ -195,6 +198,36 @@ class AgentSession:
         self._permission_mode = mode
         if self._policy_evaluator is not None:
             self._policy_evaluator.set_mode(mode)
+
+    # ------------------------------------------------------------------
+    # D4: Model state (ADR-007)
+    # ------------------------------------------------------------------
+
+    @property
+    def current_provider(self) -> str | None:
+        """The current provider for this session, or ``None``."""
+        return self._current_provider
+
+    @property
+    def current_model(self) -> str | None:
+        """The current model for this session, or ``None``."""
+        return self._current_model
+
+    def rebind_model(self, target: Any, provider: Any, runtime: Any) -> None:
+        """Rebind the session to a new model (ADR-007: atomic switch).
+
+        Called by the ModelSwitcher's ``apply_switch`` callback. Updates
+        the session's provider/model identity in-memory. The caller
+        (DanaACPAgent) journals the MODEL_CHANGED fact asynchronously
+        after the switch completes.
+
+        Args:
+            target: The ModelTarget being switched to.
+            provider: The built provider client.
+            runtime: The built model runtime.
+        """
+        self._current_provider = target.provider
+        self._current_model = target.model
 
     # ------------------------------------------------------------------
     # Public lifecycle
@@ -466,6 +499,25 @@ class AgentSession:
                 self._cancel_event = None
 
     # ------------------------------------------------------------------
+    # D4: Fact append helper (used by model switching)
+    # ------------------------------------------------------------------
+
+    async def append_fact(self, fact: NewJournalFact) -> None:
+        """Append a single fact to the journal.
+
+        Used by the ACP agent to journal model-change facts after a
+        successful model switch. The fact is appended with the current
+        version as the expected version (optimistic concurrency).
+        """
+        result = await self._repository.append(
+            self._owner_scope,
+            self._session_id,
+            self._current_version,
+            [fact],
+        )
+        self._current_version = result.new_version
+
+    # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
@@ -476,7 +528,12 @@ class AgentSession:
             self._agent = self._agent_factory()
         facts = await self._repository.read_facts(self._owner_scope, self._session_id)
         self._current_version = max((f.sequence for f in facts), default=0)
-        view = self._conversation_projector.project(facts)
+        # D4: Pass current provider for compatibility gating on protected state
+        view = self._conversation_projector.project(facts, provider_key=self._current_provider)
+        # D4: Restore model state from projected model changes
+        if view.current_provider is not None and self._current_provider is None:
+            self._current_provider = view.current_provider
+            self._current_model = view.current_model
         self._populate_timeline(view)
 
     async def _flush_chunks(self, correlation_id: str, chunk_buffer: list[str], start_index: int) -> None:
