@@ -78,6 +78,10 @@ class FactType(Enum):
     # D4: Model change fact (ADR-002, ADR-007)
     MODEL_CHANGED = "model_changed"
 
+    # D6: Artifact reference facts (ADR-009)
+    ARTIFACT_REFERENCE = "artifact_reference"
+    ARTIFACT_DELETED = "artifact_deleted"
+
     # D2: Tool lifecycle facts (ADR-002, ADR-005)
     # Non-terminal facts
     TOOL_REQUESTED = "tool_requested"
@@ -207,6 +211,7 @@ class NewJournalFact:
     payload: Mapping[str, JSONValue]
     protected_payload: bytes | None = None
     schema_version: int = 1
+    artifact_refs: tuple[ArtifactRef, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.correlation_id:

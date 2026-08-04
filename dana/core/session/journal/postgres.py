@@ -257,6 +257,7 @@ class PostgresJournalRepository:
                         schema_version=nf.schema_version,
                         payload=nf.payload,
                         protected_payload=nf.protected_payload,
+                        artifact_refs=nf.artifact_refs,
                     )
                 )
             await self._insert_facts(scope, session_id, durable)
