@@ -30,6 +30,7 @@ from uuid import uuid4
 
 import structlog
 
+from dana.core.policy.modes import PermissionMode
 from dana.core.session.journal.protocol import JournalRepository
 from dana.core.session.models import FactType, NewJournalFact, OwnerScope
 from dana.core.session.projections.conversation import ConversationProjector, ConversationView
@@ -166,11 +167,34 @@ class AgentSession:
         self._tool_engine = tool_engine
         # D2: Rollback flag — selects legacy executor for non-ACP hosts
         self._use_legacy_executor = use_legacy_executor
+        # D3: Permission mode state (ADR-013: mode state in session/new + session/set_mode)
+        self._permission_mode: PermissionMode = PermissionMode.DEFAULT
+        # D3: Policy evaluator (optional — wired by ACP agent for permission adapter)
+        self._policy_evaluator: Any = None
 
     @property
     def last_terminal(self) -> TurnTerminal | None:
         """The terminal outcome of the most recently completed turn, or ``None``."""
         return self._last_terminal
+
+    # ------------------------------------------------------------------
+    # D3: Permission mode (ADR-013)
+    # ------------------------------------------------------------------
+
+    @property
+    def permission_mode(self) -> PermissionMode:
+        """The current permission mode for this session."""
+        return self._permission_mode
+
+    def set_permission_mode(self, mode: PermissionMode) -> None:
+        """Set the permission mode (ADR-013: outside an active turn).
+
+        Args:
+            mode: The ``PermissionMode`` to set.
+        """
+        self._permission_mode = mode
+        if self._policy_evaluator is not None:
+            self._policy_evaluator.set_mode(mode)
 
     # ------------------------------------------------------------------
     # Public lifecycle

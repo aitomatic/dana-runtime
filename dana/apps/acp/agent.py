@@ -18,6 +18,7 @@ from typing import Any
 from uuid import uuid4
 
 from acp import PROTOCOL_VERSION
+from acp.helpers import update_current_mode
 from acp.schema import (
     AgentCapabilities,
     Implementation,
@@ -26,10 +27,14 @@ from acp.schema import (
     NewSessionResponse,
     PromptResponse,
     ResumeSessionResponse,
+    SessionMode,
+    SessionModeState,
+    SetSessionModeResponse,
 )
 import structlog
 
 from dana.apps.acp.translation import host_event_to_acp_update
+from dana.core.policy.modes import PermissionMode
 from dana.core.session.agent_session import AgentSession, SessionBusy, TextBlock
 from dana.core.session.journal.models import SessionRecord
 from dana.core.session.journal.protocol import JournalRepository
@@ -180,7 +185,35 @@ class DanaACPAgent:
         )
         self._sessions[session_id] = session
         logger.info("session created", session_id=session_id, cwd=cwd)
-        return NewSessionResponse(session_id=session_id)
+        return NewSessionResponse(
+            session_id=session_id,
+            modes=_build_mode_state(session.permission_mode),
+        )
+
+    # ------------------------------------------------------------------
+    # ACP protocol: session/set_mode (ADR-013)
+    # ------------------------------------------------------------------
+
+    async def set_session_mode(self, mode_id: str, session_id: str, **kwargs: Any) -> SetSessionModeResponse | None:
+        """Change the permission mode for a session (ADR-013: outside an active turn).
+
+        Maps ACP mode IDs to ``PermissionMode`` values:
+        - ``default`` → ``PermissionMode.DEFAULT``
+        - ``acceptEdits`` → ``PermissionMode.ACCEPT_EDITS``
+        - ``bypassPermissions`` → ``PermissionMode.BYPASS_PERMISSIONS``
+        """
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise ValueError(f"Unknown session: {session_id}")
+
+        mode = _acp_mode_to_permission_mode(mode_id)
+        session.set_permission_mode(mode)
+
+        # Notify client of the mode change via current_mode_update
+        await self._notify(session_id, update_current_mode(current_mode_id=mode_id))
+
+        logger.info("session mode set", session_id=session_id, mode=mode_id)
+        return SetSessionModeResponse()
 
     # ------------------------------------------------------------------
     # ACP protocol: session/load
@@ -323,3 +356,34 @@ def _extract_text(block: Any) -> str | None:
             return block.get("text", "")
         return None
     return None
+
+
+# ---------------------------------------------------------------------------
+# Permission mode helpers (ADR-013)
+# ---------------------------------------------------------------------------
+
+
+def _build_mode_state(mode: PermissionMode) -> SessionModeState:
+    """Build an ACP SessionModeState from a PermissionMode."""
+    mode_id = mode.value
+    return SessionModeState(
+        modes=[
+            SessionMode(mode_id="default", display_name="Default"),
+            SessionMode(mode_id="acceptEdits", display_name="Accept Edits"),
+            SessionMode(mode_id="bypassPermissions", display_name="Bypass Permissions"),
+        ],
+        current_mode_id=mode_id,
+    )
+
+
+def _acp_mode_to_permission_mode(mode_id: str) -> PermissionMode:
+    """Map an ACP mode ID to a PermissionMode."""
+    mapping = {
+        "default": PermissionMode.DEFAULT,
+        "acceptEdits": PermissionMode.ACCEPT_EDITS,
+        "bypassPermissions": PermissionMode.BYPASS_PERMISSIONS,
+    }
+    result = mapping.get(mode_id)
+    if result is None:
+        raise ValueError(f"Unknown permission mode: {mode_id!r}")
+    return result
