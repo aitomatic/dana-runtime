@@ -25,15 +25,22 @@ from acp.schema import (
     InitializeResponse,
     LoadSessionResponse,
     NewSessionResponse,
+    PermissionOption,
+    PermissionOptionKind,
     PromptResponse,
+    RequestPermissionRequest,
+    RequestPermissionResponse,
     ResumeSessionResponse,
     SessionMode,
     SessionModeState,
     SetSessionModeResponse,
 )
+import aiosqlite
 import structlog
 
 from dana.apps.acp.translation import host_event_to_acp_update
+from dana.core.policy.evaluator import PolicyDecision, PolicyEvaluator
+from dana.core.policy.hard_policy import create_default_hard_policy
 from dana.core.policy.modes import PermissionMode
 from dana.core.session.agent_session import AgentSession, SessionBusy, TextBlock
 from dana.core.session.journal.models import SessionRecord
@@ -99,6 +106,8 @@ class DanaACPAgent:
         # The flag is parsed now so the rollback switch is operational and
         # discoverable; the legacy code path itself is a future wiring point.
         self._journal_authority = os.environ.get("DANA_SESSION_JOURNAL_AUTHORITY", "1") != "0"
+        # D3: Rollback flag — disable durable-grant evaluation (ADR-012)
+        self._policy_grants_enabled = os.environ.get("DANA_POLICY_GRANTS_ENABLED", "1") != "0"
 
     # ------------------------------------------------------------------
     # Connection
@@ -183,12 +192,120 @@ class DanaACPAgent:
             repository=repo,
             agent_factory=self._agent_factory,
         )
+        # Wire policy evaluator for permission adapter (D3)
+        if self._policy_grants_enabled:
+            from dana.core.policy.grants import SQLiteGrantStore
+            from dana.core.policy.store_schema import POLICY_SQLITE_DDL
+
+            grant_db = await aiosqlite.connect(":memory:")
+            grant_db.row_factory = aiosqlite.Row
+            for stmt in POLICY_SQLITE_DDL:
+                await grant_db.execute(stmt)
+            await grant_db.commit()
+            grant_store = SQLiteGrantStore(grant_db)
+            hard_policy = create_default_hard_policy()
+            evaluator = PolicyEvaluator(hard_policy, grant_store, PermissionMode.DEFAULT)
+            session.set_policy_evaluator(evaluator)
         self._sessions[session_id] = session
         logger.info("session created", session_id=session_id, cwd=cwd)
         return NewSessionResponse(
             session_id=session_id,
             modes=_build_mode_state(session.permission_mode),
         )
+
+    # ------------------------------------------------------------------
+    # ACP protocol: session/request_permission (ADR-013)
+    # ------------------------------------------------------------------
+
+    async def request_permission(
+        self,
+        request: RequestPermissionRequest,
+        session_id: str,
+        **kwargs: Any,
+    ) -> RequestPermissionResponse:
+        """Handle a permission request from the host (ADR-013).
+
+        Evaluates the requested operation through the policy evaluator and
+        returns the available permission options.
+        """
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise ValueError(f"Unknown session: {session_id}")
+
+        evaluator = session.policy_evaluator
+        if evaluator is None:
+            return RequestPermissionResponse(
+                options=[
+                    PermissionOption(
+                        kind=PermissionOptionKind.ALLOW_ONCE,
+                        display_name="Allow Once",
+                    ),
+                    PermissionOption(
+                        kind=PermissionOptionKind.ALLOW_ALWAYS,
+                        display_name="Allow Always",
+                    ),
+                    PermissionOption(
+                        kind=PermissionOptionKind.REJECT_ONCE,
+                        display_name="Reject Once",
+                    ),
+                    PermissionOption(
+                        kind=PermissionOptionKind.REJECT_ALWAYS,
+                        display_name="Reject Always",
+                    ),
+                ],
+            )
+
+        # Build an Operation from the request and evaluate
+        from dana.core.policy.operations import build_policy_operation
+
+        tool_call = {
+            "function": getattr(request, "tool_name", ""),
+            "arguments": getattr(request, "arguments", {}),
+        }
+        op = build_policy_operation(
+            tool_call,
+            catalog=None,
+            owner=session.owner_scope.owner_id,
+            workspace=session.owner_scope.workspace,
+        )
+        result = await evaluator.evaluate(op, session.owner_scope)
+
+        options: list[PermissionOption] = []
+        if result.decision is PolicyDecision.DENY:
+            return RequestPermissionResponse(
+                options=[],
+                denied_reason=result.reason,
+            )
+
+        if self._policy_grants_enabled:
+            options = [
+                PermissionOption(
+                    kind=PermissionOptionKind.ALLOW_ONCE,
+                    display_name="Allow Once",
+                ),
+                PermissionOption(
+                    kind=PermissionOptionKind.ALLOW_ALWAYS,
+                    display_name="Allow Always",
+                ),
+                PermissionOption(
+                    kind=PermissionOptionKind.REJECT_ONCE,
+                    display_name="Reject Once",
+                ),
+                PermissionOption(
+                    kind=PermissionOptionKind.REJECT_ALWAYS,
+                    display_name="Reject Always",
+                ),
+            ]
+        else:
+            # Rollback: only allow-once (ADR-012)
+            options = [
+                PermissionOption(
+                    kind=PermissionOptionKind.ALLOW_ONCE,
+                    display_name="Allow Once",
+                ),
+            ]
+
+        return RequestPermissionResponse(options=options)
 
     # ------------------------------------------------------------------
     # ACP protocol: session/set_mode (ADR-013)
