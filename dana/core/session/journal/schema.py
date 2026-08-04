@@ -19,7 +19,7 @@ from __future__ import annotations
 
 # Bumped on any backwards-incompatible change to the table shapes. Phase 01
 # ships v1; a future schema change MUST increment this and add a migration.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 # --- SQLite DDL -----------------------------------------------------------

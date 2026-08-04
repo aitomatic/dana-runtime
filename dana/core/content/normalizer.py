@@ -91,33 +91,39 @@ DEFAULT_INLINE_SIZE_LIMIT = 1_000_000  # 1 MB
 DEFAULT_MAX_BLOCK_SIZE = 100_000_000  # 100 MB
 
 # Allowed MIME type prefixes for each block type.
-ALLOWED_IMAGE_MIME_TYPES = frozenset({
-    "image/png",
-    "image/jpeg",
-    "image/webp",
-    "image/gif",
-    "image/avif",
-    "image/tiff",
-    "image/bmp",
-})
+ALLOWED_IMAGE_MIME_TYPES = frozenset(
+    {
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+        "image/avif",
+        "image/tiff",
+        "image/bmp",
+    }
+)
 
-ALLOWED_DOCUMENT_MIME_TYPES = frozenset({
-    "application/pdf",
-    "text/plain",
-    "text/markdown",
-    "text/csv",
-    "application/json",
-    "application/xml",
-    "text/html",
-})
+ALLOWED_DOCUMENT_MIME_TYPES = frozenset(
+    {
+        "application/pdf",
+        "text/plain",
+        "text/markdown",
+        "text/csv",
+        "application/json",
+        "application/xml",
+        "text/html",
+    }
+)
 
-ALLOWED_RESOURCE_MIME_TYPES = frozenset({
-    "application/octet-stream",
-    "application/zip",
-    "application/gzip",
-    "application/x-tar",
-    "application/x-7z-compressed",
-})
+ALLOWED_RESOURCE_MIME_TYPES = frozenset(
+    {
+        "application/octet-stream",
+        "application/zip",
+        "application/gzip",
+        "application/x-tar",
+        "application/x-7z-compressed",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -199,12 +205,19 @@ class ContentNormalizer:
 
         return self._normalize_media_block(block, media_type, "image", workspace)
 
-    def _normalize_embedded_resource(self, block: dict) -> NormalizedMediaBlock:
-        """Normalize an embedded resource block (inline data)."""
+    def _normalize_embedded_resource(self, block: dict, workspace: str | None = None) -> NormalizedMediaBlock:
+        """Normalize an embedded resource block (inline data only).
+
+        Embedded resources are for inline data only. If a ``path`` field is
+        present, it is rejected — use ``file_resource`` for file-based content.
+        """
         media_type = block.get("media_type", "")
         validate_mime_type(media_type, ALLOWED_DOCUMENT_MIME_TYPES | ALLOWED_RESOURCE_MIME_TYPES)
 
-        return self._normalize_media_block(block, media_type, "embedded_resource", workspace=None)
+        if block.get("path") is not None:
+            raise NormalizationError("embedded_resource blocks cannot use 'path'; use file_resource instead")
+
+        return self._normalize_media_block(block, media_type, "embedded_resource", workspace)
 
     def _normalize_file_resource(self, block: dict, workspace: str | None) -> NormalizedMediaBlock:
         """Normalize a file resource block (file path reference)."""

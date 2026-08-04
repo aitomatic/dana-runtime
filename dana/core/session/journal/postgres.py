@@ -94,8 +94,17 @@ class PostgresJournalRepository:
                 str(SCHEMA_VERSION),
             )
         else:
-            if int(current) != SCHEMA_VERSION:
-                raise JournalError(f"Postgres session journal schema version mismatch: db is v{current}, runtime expects v{SCHEMA_VERSION}")
+            if int(current) == SCHEMA_VERSION:
+                return
+            if int(current) == 1 and SCHEMA_VERSION == 2:
+                # Migration v1 → v2: add artifact_refs column
+                await db.execute("ALTER TABLE session_facts ADD COLUMN artifact_refs JSONB")
+                await db.execute(
+                    "UPDATE journal_meta SET value=$1 WHERE key='schema_version'",
+                    str(SCHEMA_VERSION),
+                )
+                return
+            raise JournalError(f"Postgres session journal schema version mismatch: db is v{current}, runtime expects v{SCHEMA_VERSION}")
 
     # ------------------------------------------------------------------
     # Internal: row <-> domain mappers

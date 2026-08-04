@@ -28,10 +28,7 @@ class MimeTypeError(ContentValidationError):
     def __init__(self, media_type: str, allowed: frozenset[str]) -> None:
         self.media_type = media_type
         self.allowed = allowed
-        super().__init__(
-            f"MIME type {media_type!r} is not allowed. "
-            f"Allowed types: {', '.join(sorted(allowed))}"
-        )
+        super().__init__(f"MIME type {media_type!r} is not allowed. Allowed types: {', '.join(sorted(allowed))}")
 
 
 class OversizedError(ContentValidationError):
@@ -49,9 +46,7 @@ class TraversalError(ContentValidationError):
     def __init__(self, path: str, workspace: str | None) -> None:
         self.path = path
         self.workspace = workspace
-        super().__init__(
-            f"path {path!r} attempts directory traversal outside workspace {workspace!r}"
-        )
+        super().__init__(f"path {path!r} attempts directory traversal outside workspace {workspace!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +94,9 @@ def validate_path_safety(path: str, workspace: str | None) -> None:
     - ``..`` components that escape the workspace
     - Symlink-based traversal (resolves the path and checks the real path)
 
+    Note: this is a time-of-check check. The file should be opened with
+    ``O_NOFOLLOW`` to prevent symlink-swap TOCTOU attacks.
+
     Args:
         path: The file path to validate.
         workspace: The allowed workspace root path. If ``None``, only basic
@@ -107,7 +105,6 @@ def validate_path_safety(path: str, workspace: str | None) -> None:
     Raises:
         TraversalError: If the path attempts traversal outside the workspace.
     """
-    # Basic traversal: check for '..' components
     resolved = Path(path).resolve()
 
     if workspace is not None:
@@ -116,16 +113,3 @@ def validate_path_safety(path: str, workspace: str | None) -> None:
             resolved.relative_to(workspace_path)
         except ValueError:
             raise TraversalError(path, workspace)
-
-    # Check for symlink-based traversal: the resolved path must be under
-    # the workspace (already checked above via relative_to).
-    # Additional check: ensure the original path doesn't contain '..'
-    # that would escape before resolution.
-    if ".." in path.split("/") or ".." in path.split("\\"):
-        # Only raise if the resolved path is actually outside the workspace
-        if workspace is not None:
-            workspace_path = Path(workspace).resolve()
-            try:
-                resolved.relative_to(workspace_path)
-            except ValueError:
-                raise TraversalError(path, workspace)

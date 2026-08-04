@@ -127,10 +127,18 @@ class SQLiteJournalRepository:
                 (str(SCHEMA_VERSION),),
             )
         else:
-            # Phase 01 only supports the current version. No down/up migration yet.
             current = int(row["value"])
-            if current != SCHEMA_VERSION:
-                raise JournalError(f"SQLite session journal schema version mismatch: file is v{current}, runtime expects v{SCHEMA_VERSION}")
+            if current == SCHEMA_VERSION:
+                return
+            if current == 1 and SCHEMA_VERSION == 2:
+                # Migration v1 → v2: add artifact_refs column
+                await db.execute("ALTER TABLE session_facts ADD COLUMN artifact_refs TEXT")
+                await db.execute(
+                    "UPDATE journal_meta SET value=? WHERE key='schema_version'",
+                    (str(SCHEMA_VERSION),),
+                )
+                return
+            raise JournalError(f"SQLite session journal schema version mismatch: file is v{current}, runtime expects v{SCHEMA_VERSION}")
 
     # ------------------------------------------------------------------
     # Internal: row <-> domain mappers
