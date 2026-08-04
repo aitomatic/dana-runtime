@@ -87,9 +87,7 @@ class TestTrack:
     """Artifacts can be tracked with retention policies."""
 
     @pytest.mark.asyncio
-    async def test_track_default_policy(
-        self, manager: ArtifactRetentionManager, owner: OwnerScope
-    ) -> None:
+    async def test_track_default_policy(self, manager: ArtifactRetentionManager, owner: OwnerScope) -> None:
         await manager.track("hash1", owner, "session-1")
         entry = await manager.get_entry("hash1", owner)
         assert entry is not None
@@ -98,9 +96,7 @@ class TestTrack:
         assert entry.policy.policy_type is RetentionPolicyType.KEEP_UNTIL_SESSION_DELETED
 
     @pytest.mark.asyncio
-    async def test_track_custom_policy(
-        self, manager: ArtifactRetentionManager, owner: OwnerScope
-    ) -> None:
+    async def test_track_custom_policy(self, manager: ArtifactRetentionManager, owner: OwnerScope) -> None:
         policy = RetentionPolicy(policy_type=RetentionPolicyType.KEEP_INDEFINITE)
         await manager.track("hash2", owner, "session-1", policy)
         entry = await manager.get_entry("hash2", owner)
@@ -108,9 +104,7 @@ class TestTrack:
         assert entry.policy.policy_type is RetentionPolicyType.KEEP_INDEFINITE
 
     @pytest.mark.asyncio
-    async def test_get_entry_nonexistent(
-        self, manager: ArtifactRetentionManager, owner: OwnerScope
-    ) -> None:
+    async def test_get_entry_nonexistent(self, manager: ArtifactRetentionManager, owner: OwnerScope) -> None:
         entry = await manager.get_entry("nonexistent", owner)
         assert entry is None
 
@@ -124,9 +118,7 @@ class TestEnforceRetention:
     """Enforce retention deletes expired artifacts."""
 
     @pytest.mark.asyncio
-    async def test_delete_immediately(
-        self, manager: ArtifactRetentionManager, store: ArtifactStore, owner: OwnerScope
-    ) -> None:
+    async def test_delete_immediately(self, manager: ArtifactRetentionManager, store: ArtifactStore, owner: OwnerScope) -> None:
         # Store an artifact and track it with DELETE_IMMEDIATELY
         ref = await store.store(b"transient content", "text/plain", owner)
         policy = RetentionPolicy(policy_type=RetentionPolicyType.DELETE_IMMEDIATELY)
@@ -137,9 +129,7 @@ class TestEnforceRetention:
         assert not await store.exists(ref.sha256, owner)
 
     @pytest.mark.asyncio
-    async def test_keep_indefinite_not_deleted(
-        self, manager: ArtifactRetentionManager, store: ArtifactStore, owner: OwnerScope
-    ) -> None:
+    async def test_keep_indefinite_not_deleted(self, manager: ArtifactRetentionManager, store: ArtifactStore, owner: OwnerScope) -> None:
         ref = await store.store(b"permanent content", "text/plain", owner)
         policy = RetentionPolicy(policy_type=RetentionPolicyType.KEEP_INDEFINITE)
         await manager.track(ref.sha256, owner, "session-1", policy)
@@ -149,9 +139,7 @@ class TestEnforceRetention:
         assert await store.exists(ref.sha256, owner)
 
     @pytest.mark.asyncio
-    async def test_scope_isolation(
-        self, manager: ArtifactRetentionManager, store: ArtifactStore, owner: OwnerScope
-    ) -> None:
+    async def test_scope_isolation(self, manager: ArtifactRetentionManager, store: ArtifactStore, owner: OwnerScope) -> None:
         other = OwnerScope(owner_id="other", workspace="ws")
         ref = await store.store(b"content", "text/plain", owner)
         policy = RetentionPolicy(policy_type=RetentionPolicyType.DELETE_IMMEDIATELY)
@@ -164,6 +152,43 @@ class TestEnforceRetention:
 
 
 # ===========================================================================
+# Edge cases
+# ===========================================================================
+
+
+class TestRetentionEdgeCases:
+    """Edge cases: retention expiry race, missing artifact during sweep."""
+
+    @pytest.mark.asyncio
+    async def test_missing_artifact_during_sweep_does_not_block(
+        self, manager: ArtifactRetentionManager, store: ArtifactStore, owner: OwnerScope
+    ) -> None:
+        """If an artifact was already deleted externally, the sweep should not crash."""
+        # Track an artifact that was never stored
+        policy = RetentionPolicy(policy_type=RetentionPolicyType.DELETE_IMMEDIATELY)
+        await manager.track("nonexistent_hash", owner, "session-1", policy)
+
+        # Sweep should not raise even though the artifact doesn't exist
+        deleted = await manager.enforce_retention(owner)
+        assert deleted == 1  # Counts as deleted (entry removed from tracking)
+
+    @pytest.mark.asyncio
+    async def test_retention_expiry_race(
+        self, manager: ArtifactRetentionManager, store: ArtifactStore, owner: OwnerScope
+    ) -> None:
+        """Multiple sweeps should be idempotent."""
+        ref = await store.store(b"race content", "text/plain", owner)
+        policy = RetentionPolicy(policy_type=RetentionPolicyType.DELETE_IMMEDIATELY)
+        await manager.track(ref.sha256, owner, "session-1", policy)
+
+        deleted1 = await manager.enforce_retention(owner)
+        assert deleted1 == 1
+        # Second sweep should find nothing to delete
+        deleted2 = await manager.enforce_retention(owner)
+        assert deleted2 == 0
+
+
+# ===========================================================================
 # Session deletion
 # ===========================================================================
 
@@ -172,9 +197,7 @@ class TestOnSessionDeleted:
     """Session deletion cleans up KEEP_UNTIL_SESSION_DELETED artifacts."""
 
     @pytest.mark.asyncio
-    async def test_session_deleted_cleans_up(
-        self, manager: ArtifactRetentionManager, store: ArtifactStore, owner: OwnerScope
-    ) -> None:
+    async def test_session_deleted_cleans_up(self, manager: ArtifactRetentionManager, store: ArtifactStore, owner: OwnerScope) -> None:
         ref = await store.store(b"session content", "text/plain", owner)
         await manager.track(ref.sha256, owner, "session-1")
 
@@ -183,9 +206,7 @@ class TestOnSessionDeleted:
         assert not await store.exists(ref.sha256, owner)
 
     @pytest.mark.asyncio
-    async def test_different_session_not_affected(
-        self, manager: ArtifactRetentionManager, store: ArtifactStore, owner: OwnerScope
-    ) -> None:
+    async def test_different_session_not_affected(self, manager: ArtifactRetentionManager, store: ArtifactStore, owner: OwnerScope) -> None:
         ref = await store.store(b"other session content", "text/plain", owner)
         await manager.track(ref.sha256, owner, "session-1")
 

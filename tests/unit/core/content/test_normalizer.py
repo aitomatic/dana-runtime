@@ -113,9 +113,7 @@ class TestNormalizeEmbeddedResource:
     def test_embedded_resource_inline(self) -> None:
         normalizer = ContentNormalizer()
         data = b'{"key": "value"}'
-        result = normalizer.normalize(
-            [{"type": "embedded_resource", "media_type": "application/json", "data": data}]
-        )
+        result = normalizer.normalize([{"type": "embedded_resource", "media_type": "application/json", "data": data}])
         assert len(result) == 1
         block = result[0]
         assert isinstance(block, NormalizedMediaBlock)
@@ -125,9 +123,7 @@ class TestNormalizeEmbeddedResource:
     def test_embedded_resource_rejected_mime(self) -> None:
         normalizer = ContentNormalizer()
         with pytest.raises(MimeTypeError):
-            normalizer.normalize(
-                [{"type": "embedded_resource", "media_type": "video/mp4", "data": b"x"}]
-            )
+            normalizer.normalize([{"type": "embedded_resource", "media_type": "video/mp4", "data": b"x"}])
 
 
 # ===========================================================================
@@ -228,6 +224,53 @@ class TestUnsupportedBlockType:
         normalizer = ContentNormalizer()
         with pytest.raises(UnsupportedBlockType):
             normalizer.normalize([{"type": "", "data": b"x"}])
+
+
+# ===========================================================================
+# Edge cases
+# ===========================================================================
+
+
+class TestEdgeCases:
+    """Edge cases: empty payload, zero-byte file, unsupported MIME, symlink."""
+
+    def test_empty_payload(self) -> None:
+        normalizer = ContentNormalizer()
+        result = normalizer.normalize([])
+        assert result == []
+
+    def test_zero_byte_file(self, tmp_path) -> None:
+        normalizer = ContentNormalizer()
+        empty_file = tmp_path / "empty.txt"
+        empty_file.write_text("")
+        result = normalizer.normalize(
+            [{"type": "file_resource", "media_type": "text/plain", "path": str(empty_file)}],
+            workspace=str(tmp_path),
+        )
+        block = result[0]
+        assert isinstance(block, NormalizedMediaBlock)
+        assert block.content == b""
+        assert block.size == 0
+        assert block.sha256 == hashlib.sha256(b"").hexdigest()
+
+    def test_unsupported_mime_type(self) -> None:
+        normalizer = ContentNormalizer()
+        with pytest.raises(MimeTypeError):
+            normalizer.normalize(
+                [{"type": "image", "media_type": "image/x-unsupported", "data": b"x"}]
+            )
+
+    def test_symlink_traversal(self, tmp_path) -> None:
+        normalizer = ContentNormalizer()
+        outside = tmp_path / "outside.txt"
+        outside.write_text("secret")
+        link = tmp_path / "link.txt"
+        link.symlink_to(outside)
+        with pytest.raises(TraversalError):
+            normalizer.normalize(
+                [{"type": "file_resource", "media_type": "text/plain", "path": str(link)}],
+                workspace=str(tmp_path / "subdir"),
+            )
 
 
 # ===========================================================================

@@ -85,9 +85,7 @@ class TestDeduplication:
         assert ref1.size == ref2.size
 
     @pytest.mark.asyncio
-    async def test_different_content_different_hash(
-        self, store: ArtifactStore, owner: OwnerScope
-    ) -> None:
+    async def test_different_content_different_hash(self, store: ArtifactStore, owner: OwnerScope) -> None:
         ref1 = await store.store(b"content a", "text/plain", owner)
         ref2 = await store.store(b"content b", "text/plain", owner)
         assert ref1.sha256 != ref2.sha256
@@ -112,18 +110,12 @@ class TestMissingArtifacts:
             await store.delete("nonexistenthash0000000000000000000000000000000000000000000000", owner)
 
     @pytest.mark.asyncio
-    async def test_exists_returns_false_for_missing(
-        self, store: ArtifactStore, owner: OwnerScope
-    ) -> None:
-        exists = await store.exists(
-            "nonexistenthash0000000000000000000000000000000000000000000000", owner
-        )
+    async def test_exists_returns_false_for_missing(self, store: ArtifactStore, owner: OwnerScope) -> None:
+        exists = await store.exists("nonexistenthash0000000000000000000000000000000000000000000000", owner)
         assert not exists
 
     @pytest.mark.asyncio
-    async def test_exists_returns_true_for_stored(
-        self, store: ArtifactStore, owner: OwnerScope
-    ) -> None:
+    async def test_exists_returns_true_for_stored(self, store: ArtifactStore, owner: OwnerScope) -> None:
         content = b"exists test"
         ref = await store.store(content, "text/plain", owner)
         exists = await store.exists(ref.sha256, owner)
@@ -139,18 +131,14 @@ class TestOwnerScopeIsolation:
     """Artifacts are isolated by OwnerScope."""
 
     @pytest.mark.asyncio
-    async def test_different_owner_cannot_access(
-        self, store: ArtifactStore, owner: OwnerScope, other_owner: OwnerScope
-    ) -> None:
+    async def test_different_owner_cannot_access(self, store: ArtifactStore, owner: OwnerScope, other_owner: OwnerScope) -> None:
         content = b"secret data"
         ref = await store.store(content, "text/plain", owner)
         with pytest.raises(ArtifactNotFound):
             await store.load(ref.sha256, other_owner)
 
     @pytest.mark.asyncio
-    async def test_same_owner_different_workspace_isolation(
-        self, store: ArtifactStore, owner: OwnerScope
-    ) -> None:
+    async def test_same_owner_different_workspace_isolation(self, store: ArtifactStore, owner: OwnerScope) -> None:
         ws1 = OwnerScope(owner_id="test-owner", workspace="ws1")
         ws2 = OwnerScope(owner_id="test-owner", workspace="ws2")
         content = b"workspace data"
@@ -182,6 +170,45 @@ class TestDelete:
         await store.delete(ref.sha256, owner)
         with pytest.raises(ArtifactNotFound):
             await store.load(ref.sha256, owner)
+
+
+# ===========================================================================
+# Edge cases
+# ===========================================================================
+
+
+class TestEdgeCases:
+    """Edge cases: concurrent duplicate uploads, zero-byte content."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_duplicate_uploads(
+        self, store: ArtifactStore, owner: OwnerScope
+    ) -> None:
+        """Simulate concurrent duplicate uploads — both should succeed and return same ref."""
+        content = b"concurrent content"
+        import asyncio
+
+        ref1, ref2 = await asyncio.gather(
+            store.store(content, "text/plain", owner),
+            store.store(content, "text/plain", owner),
+        )
+        assert ref1.sha256 == ref2.sha256
+        assert ref1.uri == ref2.uri
+
+    @pytest.mark.asyncio
+    async def test_zero_byte_artifact(self, store: ArtifactStore, owner: OwnerScope) -> None:
+        ref = await store.store(b"", "text/plain", owner)
+        loaded = await store.load(ref.sha256, owner)
+        assert loaded == b""
+        assert ref.size == 0
+
+    @pytest.mark.asyncio
+    async def test_large_content(self, store: ArtifactStore, owner: OwnerScope) -> None:
+        content = b"x" * 100_000  # 100KB
+        ref = await store.store(content, "application/octet-stream", owner)
+        loaded = await store.load(ref.sha256, owner)
+        assert loaded == content
+        assert ref.size == 100_000
 
 
 # ===========================================================================
