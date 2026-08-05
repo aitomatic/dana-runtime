@@ -6,7 +6,9 @@ namespaced Tool Identity; duplicate detection applies.
 Per ADR-012: rollback disables MCP configuration loading.
 """
 
+from dana.core.mcp.cancellation import MCPCancellationTracker
 from dana.core.mcp.catalog_adapter import MCPCatalogAdapter
+from dana.core.mcp.cleanup import MCPCleanupHandler
 from dana.core.mcp.config import (
     MCPConfig,
     MCPServerConfig,
@@ -15,18 +17,24 @@ from dana.core.mcp.config import (
     load_mcp_config,
     load_mcp_config_from_dict,
 )
+from dana.core.mcp.execution import MCPExecutionAdapter
 from dana.core.mcp.leases import LeaseState, MCPLease, MCPLeaseManager
 from dana.core.mcp.protocol import MCPHandshakeResult, discover_tools, perform_handshake
+from dana.core.mcp.restore import MCPRestoreHandler
 from dana.core.mcp.schema_conversion import mcp_tool_to_catalog_entry
 
 
 __all__ = [
+    "MCPCancellationTracker",
     "MCPCatalogAdapter",
+    "MCPCleanupHandler",
     "MCPConfig",
+    "MCPExecutionAdapter",
     "MCPHandshakeResult",
     "MCPLease",
     "MCPLeaseManager",
     "MCPServerConfig",
+    "MCPRestoreHandler",
     "LeaseState",
     "discover_tools",
     "filter_env_for_server",

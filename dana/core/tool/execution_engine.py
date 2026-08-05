@@ -22,6 +22,8 @@ from uuid import uuid4
 
 import structlog
 
+from dana.core.mcp.cancellation import MCPCancellationTracker
+from dana.core.mcp.execution import MCPExecutionAdapter
 from dana.core.tool.catalog import ToolCatalog, ToolCatalogEntry
 from dana.core.tool.tool_executor_helpers import create_tool_error, create_tool_success
 from dana.core.tool.worker import (
@@ -104,6 +106,53 @@ class ToolExecutionEngine:
 
         # In-flight tracking
         self._in_flight: dict[str, _InFlight] = {}
+
+        # Remote adapters (e.g. MCP) keyed by server name
+        self._remote_adapters: dict[str, MCPExecutionAdapter] = {}
+
+        # Cancellation tracker shared across remote adapters
+        self._mcp_cancellation_tracker = MCPCancellationTracker()
+
+    # ------------------------------------------------------------------
+    # Remote adapter registration (D5 — MCP integration)
+    # ------------------------------------------------------------------
+
+    def register_remote_adapter(
+        self,
+        server_name: str,
+        adapter: MCPExecutionAdapter,
+    ) -> None:
+        """Register a remote execution adapter (e.g. MCP).
+
+        Remote adapters provide callable tool execution for tools that
+        run on external servers. The engine routes tool calls to the
+        appropriate adapter based on the catalog entry's source.
+
+        Args:
+            server_name: The server name (e.g. MCP server name).
+            adapter: The ``MCPExecutionAdapter`` instance.
+        """
+        self._remote_adapters[server_name] = adapter
+        logger.info("remote_adapter_registered", server_name=server_name)
+
+    def unregister_remote_adapter(self, server_name: str) -> None:
+        """Unregister a remote execution adapter.
+
+        Args:
+            server_name: The server name to unregister.
+        """
+        self._remote_adapters.pop(server_name, None)
+        logger.info("remote_adapter_unregistered", server_name=server_name)
+
+    @property
+    def remote_adapters(self) -> dict[str, MCPExecutionAdapter]:
+        """Registered remote adapters (copy)."""
+        return dict(self._remote_adapters)
+
+    @property
+    def mcp_cancellation_tracker(self) -> MCPCancellationTracker:
+        """The MCP cancellation tracker."""
+        return self._mcp_cancellation_tracker
 
     # ------------------------------------------------------------------
     # Public API
@@ -237,6 +286,10 @@ class ToolExecutionEngine:
 
         For isolated tools: kills the worker process group.
 
+        For remote (MCP) tools: sends cancellation notification to the remote
+        server. Per ADR-005, cancellation is terminal only after the remote
+        system acknowledges it.
+
         Never reports ``cancelled`` because a future was abandoned — only when
         cancellation was actually requested and confirmed.
         """
@@ -256,11 +309,43 @@ class ToolExecutionEngine:
                 manager.kill_process_group()
                 logger.info("cancel_isolated", tool_call_id=tool_call_id, worker_id=worker_id)
         else:
-            logger.info(
-                "cancel_cooperative",
-                tool_call_id=tool_call_id,
-                max_latency_ms=entry.max_latency_ms,
-            )
+            # Check if this is a remote (MCP) tool
+            source = entry.identity.source or ""
+            if source.startswith("mcp:"):
+                server_name = source[4:]  # Strip "mcp:" prefix
+                adapter = self._remote_adapters.get(server_name)
+                if adapter is not None:
+                    # Send cancellation notification to the remote server
+                    # This is fire-and-forget; the response will carry
+                    # the acknowledgement
+                    import asyncio
+
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(adapter.send_cancellation_notification(tool_call_id))
+                    except RuntimeError:
+                        logger.warning(
+                            "cancel_mcp_no_loop",
+                            tool_call_id=tool_call_id,
+                            server_name=server_name,
+                        )
+                    logger.info(
+                        "cancel_mcp",
+                        tool_call_id=tool_call_id,
+                        server_name=server_name,
+                    )
+                else:
+                    logger.warning(
+                        "cancel_mcp_no_adapter",
+                        tool_call_id=tool_call_id,
+                        server_name=server_name,
+                    )
+            else:
+                logger.info(
+                    "cancel_cooperative",
+                    tool_call_id=tool_call_id,
+                    max_latency_ms=entry.max_latency_ms,
+                )
 
     # ------------------------------------------------------------------
     # Cooperative execution
@@ -480,6 +565,7 @@ class ToolExecutionEngine:
                 logger.exception("worker_close_error", worker_id=worker_id)
         self._worker_managers.clear()
         self._in_flight.clear()
+        self._remote_adapters.clear()
 
     def assert_no_leaks(self) -> None:
         """Assert that no owned subprocesses are still alive.
