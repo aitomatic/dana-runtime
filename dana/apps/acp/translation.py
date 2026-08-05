@@ -44,10 +44,16 @@ def host_event_to_acp_update(event: HostEvent) -> Any:
     content-final). Text-bearing events become delta chunks. Tool lifecycle
     events become ``tool_call`` or ``tool_call_update`` notifications.
     """
-    # --- D1: Text-bearing events ---
+    # --- D1: Text-bearing events (with D6 multimodal content block support) ---
     if event.event_type is HostEventType.USER_MESSAGE:
+        content_blocks = event.metadata.get("content_blocks")
+        if content_blocks and isinstance(content_blocks, list):
+            return _multimodal_user_message_to_acp(event)
         return update_user_message_text(event.text or "")
     if event.event_type is HostEventType.ASSISTANT_CONTENT_CHUNK:
+        content_blocks = event.metadata.get("content_blocks")
+        if content_blocks and isinstance(content_blocks, list):
+            return _multimodal_agent_chunk_to_acp(event)
         return update_agent_message_text(event.text or "")
     # ASSISTANT_CONTENT_FINAL: already streamed via chunks — skip to avoid duplication.
     # TURN_*, SESSION_*: no ACP update in D1; the response signals completion.
@@ -75,18 +81,6 @@ def host_event_to_acp_update(event: HostEvent) -> Any:
         HostEventType.TOOL_EFFECT_UNKNOWN,
     ):
         return _tool_terminal_to_acp(event)
-
-    # --- D6: Multimodal content blocks ---
-    if event.event_type is HostEventType.USER_MESSAGE:
-        content_blocks = event.metadata.get("content_blocks")
-        if content_blocks and isinstance(content_blocks, list):
-            return _multimodal_user_message_to_acp(event)
-        return update_user_message_text(event.text or "")
-    if event.event_type is HostEventType.ASSISTANT_CONTENT_CHUNK:
-        content_blocks = event.metadata.get("content_blocks")
-        if content_blocks and isinstance(content_blocks, list):
-            return _multimodal_agent_chunk_to_acp(event)
-        return update_agent_message_text(event.text or "")
 
     return None
 

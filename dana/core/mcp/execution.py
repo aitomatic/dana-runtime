@@ -136,6 +136,27 @@ class MCPExecutionAdapter:
         finally:
             self._cancellation_tracker.forget(tool_call_id)
 
+    async def call_tool_from_dict(
+        self,
+        tool_call: dict[str, Any],
+        tool_call_id: str,
+    ) -> dict[str, Any]:
+        """Call an MCP tool from a tool_call dict (engine integration).
+
+        Extracts the function name and arguments from the tool_call dict
+        and delegates to ``call_tool``.
+
+        Args:
+            tool_call: The tool call dict with ``function`` and ``arguments``.
+            tool_call_id: The tool_call_id for cancellation tracking.
+
+        Returns:
+            A result dict from ``call_tool``.
+        """
+        name = tool_call.get("function", "")
+        arguments = tool_call.get("arguments", {})
+        return await self.call_tool(name, arguments, tool_call_id)
+
     async def send_cancellation_notification(
         self,
         tool_call_id: str,

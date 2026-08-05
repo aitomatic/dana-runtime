@@ -183,6 +183,17 @@ class ToolExecutionEngine:
                 in_flight = _InFlight(tool_call_id, entry)
                 self._in_flight[tool_call_id] = in_flight
                 return self._execute_isolated_sync(entry, tool_call, tool_call_id, in_flight)
+            # D5: Route MCP tools to remote adapter
+            if entry.identity.source and entry.identity.source.startswith("mcp:"):
+                server_name = entry.identity.source[len("mcp:") :]
+                adapter = self._remote_adapters.get(server_name)
+                if adapter is not None:
+                    return adapter.call_tool(tool_call, tool_call_id)
+                return create_tool_error(
+                    "remote_adapter_not_found",
+                    function_name,
+                    f"No remote adapter registered for MCP server '{server_name}'",
+                )
             return self._execute_cooperative_sync(entry, tool_call, tool_call_id)
         except Exception as exc:
             return create_tool_error(
@@ -216,6 +227,17 @@ class ToolExecutionEngine:
                 in_flight = _InFlight(tool_call_id, entry)
                 self._in_flight[tool_call_id] = in_flight
                 return await self._execute_isolated_async(entry, tool_call, tool_call_id, in_flight)
+            # D5: Route MCP tools to remote adapter
+            if entry.identity.source and entry.identity.source.startswith("mcp:"):
+                server_name = entry.identity.source[len("mcp:") :]
+                adapter = self._remote_adapters.get(server_name)
+                if adapter is not None:
+                    return await adapter.call_tool_async(tool_call, tool_call_id)
+                return create_tool_error(
+                    "remote_adapter_not_found",
+                    function_name,
+                    f"No remote adapter registered for MCP server '{server_name}'",
+                )
             return await self._execute_cooperative_async(entry, tool_call, tool_call_id)
         except Exception as exc:
             return create_tool_error(

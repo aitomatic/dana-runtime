@@ -592,11 +592,11 @@ class DanaACPAgent:
 
         # D6: Build TextBlocks for the session prompt, preserving content_blocks
         # metadata for multimodal projection
-        text_blocks = _normalized_blocks_to_text_blocks(normalized_blocks)
+        text_blocks, content_blocks_payload = _normalized_blocks_to_text_blocks(normalized_blocks)
         stop_reason = "end_turn"
 
         try:
-            async for event in session.prompt(text_blocks):
+            async for event in session.prompt(text_blocks, content_blocks=content_blocks_payload):
                 update = host_event_to_acp_update(event)
                 if update is not None:
                     await self._notify(session_id, update)
@@ -653,8 +653,11 @@ def _acp_prompt_to_normalized_blocks(prompt: list) -> list[dict]:
     return normalized
 
 
-def _normalized_blocks_to_text_blocks(blocks: list[dict]) -> list[TextBlock]:
+def _normalized_blocks_to_text_blocks(blocks: list[dict]) -> tuple[list[TextBlock], list[dict]]:
     """Convert normalized blocks to TextBlock list for AgentSession.
+
+    Returns a tuple of (text_blocks, content_blocks_payload) where
+    content_blocks_payload carries the multimodal content for journaling.
 
     Text blocks are converted to TextBlock instances. Multimodal blocks
     are serialized as text placeholders with their content_blocks metadata
@@ -672,10 +675,8 @@ def _normalized_blocks_to_text_blocks(blocks: list[dict]) -> list[TextBlock]:
             text_parts.append(text)
             content_blocks_payload.append(block)
         elif block_type == "image":
-            # Serialize image as placeholder text; actual data in content_blocks
             media_type = block.get("media_type", "image/*")
             text_parts.append(f"[Image: {media_type}]")
-            # Convert bytes data to base64 for JSON-safe payload
             data = block.get("data", b"")
             if isinstance(data, bytes):
                 import base64
@@ -694,11 +695,10 @@ def _normalized_blocks_to_text_blocks(blocks: list[dict]) -> list[TextBlock]:
             content_blocks_payload.append(block)
 
     if not text_parts and not has_multimodal:
-        return [TextBlock(text="")]
+        return [TextBlock(text="")], content_blocks_payload
 
-    # Build a single TextBlock with the text summary
     text = " ".join(text_parts) if text_parts else "[multimodal content]"
-    return [TextBlock(text=text)]
+    return [TextBlock(text=text)], content_blocks_payload
 
 
 def _content_blocks_to_text_blocks(blocks: list) -> list[TextBlock]:

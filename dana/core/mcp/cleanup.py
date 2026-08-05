@@ -118,6 +118,7 @@ class MCPCleanupHandler:
         """Reap child PIDs for a server.
 
         Sends SIGTERM first, then SIGKILL after a short grace period.
+        Calls ``os.waitpid`` to prevent zombie accumulation.
         """
         pids = self._child_pids.pop(server_name, [])
         for pid in pids:
@@ -125,10 +126,26 @@ class MCPCleanupHandler:
                 os.kill(pid, signal.SIGTERM)
                 logger.debug("SIGTERM sent to '%s' PID=%d", server_name, pid)
             except ProcessLookupError:
-                # Process already exited
                 pass
             except Exception as exc:
                 logger.warning("Child reap error for '%s' PID=%d: %s", server_name, pid, exc)
+
+        # Grace period for SIGTERM to take effect
+        import time
+
+        time.sleep(0.1)
+
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception as exc:
+                logger.warning("Child kill error for '%s' PID=%d: %s", server_name, pid, exc)
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
 
     def assert_no_leaks(self) -> None:
         """Assert that no owned subprocesses are still alive.
