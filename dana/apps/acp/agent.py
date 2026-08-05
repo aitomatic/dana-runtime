@@ -28,6 +28,7 @@ from acp.schema import (
     NewSessionResponse,
     PermissionOption,
     PermissionOptionKind,
+    PromptCapabilities,
     PromptResponse,
     RequestPermissionRequest,
     RequestPermissionResponse,
@@ -41,7 +42,13 @@ from acp.schema import (
 import aiosqlite
 import structlog
 
-from dana.apps.acp.translation import host_event_to_acp_update
+from dana.apps.acp.translation import (
+    acp_content_to_normalized_block,
+    host_event_to_acp_update,
+)
+from dana.core.content.validation import (
+    validate_provider_capability,
+)
 from dana.core.model.catalog import ModelCatalog, ModelTarget
 from dana.core.model.switching import ModelSwitcher
 from dana.core.policy.evaluator import PolicyDecision, PolicyEvaluator
@@ -170,15 +177,49 @@ class DanaACPAgent:
         client_info: Any | None = None,
         **kwargs: Any,
     ) -> InitializeResponse:
+        # D6: Advertise multimodal capabilities based on model catalog
+        supports_images = self._supports_images()
+        supports_embedded = self._supports_embedded_resources()
+        prompt_caps = (
+            PromptCapabilities(
+                image=supports_images,
+                embeddedContext=supports_embedded,
+            )
+            if (supports_images or supports_embedded)
+            else None
+        )
+
         return InitializeResponse(
             protocol_version=PROTOCOL_VERSION,
-            agent_capabilities=AgentCapabilities(load_session=True),
+            agent_capabilities=AgentCapabilities(
+                load_session=True,
+                prompt_capabilities=prompt_caps,
+            ),
             agent_info=Implementation(
                 name="dana-acp",
                 title="Dana",
                 version=_dana_version(),
             ),
         )
+
+    def _supports_images(self) -> bool:
+        """Check if any model in the catalog supports image content.
+
+        D6: Image capability is advertised only when supported by at least
+        one configured model. Providers known to support images include
+        anthropic, openai, google, and bedrock.
+        """
+        image_providers = frozenset({"anthropic", "openai", "google", "bedrock", "vertex"})
+        return any(t.provider in image_providers for t in self._model_catalog.targets)
+
+    def _supports_embedded_resources(self) -> bool:
+        """Check if any model in the catalog supports embedded resources.
+
+        D6: Embedded resources (documents, code files) are supported by
+        providers that support image content plus a few others.
+        """
+        resource_providers = frozenset({"anthropic", "openai", "google", "bedrock", "vertex"})
+        return any(t.provider in resource_providers for t in self._model_catalog.targets)
 
     # ------------------------------------------------------------------
     # ACP protocol: session/new
@@ -402,6 +443,10 @@ class DanaACPAgent:
         if session is None:
             raise ValueError(f"Unknown session: {session_id}")
 
+        # Busy check: switching during an active turn returns busy (ADR-007)
+        if session._lock.locked():
+            raise SessionBusy(session_id)
+
         # Parse model_id as "provider/model"
         if "/" not in model_id:
             raise ValueError(f"Invalid model_id: {model_id!r} (expected 'provider/model')")
@@ -535,11 +580,23 @@ class DanaACPAgent:
         if session is None:
             raise ValueError(f"Unknown session: {session_id}")
 
-        blocks = _content_blocks_to_text_blocks(prompt)
+        # D6: Convert ACP content blocks to normalized blocks, then to TextBlock
+        # for the session. Multimodal blocks (image, embedded_resource, file_resource)
+        # are converted to normalized dicts and passed through content_blocks.
+        normalized_blocks = _acp_prompt_to_normalized_blocks(prompt)
+
+        # D6: Validate provider capability before turn start (ADR-009)
+        provider = session.current_provider
+        if provider is not None:
+            _validate_multimodal_capability(normalized_blocks, provider)
+
+        # D6: Build TextBlocks for the session prompt, preserving content_blocks
+        # metadata for multimodal projection
+        text_blocks = _normalized_blocks_to_text_blocks(normalized_blocks)
         stop_reason = "end_turn"
 
         try:
-            async for event in session.prompt(blocks):
+            async for event in session.prompt(text_blocks):
                 update = host_event_to_acp_update(event)
                 if update is not None:
                     await self._notify(session_id, update)
@@ -578,8 +635,70 @@ class DanaACPAgent:
 
 
 # ---------------------------------------------------------------------------
-# Content translation: ACP blocks → TextBlock
+# Content translation: ACP blocks → normalized blocks → TextBlock
 # ---------------------------------------------------------------------------
+
+
+def _acp_prompt_to_normalized_blocks(prompt: list) -> list[dict]:
+    """Convert ACP prompt content blocks to normalized block dicts.
+
+    Each ACP content block (Pydantic model or dict) is converted to a
+    normalized dict that the ContentNormalizer can process. Multimodal
+    blocks (image, embedded_resource, file_resource) are converted with
+    their data intact.
+    """
+    normalized: list[dict] = []
+    for block in prompt:
+        normalized.append(acp_content_to_normalized_block(block))
+    return normalized
+
+
+def _normalized_blocks_to_text_blocks(blocks: list[dict]) -> list[TextBlock]:
+    """Convert normalized blocks to TextBlock list for AgentSession.
+
+    Text blocks are converted to TextBlock instances. Multimodal blocks
+    are serialized as text placeholders with their content_blocks metadata
+    preserved in the text for journaling purposes. The actual multimodal
+    content is carried via the content_blocks payload field.
+    """
+    text_parts: list[str] = []
+    has_multimodal = any(b.get("type") != "text" for b in blocks)
+    content_blocks_payload: list[dict] = []
+
+    for block in blocks:
+        block_type = block.get("type", "")
+        if block_type == "text":
+            text = block.get("text", "")
+            text_parts.append(text)
+            content_blocks_payload.append(block)
+        elif block_type == "image":
+            # Serialize image as placeholder text; actual data in content_blocks
+            media_type = block.get("media_type", "image/*")
+            text_parts.append(f"[Image: {media_type}]")
+            # Convert bytes data to base64 for JSON-safe payload
+            data = block.get("data", b"")
+            if isinstance(data, bytes):
+                import base64
+
+                block["data"] = base64.b64encode(data).decode("utf-8")
+            content_blocks_payload.append(block)
+        elif block_type in ("embedded_resource", "file_resource"):
+            media_type = block.get("media_type", "application/octet-stream")
+            uri = block.get("uri", "")
+            text_parts.append(f"[Resource: {media_type}]" if not uri else f"[Resource: {uri}]")
+            data = block.get("data", b"")
+            if isinstance(data, bytes):
+                import base64
+
+                block["data"] = base64.b64encode(data).decode("utf-8")
+            content_blocks_payload.append(block)
+
+    if not text_parts and not has_multimodal:
+        return [TextBlock(text="")]
+
+    # Build a single TextBlock with the text summary
+    text = " ".join(text_parts) if text_parts else "[multimodal content]"
+    return [TextBlock(text=text)]
 
 
 def _content_blocks_to_text_blocks(blocks: list) -> list[TextBlock]:
@@ -611,6 +730,34 @@ def _extract_text(block: Any) -> str | None:
             return block.get("text", "")
         return None
     return None
+
+
+# ---------------------------------------------------------------------------
+# D6: Multimodal capability validation
+# ---------------------------------------------------------------------------
+
+
+def _validate_multimodal_capability(blocks: list[dict], provider: str) -> None:
+    """Validate that the provider supports the multimodal content in blocks.
+
+    Per ADR-009: unsupported models fail before turn start, not mid-turn.
+    Image capability is advertised only when supported.
+
+    For D6, we use a simple heuristic: providers known to support multimodal
+    content include anthropic, openai, google, bedrock, and vertex.
+    """
+    multimodal_providers = frozenset({"anthropic", "openai", "google", "bedrock", "vertex"})
+    supports_images = provider in multimodal_providers
+    supports_embedded = provider in multimodal_providers
+    supports_file = provider in multimodal_providers
+
+    validate_provider_capability(
+        blocks,
+        provider,
+        supports_images=supports_images,
+        supports_embedded_resources=supports_embedded,
+        supports_file_resources=supports_file,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,12 @@ completed/errored/cancelled turn clears it.
 D4 adds model-change tracking: ``MODEL_CHANGED`` facts are projected into
 ``model_changes``, and protected replay state is included only when its
 provider matches the current ``provider_key`` (compatibility gating).
+
+D6 adds multimodal content projection: ``USER_CONTENT_FINAL`` facts may carry
+``content_blocks`` in their payload (a list of normalized content block dicts).
+When present, the user message is projected as an ``LLMMessage`` with
+``content: list[ContentBlock]`` instead of a plain string. Assistant messages
+remain text-only in D6.
 """
 
 from __future__ import annotations
@@ -23,7 +29,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from dana.common.llm.types import LLMMessage
+from dana.common.llm.types import ContentBlock, LLMMessage
 from dana.core.session.models import FactType, JournalFact
 from dana.core.session.protected_state import ProtectedStateCodec
 
@@ -93,6 +99,9 @@ class ConversationProjector:
                 matches this key are included in ``replay_state``.
 
         - User messages come from ``USER_CONTENT_FINAL`` (always included).
+          D6: when the payload carries ``content_blocks`` (a list of normalized
+          content block dicts), the user message is projected as
+          ``content: list[ContentBlock]`` instead of a plain string.
         - Assistant messages come only from ``ASSISTANT_CONTENT_FINAL`` facts
           whose turn is closed by a matching ``TURN_COMPLETED``.
         - Interrupted turns set ``interruption_observation`` instead of adding
@@ -118,9 +127,21 @@ class ConversationProjector:
                 last_sequence = fact.sequence
 
             if fact.fact_type is FactType.USER_CONTENT_FINAL:
-                messages.append(LLMMessage(role="user", content=str(fact.payload["text"])))
+                content_blocks = fact.payload.get("content_blocks")
+                if content_blocks is not None and isinstance(content_blocks, list) and len(content_blocks) > 0:
+                    # Multimodal: project as list[ContentBlock]
+                    projected_blocks: list[ContentBlock] = []
+                    for cb in content_blocks:
+                        if isinstance(cb, dict):
+                            projected_blocks.append(cb)  # type: ignore[arg-type]
+                    if projected_blocks:
+                        messages.append(LLMMessage(role="user", content=projected_blocks))
+                    else:
+                        messages.append(LLMMessage(role="user", content=str(fact.payload.get("text", ""))))
+                else:
+                    messages.append(LLMMessage(role="user", content=str(fact.payload.get("text", ""))))
             elif fact.fact_type is FactType.ASSISTANT_CONTENT_FINAL:
-                pending_final[fact.correlation_id] = str(fact.payload["text"])
+                pending_final[fact.correlation_id] = str(fact.payload.get("text", ""))
             elif fact.fact_type is FactType.TURN_COMPLETED:
                 text = pending_final.pop(fact.correlation_id, None)
                 if text is not None:
