@@ -255,11 +255,20 @@ class AgentSession:
         for event in self._host_event_projector.project(facts):
             yield event
 
-    async def prompt(self, blocks: Sequence[TextBlock]) -> AsyncIterator[HostEvent]:
+    async def prompt(
+        self,
+        blocks: Sequence[TextBlock],
+        content_blocks: list[dict] | None = None,
+    ) -> AsyncIterator[HostEvent]:
         """Run one text turn. Yields host events as they occur.
 
         After the generator is exhausted, the :class:`TurnTerminal` outcome is
         available via :attr:`last_terminal`.
+
+        D6: When ``content_blocks`` is provided (list of normalized content block
+        dicts), the ``USER_CONTENT_FINAL`` fact payload includes a
+        ``content_blocks`` key. The ConversationView projects these as
+        ``list[ContentBlock]`` instead of a plain string.
 
         Raises :class:`SessionBusy` if a turn is already active.
         """
@@ -275,6 +284,9 @@ class AgentSession:
 
             # --- Input durability: persist TURN_STARTED + USER_CONTENT_FINAL
             # BEFORE invoking the model. ---
+            user_payload: dict[str, object] = {"text": user_text}
+            if content_blocks:
+                user_payload["content_blocks"] = content_blocks
             start_facts = [
                 NewJournalFact(
                     fact_type=FactType.TURN_STARTED,
@@ -286,7 +298,7 @@ class AgentSession:
                     fact_type=FactType.USER_CONTENT_FINAL,
                     correlation_id=correlation_id,
                     causation_id=correlation_id,
-                    payload={"text": user_text},
+                    payload=user_payload,
                 ),
             ]
             start_result = await self._repository.append(self._owner_scope, self._session_id, self._current_version, start_facts)

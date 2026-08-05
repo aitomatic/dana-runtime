@@ -113,3 +113,49 @@ def validate_path_safety(path: str, workspace: str | None) -> None:
             resolved.relative_to(workspace_path)
         except ValueError:
             raise TraversalError(path, workspace)
+
+
+# ---------------------------------------------------------------------------
+# Provider capability validation (D6, ADR-009)
+# ---------------------------------------------------------------------------
+
+
+class ProviderCapabilityError(ContentValidationError):
+    """Raised when a provider does not support a required content capability."""
+
+    def __init__(self, capability: str, provider: str) -> None:
+        self.capability = capability
+        self.provider = provider
+        super().__init__(f"provider {provider!r} does not support {capability!r}")
+
+
+def validate_provider_capability(
+    blocks: list[dict],
+    provider: str,
+    *,
+    supports_images: bool = False,
+    supports_embedded_resources: bool = False,
+    supports_file_resources: bool = False,
+) -> None:
+    """Validate that a provider supports the content types in the given blocks.
+
+    Per ADR-009: unsupported models fail before turn start, not mid-turn.
+
+    Args:
+        blocks: Normalized content blocks to validate.
+        provider: The provider name (for error messages).
+        supports_images: Whether the provider supports image content.
+        supports_embedded_resources: Whether the provider supports embedded resources.
+        supports_file_resources: Whether the provider supports file resources.
+
+    Raises:
+        ProviderCapabilityError: If a block type is not supported by the provider.
+    """
+    for block in blocks:
+        block_type = block.get("type", "")
+        if block_type == "image" and not supports_images:
+            raise ProviderCapabilityError("image content", provider)
+        if block_type == "embedded_resource" and not supports_embedded_resources:
+            raise ProviderCapabilityError("embedded resources", provider)
+        if block_type == "file_resource" and not supports_file_resources:
+            raise ProviderCapabilityError("file resources", provider)
