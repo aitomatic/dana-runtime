@@ -21,6 +21,7 @@ from dana.common.utils.misc import Misc
 from dana.core.ext.event_bus import Event, EventBus
 from dana.core.ext.events import TOOL_CALL, TOOL_RESULT
 from dana.core.ext.operation import build_operation
+from dana.core.tool.catalog import ToolCatalog
 from dana.core.tool.tool_executor_helpers import (
     create_tool_error,
     create_tool_success,
@@ -57,10 +58,12 @@ class ToolExecutor:
         agent_getter: Callable[[], Any] | None = None,
         tool_name_registry_getter: Callable[[], dict[str, tuple[Any, str]]] | None = None,
         max_workers: int | None = None,
+        tool_catalog: ToolCatalog | None = None,
     ) -> None:
         self._agent_getter = agent_getter
         self._tool_name_registry_getter = tool_name_registry_getter
         self._max_workers = max_workers
+        self._tool_catalog = tool_catalog
 
     # ------------------------------------------------------------------
     # Public API — ToolExecutorProtocol
@@ -174,7 +177,21 @@ class ToolExecutor:
         Extracted from ``_execute_single_call`` so the emit orchestration can wrap
         it. Raises propagate to the caller's never-raise guard. Dispatch logic is
         intentionally NOT merged with the async variant (only emit is shared).
+
+        Dispatch order:
+        1. ToolCatalog (if wired) — primary path per ADR-004.
+        2. @named_tool registry — legacy fast path.
+        3. Standard name parsing fallback.
         """
+        # --- ToolCatalog fast path (ADR-004) ---
+        if self._tool_catalog is not None:
+            entry = self._tool_catalog.get(function_name)
+            if entry is not None:
+                result = entry.adapter(arguments)
+                if isinstance(result, dict) and "success" in result:
+                    return result
+                return create_tool_success("resource", function_name, result)
+
         registry = self._get_registry()
 
         # --- @named_tool registry fast path ---
@@ -275,7 +292,21 @@ class ToolExecutor:
 
         Dispatch logic is intentionally NOT merged with the sync variant (only
         emit is shared). Raises propagate to the caller's never-raise guard.
+
+        Dispatch order:
+        1. ToolCatalog (if wired) — primary path per ADR-004.
+        2. @named_tool registry — legacy fast path.
+        3. Standard name parsing fallback.
         """
+        # --- ToolCatalog fast path (ADR-004) ---
+        if self._tool_catalog is not None:
+            entry = self._tool_catalog.get(function_name)
+            if entry is not None:
+                result = entry.adapter(arguments)
+                if isinstance(result, dict) and "success" in result:
+                    return result
+                return create_tool_success("resource", function_name, result)
+
         registry = self._get_registry()
 
         # --- @named_tool registry fast path ---

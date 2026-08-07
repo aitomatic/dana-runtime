@@ -402,3 +402,176 @@ class TestViewShape:
         facts = _completed_turn(make_fact, correlation_id="turn-1", user_text="q", assistant_text="a")
         view = ConversationProjector().project(facts)
         assert all(isinstance(m, LLMMessage) for m in view.messages)
+
+
+# ===========================================================================
+# D4: Model change tracking
+# ===========================================================================
+
+
+class TestModelChangeTracking:
+    """MODEL_CHANGED facts are projected into model_changes, current_provider, current_model."""
+
+    def test_no_model_changes(self, make_fact) -> None:
+        facts = _completed_turn(make_fact, correlation_id="turn-1", user_text="q", assistant_text="a")
+        view = ConversationProjector().project(facts)
+        assert view.model_changes == ()
+        assert view.current_provider is None
+        assert view.current_model is None
+
+    def test_single_model_change(self, make_fact) -> None:
+        facts = [
+            make_fact(
+                FactType.MODEL_CHANGED,
+                payload={"provider": "anthropic", "model": "claude-sonnet-4"},
+            ),
+        ]
+        view = ConversationProjector().project(facts)
+        assert len(view.model_changes) == 1
+        assert view.model_changes[0]["provider"] == "anthropic"
+        assert view.model_changes[0]["model"] == "claude-sonnet-4"
+        assert view.current_provider == "anthropic"
+        assert view.current_model == "claude-sonnet-4"
+
+    def test_multiple_model_changes(self, make_fact) -> None:
+        facts = [
+            make_fact(
+                FactType.MODEL_CHANGED,
+                correlation_id="switch-1",
+                payload={"provider": "anthropic", "model": "claude-sonnet-4"},
+            ),
+            make_fact(
+                FactType.MODEL_CHANGED,
+                correlation_id="switch-2",
+                payload={"provider": "openai", "model": "gpt-4o"},
+            ),
+        ]
+        view = ConversationProjector().project(facts)
+        assert len(view.model_changes) == 2
+        assert view.model_changes[0]["provider"] == "anthropic"
+        assert view.model_changes[1]["provider"] == "openai"
+        # Current is the most recent
+        assert view.current_provider == "openai"
+        assert view.current_model == "gpt-4o"
+
+    def test_model_change_between_turns(self, make_fact) -> None:
+        """Messages from both pre- and post-switch providers appear in conversation."""
+        facts = [
+            make_fact(FactType.USER_CONTENT_FINAL, correlation_id="turn-1", payload={"text": "hello from anthropic"}),
+            make_fact(FactType.ASSISTANT_CONTENT_FINAL, correlation_id="turn-1", payload={"text": "hi there"}),
+            make_fact(FactType.TURN_COMPLETED, correlation_id="turn-1"),
+            make_fact(
+                FactType.MODEL_CHANGED,
+                correlation_id="switch-1",
+                payload={"provider": "openai", "model": "gpt-4o"},
+            ),
+            make_fact(FactType.USER_CONTENT_FINAL, correlation_id="turn-2", payload={"text": "hello from openai"}),
+            make_fact(FactType.ASSISTANT_CONTENT_FINAL, correlation_id="turn-2", payload={"text": "hello again"}),
+            make_fact(FactType.TURN_COMPLETED, correlation_id="turn-2"),
+        ]
+        view = ConversationProjector().project(facts)
+        # All messages from both providers are in the conversation
+        assert len(view.messages) == 4
+        assert view.messages[0].content == "hello from anthropic"
+        assert view.messages[3].content == "hello again"
+        # Model changes tracked
+        assert len(view.model_changes) == 1
+        assert view.current_provider == "openai"
+        assert view.current_model == "gpt-4o"
+
+
+# ===========================================================================
+# D4: Protected state compatibility gating
+# ===========================================================================
+
+
+class TestProtectedStateCompatibility:
+    """Protected replay state is included only when provider_key matches."""
+
+    def _codec_with_key(self, key: bytes):
+        class _FixedProvider:
+            def key(self) -> bytes:
+                return key
+
+        from dana.core.session.protected_state import ProtectedStateCodec
+
+        return ProtectedStateCodec(_FixedProvider())
+
+    def test_incompatible_provider_excludes_replay_state(self, make_fact) -> None:
+        """Protected state from a different provider is excluded from projection."""
+        codec = self._codec_with_key(b"test-key-32-bytes-ok-for-testing!")
+        ciphertext = codec.encrypt(b"anthropic-replay-state")
+        facts = [
+            make_fact(
+                FactType.MODEL_CHANGED,
+                payload={"provider": "anthropic", "model": "claude-sonnet-4"},
+            ),
+            make_fact(
+                FactType.TURN_COMPLETED,
+                correlation_id="turn-1",
+                protected_payload=ciphertext,
+            ),
+            make_fact(
+                FactType.MODEL_CHANGED,
+                correlation_id="switch-1",
+                payload={"provider": "openai", "model": "gpt-4o"},
+            ),
+        ]
+        # Project with provider_key="openai" — anthropic's protected state is excluded
+        view = ConversationProjector(protected_state_codec=codec).project(facts, provider_key="openai")
+        assert view.replay_state is None
+
+    def test_compatible_provider_includes_replay_state(self, make_fact) -> None:
+        """Protected state from the current provider is included."""
+        codec = self._codec_with_key(b"test-key-32-bytes-ok-for-testing!")
+        ciphertext = codec.encrypt(b"openai-replay-state")
+        facts = [
+            make_fact(
+                FactType.MODEL_CHANGED,
+                payload={"provider": "openai", "model": "gpt-4o"},
+            ),
+            make_fact(
+                FactType.TURN_COMPLETED,
+                correlation_id="turn-1",
+                protected_payload=ciphertext,
+            ),
+        ]
+        view = ConversationProjector(protected_state_codec=codec).project(facts, provider_key="openai")
+        assert view.replay_state == b"openai-replay-state"
+
+    def test_no_provider_key_includes_all(self, make_fact) -> None:
+        """Without provider_key, all protected state is included (pre-switch compatibility)."""
+        codec = self._codec_with_key(b"test-key-32-bytes-ok-for-testing!")
+        ciphertext = codec.encrypt(b"any-replay-state")
+        facts = [
+            make_fact(
+                FactType.TURN_COMPLETED,
+                correlation_id="turn-1",
+                protected_payload=ciphertext,
+            ),
+        ]
+        view = ConversationProjector(protected_state_codec=codec).project(facts, provider_key=None)
+        assert view.replay_state == b"any-replay-state"
+
+    def test_switch_to_same_provider_includes_replay_state(self, make_fact) -> None:
+        """Switching to the same provider keeps replay state compatible."""
+        codec = self._codec_with_key(b"test-key-32-bytes-ok-for-testing!")
+        ciphertext = codec.encrypt(b"anthropic-replay-state")
+        facts = [
+            make_fact(
+                FactType.MODEL_CHANGED,
+                payload={"provider": "anthropic", "model": "claude-sonnet-4"},
+            ),
+            make_fact(
+                FactType.TURN_COMPLETED,
+                correlation_id="turn-1",
+                protected_payload=ciphertext,
+            ),
+            make_fact(
+                FactType.MODEL_CHANGED,
+                correlation_id="switch-1",
+                payload={"provider": "anthropic", "model": "claude-haiku-3"},
+            ),
+        ]
+        view = ConversationProjector(protected_state_codec=codec).project(facts, provider_key="anthropic")
+        assert view.replay_state == b"anthropic-replay-state"

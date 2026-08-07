@@ -28,9 +28,19 @@ class FileStorageConfig(StorageConfig):
     workspace_folder: str | None
 
 
+# Model configuration
+class ModelTargetConfig(BaseSettings):
+    provider: str
+    model: str
+    api_key: str | None = None
+    endpoint: str | None = None
+    extra: dict[str, str] | None = None
+
+
 # MAIN CONFIG
 class Config(BaseSettings):
     storage_cfg: StorageConfig
+    models: list[ModelTargetConfig] = []
 
 
 storage_mode = os.getenv("DANA_STORAGE_MODE", "file")

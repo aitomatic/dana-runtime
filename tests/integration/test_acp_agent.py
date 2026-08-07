@@ -43,6 +43,7 @@ from dana.core.session.models import FactType, JournalFact, OwnerScope
 # ---------------------------------------------------------------------------
 
 os.environ.setdefault("DANA_SESSION_STATE_KEY", "test-key-32-bytes-ok-for-testing!")
+os.environ.setdefault("DANA_POLICY_GRANTS_ENABLED", "0")
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +610,255 @@ class TestSubprocess:
 
     @pytest.mark.asyncio
     async def test_session_new_over_stdio(self, tmp_path):
+        """initialize → session/new round-trip over stdio."""
+        env = {
+            **os.environ,
+            "DANA_SESSION_STATE_KEY": "test-key-32-bytes-ok-for-testing!",
+            "DANA_ACP_JOURNAL": str(tmp_path / "sub.db"),
+        }
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "dana.apps.acp",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        try:
+            assert proc.stdin is not None
+            assert proc.stdout is not None
+
+            async def send(req):
+                proc.stdin.write((json.dumps(req) + "\n").encode())
+                await proc.stdin.drain()
+
+            async def recv():
+                return await _read_jsonrpc_frame(proc.stdout)
+
+            # initialize
+            await send({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": 1}})
+            init = await recv()
+            assert init["result"]["protocolVersion"] == 1
+
+            # session/new
+            await send({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": str(tmp_path), "mcpServers": []}})
+            new = await recv()
+            session_id = new["result"]["sessionId"]
+            assert session_id
+        finally:
+            proc.terminate()
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+
+
+# ===========================================================================
+# D4: Model switching (ADR-007)
+# ===========================================================================
+
+
+class TestModelSwitching:
+    """D4 model switching — session/set_model, model state, cross-provider continuation."""
+
+    @pytest.mark.asyncio
+    async def test_new_session_includes_model_state(self, tmp_path):
+        """session/new returns model state with available models."""
+        from dana.apps.acp.agent import DanaACPAgent
+        from dana.core.model.catalog import ModelCatalog, ModelTarget
+
+        catalog = ModelCatalog(
+            [
+                ModelTarget(provider="anthropic", model="claude-sonnet-4"),
+                ModelTarget(provider="openai", model="gpt-4o"),
+            ]
+        )
+        a = DanaACPAgent(
+            journal_path=str(tmp_path / "journal.db"),
+            agent_factory=fake_agent_factory(chunks=["ok"]),
+            model_catalog=catalog,
+        )
+        conn = RecordingConn()
+        a.on_connect(conn)
+        resp = await a.new_session(cwd=str(tmp_path))
+        assert resp.models is not None
+        assert len(resp.models.available_models) == 2
+        assert resp.models.current_model_id == "anthropic/claude-sonnet-4"
+
+    @pytest.mark.asyncio
+    async def test_set_session_model_switches_model(self, tmp_path):
+        """session/set_model switches to a configured target and journals MODEL_CHANGED."""
+        from dana.apps.acp.agent import DanaACPAgent
+        from dana.core.model.catalog import ModelCatalog, ModelTarget
+
+        catalog = ModelCatalog(
+            [
+                ModelTarget(provider="anthropic", model="claude-sonnet-4"),
+                ModelTarget(provider="openai", model="gpt-4o"),
+            ]
+        )
+        a = DanaACPAgent(
+            journal_path=str(tmp_path / "journal.db"),
+            agent_factory=fake_agent_factory(chunks=["ok"]),
+            model_catalog=catalog,
+        )
+        conn = RecordingConn()
+        a.on_connect(conn)
+        new_resp = await a.new_session(cwd=str(tmp_path))
+        sid = new_resp.session_id
+
+        # Switch to openai/gpt-4o
+        switch_resp = await a.set_session_model(model_id="openai/gpt-4o", session_id=sid)
+        assert switch_resp is not None
+
+        # Session should have updated provider/model
+        session = a._sessions[sid]
+        assert session.current_provider == "openai"
+        assert session.current_model == "gpt-4o"
+
+        # Journal should contain exactly one MODEL_CHANGED fact
+        repo = await a._get_repository()
+        facts = await repo.read_facts(session._owner_scope, session._session_id)
+        model_changed_facts = [f for f in facts if f.fact_type == FactType.MODEL_CHANGED]
+        assert len(model_changed_facts) == 1
+        assert model_changed_facts[0].payload["provider"] == "openai"
+        assert model_changed_facts[0].payload["model"] == "gpt-4o"
+
+    @pytest.mark.asyncio
+    async def test_history_survives_switch(self, tmp_path):
+        """Conversation history from both pre- and post-switch providers is preserved."""
+        from dana.apps.acp.agent import DanaACPAgent
+        from dana.core.model.catalog import ModelCatalog, ModelTarget
+
+        catalog = ModelCatalog(
+            [
+                ModelTarget(provider="anthropic", model="claude-sonnet-4"),
+                ModelTarget(provider="openai", model="gpt-4o"),
+            ]
+        )
+        a = DanaACPAgent(
+            journal_path=str(tmp_path / "journal.db"),
+            agent_factory=fake_agent_factory(chunks=["pre-switch response"]),
+            model_catalog=catalog,
+        )
+        conn = RecordingConn()
+        a.on_connect(conn)
+        new_resp = await a.new_session(cwd=str(tmp_path))
+        sid = new_resp.session_id
+
+        # Run a turn on the startup model
+        await a.prompt(prompt=[{"type": "text", "text": "hello from anthropic"}], session_id=sid)
+
+        # Switch to openai
+        await a.set_session_model(model_id="openai/gpt-4o", session_id=sid)
+
+        # Load the session fresh and verify history is intact
+        from dana.apps.acp.agent import DanaACPAgent as DanaACPAgent2
+
+        a2 = DanaACPAgent2(
+            journal_path=str(tmp_path / "journal.db"),
+            agent_factory=fake_agent_factory(chunks=["post-switch response"]),
+            model_catalog=catalog,
+        )
+        conn2 = RecordingConn()
+        a2.on_connect(conn2)
+        load_resp = await a2.load_session(cwd=str(tmp_path), session_id=sid)
+
+        # Model state should reflect the switch
+        assert load_resp.models is not None
+        assert load_resp.models.current_model_id == "openai/gpt-4o"
+
+        # Replay should include pre-switch messages
+        kinds = [getattr(u, "session_update", None) for _, u in conn2.updates]
+        assert "user_message_chunk" in kinds
+        assert "agent_message_chunk" in kinds
+
+    @pytest.mark.asyncio
+    async def test_unknown_model_target_raises(self, tmp_path):
+        """Switching to an unconfigured model raises ValueError."""
+        from dana.apps.acp.agent import DanaACPAgent
+        from dana.core.model.catalog import ModelCatalog, ModelTarget
+
+        catalog = ModelCatalog(
+            [
+                ModelTarget(provider="anthropic", model="claude-sonnet-4"),
+            ]
+        )
+        a = DanaACPAgent(
+            journal_path=str(tmp_path / "journal.db"),
+            agent_factory=fake_agent_factory(chunks=["ok"]),
+            model_catalog=catalog,
+        )
+        conn = RecordingConn()
+        a.on_connect(conn)
+        new_resp = await a.new_session(cwd=str(tmp_path))
+        sid = new_resp.session_id
+
+        with pytest.raises(ValueError, match="Unknown model target"):
+            await a.set_session_model(model_id="openai/gpt-4o", session_id=sid)
+
+    @pytest.mark.asyncio
+    async def test_rollback_disables_model_switching(self, tmp_path, monkeypatch):
+        """When DANA_MODEL_SWITCHING_ENABLED=0, set_session_model raises and model state is None."""
+        monkeypatch.setenv("DANA_MODEL_SWITCHING_ENABLED", "0")
+        from dana.apps.acp.agent import DanaACPAgent
+        from dana.core.model.catalog import ModelCatalog, ModelTarget
+
+        catalog = ModelCatalog(
+            [
+                ModelTarget(provider="anthropic", model="claude-sonnet-4"),
+                ModelTarget(provider="openai", model="gpt-4o"),
+            ]
+        )
+        a = DanaACPAgent(
+            journal_path=str(tmp_path / "journal.db"),
+            agent_factory=fake_agent_factory(chunks=["ok"]),
+            model_catalog=catalog,
+        )
+        conn = RecordingConn()
+        a.on_connect(conn)
+        new_resp = await a.new_session(cwd=str(tmp_path))
+        sid = new_resp.session_id
+
+        # Model state should be None (selector hidden)
+        assert new_resp.models is None
+
+        # set_session_model should raise
+        with pytest.raises(RuntimeError, match="Model switching is disabled"):
+            await a.set_session_model(model_id="openai/gpt-4o", session_id=sid)
+
+    @pytest.mark.asyncio
+    async def test_model_change_journaled_once(self, tmp_path):
+        """Model change is journaled as exactly one MODEL_CHANGED fact per switch."""
+        from dana.apps.acp.agent import DanaACPAgent
+        from dana.core.model.catalog import ModelCatalog, ModelTarget
+
+        catalog = ModelCatalog(
+            [
+                ModelTarget(provider="anthropic", model="claude-sonnet-4"),
+                ModelTarget(provider="openai", model="gpt-4o"),
+                ModelTarget(provider="anthropic", model="claude-haiku-3"),
+            ]
+        )
+        a = DanaACPAgent(
+            journal_path=str(tmp_path / "journal.db"),
+            agent_factory=fake_agent_factory(chunks=["ok"]),
+            model_catalog=catalog,
+        )
+        conn = RecordingConn()
+        a.on_connect(conn)
+        new_resp = await a.new_session(cwd=str(tmp_path))
+        sid = new_resp.session_id
+
+        # Two switches
+        await a.set_session_model(model_id="openai/gpt-4o", session_id=sid)
+        await a.set_session_model(model_id="anthropic/claude-haiku-3", session_id=sid)
+
+        repo = await a._get_repository()
+        session = a._sessions[sid]
+        facts = await repo.read_facts(session._owner_scope, session._session_id)
+        model_changed_facts = [f for f in facts if f.fact_type == FactType.MODEL_CHANGED]
+        assert len(model_changed_facts) == 2
+        assert model_changed_facts[0].payload["model"] == "gpt-4o"
+        assert model_changed_facts[1].payload["model"] == "claude-haiku-3"
         """initialize → session/new round-trip over stdio."""
         env = {
             **os.environ,
