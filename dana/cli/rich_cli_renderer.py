@@ -41,6 +41,7 @@ from dana.cli.components.subagent_card import SubagentCardComponent
 from dana.cli.components.tool_card import ToolCardComponent
 from dana.cli.state import RenderState
 from dana.common.protocols import DictParams, Notifiable
+from dana.core.session.projections.host_events import HostEvent
 
 
 # Minimum terminal width for rich rendering
@@ -86,6 +87,7 @@ class RichCLIRenderer(Notifiable):
         self._completed_subagents: list[SubagentCardComponent] = []  # Completed subagent cards for display
         self._caller_message_shown = False  # Only show ❯ once per user interaction
         self._seen_tool_calls = False  # Suppress streaming once tools are in play
+        self._tool_names: dict[str, str] = {}  # D7.2: tool_call_id → name (HostEvent bridge)
         self._lock = threading.Lock()
 
         # Detect terminal capabilities
@@ -698,3 +700,204 @@ class RichCLIRenderer(Notifiable):
 
     def _handle_skill(self, notifier: object, data: DictParams) -> None:
         """Handle skill_progress broadcasts."""
+
+    # ------------------------------------------------------------------
+    # D7.2: HostEvent consumer bridge (AgentSession path)
+    # ------------------------------------------------------------------
+
+    def handle_host_event(self, event: HostEvent) -> None:
+        """Consume one AgentSession HostEvent (D7.2 bridge entry point).
+
+        In-process analog of ACP's session_update translation: the CLI
+        consumes the same HostEvent projection as dana-acp but renders to
+        Rich instead of JSON-RPC. Thread-safe (acquires the render lock).
+        """
+        with self._lock:
+            from dana.cli.host_event_adapter import render_host_event
+
+            render_host_event(self, event)
+
+    # -- turn lifecycle ------------------------------------------------
+
+    def begin_turn(self, event: HostEvent) -> None:
+        """TURN_STARTED: reset stream display and start the spinner."""
+        self._flush_tool_cards()
+        self._stream_display.clear()
+        self._seen_tool_calls = False
+        self._caller_message_shown = False
+        self._tool_names.clear()
+        self._ensure_live()
+        if not self._spinner.running:
+            self._spinner.start()
+        self._spinner.update_phase("THINK")
+        if not self._has_color:
+            self.console.print("[…] working")
+        else:
+            self._refresh_display()
+
+    def complete_turn(self, event: HostEvent) -> None:
+        """TURN_COMPLETED: stop spinner, flush pending cards, print summary."""
+        self._flush_tool_cards()
+        tool_count = self._spinner.tool_count
+        elapsed = self._spinner.elapsed_text
+        self._spinner.stop()
+        self._stop_live()
+        if tool_count > 0 and not self._agent_stack:
+            self.console.print(Text(f"  ✓ Done ({tool_count} tools · {elapsed})", style="dim"))
+
+    def terminate_turn(self, event: HostEvent, kind: str) -> None:
+        """TURN_CANCELLED / TURN_ERROR: stop and print a truthful banner."""
+        self._flush_tool_cards()
+        self._spinner.stop()
+        self._stop_live()
+        if kind == "cancelled":
+            from dana.cli.host_event_adapter import cancellation_outcome
+
+            self.console.print(Text(f"  ✗ {cancellation_outcome(event)}", style="yellow"))
+        else:
+            err = (event.metadata.get("error") if event.metadata else None) or "unknown error"
+            self.console.print(Text(f"  ✗ Error: {err}", style="red"))
+
+    # -- messages & streaming ------------------------------------------
+
+    def show_user_message(self, event: HostEvent) -> None:
+        """USER_MESSAGE: echo the prompt line once (verbose only)."""
+        if not self.verbose or self._caller_message_shown:
+            return
+        self._caller_message_shown = True
+        was_live = self._live is not None
+        if was_live:
+            self._stop_live()
+        line = Text()
+        line.append("❯ ", style="bold green")
+        line.append(str(event.text or ""), style="bold on grey23")
+        self.console.print(line)
+        if was_live:
+            self._ensure_live()
+
+    def stream_assistant_chunk(self, event: HostEvent) -> None:
+        """ASSISTANT_CONTENT_CHUNK: append to the live stream display."""
+        chunk = event.text or ""
+        if not chunk:
+            return
+        self._spinner.increment_chars(len(chunk))
+        # Once tools are in play, intermediate text is reasoning — suppress.
+        if self._seen_tool_calls:
+            return
+        self._stream_display.append_chunk(chunk)
+        self._ensure_live()
+        if not self._spinner.running:
+            self._spinner.start()
+        if self._has_color:
+            self._refresh_display()
+        else:
+            self.console.print(chunk, end="")
+
+    def finish_assistant_response(self, event: HostEvent) -> None:
+        """ASSISTANT_CONTENT_FINAL: stop streaming and print the final response."""
+        self._flush_tool_cards()
+        self._spinner.stop()
+        self._stop_live()
+        response = event.text or ""
+        if response and self.verbose and not self._agent_stack:
+            self.console.print()
+            if self._has_color:
+                self.console.print(Markdown(response))
+            else:
+                self.console.print(response)
+
+    def show_thought(self, event: HostEvent) -> None:
+        """THOUGHT: print reasoning text (dim italic in color mode)."""
+        text = event.text or ""
+        if not text or not self.show_reasoning:
+            return
+        was_live = self._live is not None
+        if was_live:
+            self._stop_live()
+        if self._has_color:
+            self.console.print(Text(f"  {text}", style="dim italic"))
+        else:
+            self.console.print(f"  {text}")
+        if was_live:
+            self._ensure_live()
+
+    # -- tool lifecycle ------------------------------------------------
+
+    def _record_tool_name(self, event: HostEvent) -> dict[str, Any]:
+        """Build a tool-card dict from a tool HostEvent and record its name."""
+        meta = event.metadata or {}
+        call_id = str(meta.get("tool_call_id", ""))
+        name = str(meta.get("tool_name", "unknown"))
+        if call_id:
+            self._tool_names[call_id] = name
+        return {
+            "tool_call_id": call_id,
+            "function": name,
+            "arguments": meta.get("raw_input") or {},
+        }
+
+    def show_tool_requested(self, event: HostEvent) -> None:
+        """TOOL_REQUESTED: enqueue a pending tool card (flushed at terminal/turn)."""
+        self._seen_tool_calls = True
+        if self.show_tool_calls:
+            self._pending_tool_cards.append(self._record_tool_name(event))
+        self._ensure_live()
+        if not self._spinner.running:
+            self._spinner.start()
+        if self._has_color:
+            self._refresh_display()
+
+    def show_tool_authorization(self, event: HostEvent) -> None:
+        """TOOL_AUTHORIZED_OR_DENIED: surface denials as a failed card."""
+        meta = event.metadata or {}
+        if not meta.get("authorized", True):
+            self._seen_tool_calls = True
+            card = self._record_tool_name(event)
+            card["status"] = "failed"
+            card["error"] = meta.get("reason", "Permission denied")
+            self._pending_tool_cards.append(card)
+            self._flush_tool_cards()
+
+    def show_tool_started(self, event: HostEvent) -> None:
+        """TOOL_STARTED: advance spinner to ACT (in-progress)."""
+        self._ensure_live()
+        if not self._spinner.running:
+            self._spinner.start()
+        self._spinner.update_phase("ACT")
+        if self._has_color:
+            self._refresh_display()
+
+    def show_tool_progress(self, event: HostEvent) -> None:
+        """TOOL_PROGRESS: refresh live display (progress is journaled)."""
+        if self._has_color:
+            self._refresh_display()
+
+    def show_tool_terminal(self, event: HostEvent, status: str) -> None:
+        """Terminal tool outcome (result/failure/cancel states) → result panel."""
+        self._flush_tool_cards()
+        self._spinner.increment_tool_count()
+        self.state.session_tool_count += 1
+        meta = event.metadata or {}
+        call_id = str(meta.get("tool_call_id", ""))
+        tool_name = self._tool_names.get(call_id, "unknown")
+        if status == "completed":
+            output = str(meta.get("result", ""))
+            exit_code = 0
+        else:
+            output = str(meta.get("error") or meta.get("result") or f"tool {status}")
+            exit_code = 1
+        if self._has_color:
+            panel = ResultPanelComponent(
+                tool_name=str(tool_name),
+                output=output,
+                exit_code=exit_code,
+                is_recent=True,
+            )
+            self.state.current_turn_results.append(panel)
+        else:
+            self.console.print(f"[tool] {tool_name}: {status}")
+        self._ensure_live()
+        if not self._spinner.running:
+            self._spinner.start()
+        if self._has_color:
+            self._refresh_display()
