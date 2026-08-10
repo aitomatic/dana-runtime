@@ -234,8 +234,6 @@ class DanaCodeApp:
             session_id=session_id,
             repository=repo,
         )
-        # Align the in-memory version with the persisted SESSION_CREATED fact.
-        session._current_version = init_facts[0].sequence
         self.agent_session = session
 
         self.renderer = RichCLIRenderer(verbose=True, show_tool_calls=True)
