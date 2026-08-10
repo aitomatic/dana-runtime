@@ -39,6 +39,7 @@ from dana.cli.components.status_line import StatusLineComponent
 from dana.cli.components.stream_display import StreamDisplayComponent
 from dana.cli.components.subagent_card import SubagentCardComponent
 from dana.cli.components.tool_card import ToolCardComponent
+from dana.cli.host_event_adapter import cancellation_outcome, render_host_event
 from dana.cli.state import RenderState
 from dana.common.protocols import DictParams, Notifiable
 from dana.core.session.projections.host_events import HostEvent
@@ -713,8 +714,6 @@ class RichCLIRenderer(Notifiable):
         Rich instead of JSON-RPC. Thread-safe (acquires the render lock).
         """
         with self._lock:
-            from dana.cli.host_event_adapter import render_host_event
-
             render_host_event(self, event)
 
     # -- turn lifecycle ------------------------------------------------
@@ -751,8 +750,6 @@ class RichCLIRenderer(Notifiable):
         self._spinner.stop()
         self._stop_live()
         if kind == "cancelled":
-            from dana.cli.host_event_adapter import cancellation_outcome
-
             self.console.print(Text(f"  ✗ {cancellation_outcome(event)}", style="yellow"))
         else:
             err = (event.metadata.get("error") if event.metadata else None) or "unknown error"

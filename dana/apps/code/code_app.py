@@ -11,6 +11,7 @@ Rollback: ``DANA_CODE_AGENTSESSION_ENABLED=0`` reverts to the legacy
 """
 
 import asyncio
+import contextlib
 import importlib.metadata
 import logging
 import os
@@ -248,16 +249,22 @@ class DanaCodeApp:
         assert self.renderer is not None
 
         blocks = [TextBlock(text=message)]
+        gen = self.agent_session.prompt(blocks)
         try:
-            async for event in self.agent_session.prompt(blocks):
+            async for event in gen:
                 self.renderer.handle_host_event(event)
         except SessionBusy:
             print("\n⏳ A turn is already in progress. Please wait for it to finish.\n")
-        except KeyboardInterrupt:
-            # Ctrl-C mid-turn: the prompt generator is abandoned; its
-            # ``async with`` lock releases on close so the next turn is not
-            # busy. A clean TURN_CANCELLED fact is a D7.3 follow-up.
-            print("\n⏹ Turn interrupted.\n")
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # Ctrl-C mid-turn. Under asyncio.run (Py 3.11+) SIGINT surfaces as
+            # CancelledError inside the task, not KeyboardInterrupt — catch both.
+            # Explicitly close the generator so its ``async with`` lock releases
+            # promptly (no stuck-busy on next turn); re-raise to let asyncio.run
+            # shut down cleanly. A journaled TURN_CANCELLED fact + interrupt-and-
+            # continue UX is the D7.3 cancel-watcher follow-up (ADR-005).
+            with contextlib.suppress(Exception):
+                await gen.aclose()
+            raise
 
     # ------------------------------------------------------------------
     # Legacy path (DANA_CODE_AGENTSESSION_ENABLED=0)

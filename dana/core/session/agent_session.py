@@ -61,8 +61,8 @@ def default_agent_factory() -> Any:
 
     return STARAgent(
         agent_type="dana-host",
-        llm_provider=os.environ.get("DANA_LLM_PROVIDER"),
-        model=os.environ.get("DANA_MODEL"),
+        llm_provider=os.environ.get("DANA_LLM_PROVIDER", "openai"),
+        model=os.environ.get("DANA_MODEL", "gpt-5"),
         auto_register=False,
         enable_skills=False,
         enable_web_search=False,
