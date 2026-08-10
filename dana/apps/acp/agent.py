@@ -76,17 +76,27 @@ def _dana_version() -> str:
 
 
 def _default_agent_factory() -> Any:
-    """Build a minimal STARAgent for production use (text-only, no tools)."""
-    from dana.core.agent.star_agent import STARAgent
+    """Build a coding-assistant agent for ACP sessions.
 
-    return STARAgent(
-        agent_type="dana-acp",
-        auto_register=False,
-        enable_skills=False,
-        enable_web_search=False,
-        enable_code_execution=False,
-        enable_assistant=False,
-        compress_timeline=False,
+    Returns a :class:`~dana.core.agent.builtin_agents.dana_coding_agent.DanaCodingAgent`
+    with the coding-assistant identity and provider/model read from the
+    environment (DANA_LLM_PROVIDER / DANA_MODEL). The prior bare ``STARAgent``
+    emitted a generic STAR system prompt with no coding identity and could not
+    answer coding questions; DanaCodingAgent handles an explicit
+    ``llm_provider``/``model`` correctly (the legacy CLI path proves it), so
+    passing them is safe here and does not reintroduce the d6b73d6
+    misconfigured-azure-client empty-stream bug.
+    """
+    from dana.core.agent.builtin_agents.dana_coding_agent import DanaCodingAgent
+
+    llm_provider = os.environ.get("DANA_LLM_PROVIDER", "openai")
+    model = os.environ.get("DANA_MODEL", "gpt-5")
+
+    return DanaCodingAgent(
+        agent_id="dana-acp",
+        agent_type="dana_coding_agent",
+        llm_provider=llm_provider,
+        model=model,
     )
 
 

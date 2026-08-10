@@ -46,25 +46,34 @@ _TERMINAL_FACT_TYPES = frozenset({FactType.TURN_COMPLETED, FactType.TURN_CANCELL
 
 
 def default_agent_factory() -> Any:
-    """Build a minimal STARAgent for host adapters (text-turn streaming).
+    """Build a coding-assistant agent for host adapters (text-turn streaming).
 
-    Mirrors ``dana.apps.acp.agent._default_agent_factory``: we do NOT pass
-    ``llm_provider``/``model`` — STARAgent resolves them (plus api key,
-    azure endpoint/deployment, etc.) from the config manager / env. Passing
-    them explicitly produced a misconfigured LLM client (empty stream), so
-    host adapters pass ``agent_factory=None`` and rely on this default
-    (ADR-001: AgentSession is the only broad host-facing module).
+    Returns a :class:`~dana.core.agent.builtin_agents.dana_coding_agent.DanaCodingAgent`
+    with the coding-assistant identity (IDENTITY system prompt) and provider/model
+    read from the environment (DANA_LLM_PROVIDER / DANA_MODEL) — the same
+    construction the legacy ``DanaCodeApp._initialize_legacy_agent`` uses and
+    that is verified to answer real prompts correctly.
+
+    The prior bare ``STARAgent`` (``identity_override=None``) emitted a generic
+    STAR system prompt with no coding identity, so it could not answer coding
+    questions — every prompt got a generic greeting (the ``d6b73d6`` fix only
+    corrected the empty stream, not the non-functional agent). DanaCodingAgent
+    handles an explicit ``llm_provider``/``model`` correctly (the legacy path
+    proves it), so passing them does not reintroduce the ``d6b73d6``
+    misconfigured-azure-client empty-stream bug.
     """
-    from dana.core.agent.star_agent import STARAgent
+    import os
 
-    return STARAgent(
-        agent_type="dana-host",
-        auto_register=False,
-        enable_skills=False,
-        enable_web_search=False,
-        enable_code_execution=False,
-        enable_assistant=False,
-        compress_timeline=False,
+    from dana.core.agent.builtin_agents.dana_coding_agent import DanaCodingAgent
+
+    llm_provider = os.environ.get("DANA_LLM_PROVIDER", "openai")
+    model = os.environ.get("DANA_MODEL", "gpt-5")
+
+    return DanaCodingAgent(
+        agent_id="dana-code",
+        agent_type="dana_coding_agent",
+        llm_provider=llm_provider,
+        model=model,
     )
 
 
