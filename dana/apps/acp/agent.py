@@ -592,7 +592,9 @@ class DanaACPAgent:
 
         # D6: Build TextBlocks for the session prompt, preserving content_blocks
         # metadata for multimodal projection
-        text_blocks, content_blocks_payload = _normalized_blocks_to_text_blocks(normalized_blocks)
+        from dana.core.content.blocks import normalized_blocks_to_text_blocks
+
+        text_blocks, content_blocks_payload = normalized_blocks_to_text_blocks(normalized_blocks)
         stop_reason = "end_turn"
 
         try:
@@ -651,54 +653,6 @@ def _acp_prompt_to_normalized_blocks(prompt: list) -> list[dict]:
     for block in prompt:
         normalized.append(acp_content_to_normalized_block(block))
     return normalized
-
-
-def _normalized_blocks_to_text_blocks(blocks: list[dict]) -> tuple[list[TextBlock], list[dict]]:
-    """Convert normalized blocks to TextBlock list for AgentSession.
-
-    Returns a tuple of (text_blocks, content_blocks_payload) where
-    content_blocks_payload carries the multimodal content for journaling.
-
-    Text blocks are converted to TextBlock instances. Multimodal blocks
-    are serialized as text placeholders with their content_blocks metadata
-    preserved in the text for journaling purposes. The actual multimodal
-    content is carried via the content_blocks payload field.
-    """
-    text_parts: list[str] = []
-    has_multimodal = any(b.get("type") != "text" for b in blocks)
-    content_blocks_payload: list[dict] = []
-
-    for block in blocks:
-        block_type = block.get("type", "")
-        if block_type == "text":
-            text = block.get("text", "")
-            text_parts.append(text)
-            content_blocks_payload.append(block)
-        elif block_type == "image":
-            media_type = block.get("media_type", "image/*")
-            text_parts.append(f"[Image: {media_type}]")
-            data = block.get("data", b"")
-            if isinstance(data, bytes):
-                import base64
-
-                block["data"] = base64.b64encode(data).decode("utf-8")
-            content_blocks_payload.append(block)
-        elif block_type in ("embedded_resource", "file_resource"):
-            media_type = block.get("media_type", "application/octet-stream")
-            uri = block.get("uri", "")
-            text_parts.append(f"[Resource: {media_type}]" if not uri else f"[Resource: {uri}]")
-            data = block.get("data", b"")
-            if isinstance(data, bytes):
-                import base64
-
-                block["data"] = base64.b64encode(data).decode("utf-8")
-            content_blocks_payload.append(block)
-
-    if not text_parts and not has_multimodal:
-        return [TextBlock(text="")], content_blocks_payload
-
-    text = " ".join(text_parts) if text_parts else "[multimodal content]"
-    return [TextBlock(text=text)], content_blocks_payload
 
 
 def _content_blocks_to_text_blocks(blocks: list) -> list[TextBlock]:
