@@ -33,6 +33,7 @@ from uuid import uuid4
 import pytest
 import pytest_asyncio
 
+from dana.core.runtime.protocols import StreamEvent, StreamEventType
 from dana.core.session.journal.models import SessionRecord
 from dana.core.session.journal.sqlite import SQLiteJournalRepository
 from dana.core.session.models import FactType, JournalFact, OwnerScope
@@ -84,6 +85,20 @@ class FakeAgent:
             result_holder["full_text"] = "".join(full_parts)
             result_holder["protected_payload"] = None
             result_holder["finish_reason"] = "stop"
+
+    async def aquery_stream(self, *, message=None, **kwargs):
+        """Streaming STAR-loop stand-in: yields TEXT_DELTA per chunk, then DONE."""
+        if self._error is not None:
+            raise self._error
+        for chunk in self._chunks:
+            if self._delay:
+                await asyncio.sleep(self._delay)
+            if self._gate is not None:
+                if self._parked is not None:
+                    self._parked.set()
+                await self._gate.wait()
+            yield StreamEvent(event_type=StreamEventType.TEXT_DELTA, data=chunk, iteration=0)
+        yield StreamEvent(event_type=StreamEventType.DONE, data=None, iteration=0)
 
 
 class RecordingConn:

@@ -8,9 +8,11 @@ raises :class:`SessionBusy`. All turn lifecycle facts are journaled before,
 during, and after the model call, enforcing input durability and exactly one
 terminal fact per turn.
 
-D1 is text-only: the agent is driven through
-:meth:`~dana.core.agent.star_agent_streaming.STARAgentStreamingMixin.aquery_text_stream`,
-which yields immediate text deltas without buffering or emitting THINKING events.
+D1 is text-only: the agent is driven through the streaming STAR loop
+(:meth:`~dana.core.agent.star_agent_streaming.STARAgentStreamingMixin.aquery_stream`)
+which runs see/think/act with tool-calling + reflection and yields
+:class:`~dana.core.runtime.protocols.StreamEvent` values that the session maps to
+:class:`HostEvent` values.
 
 D2 adds tool lifecycle wiring: the session can emit thought events and tool
 lifecycle events (requested, started, progress, result, cancellation) as
@@ -22,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable, Sequence
+import contextlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import time
@@ -396,7 +399,12 @@ class AgentSession:
                 text=user_text,
             )
 
-            self._add_user_message_to_timeline(user_text)
+            # NOTE: do NOT pre-add the user message to the timeline here.
+            # aquery_stream drives the full STAR loop; STARAgent._see adds the
+            # caller_message to the timeline itself so build_prompt includes
+            # it. Pre-adding would duplicate the user message.
+
+            from dana.core.runtime.protocols import StreamEventType
 
             accumulated: list[str] = []
             chunk_buffer: list[str] = []
@@ -404,43 +412,100 @@ class AgentSession:
             last_flush = time.monotonic()
             chunk_index = 0
 
-            try:
-                result_holder: dict[str, Any] = {}
-                async for chunk in self._agent.aquery_text_stream(
-                    message=user_text,
-                    cancel_event=self._cancel_event,
-                    result_holder=result_holder,
-                ):
-                    accumulated.append(chunk)
-                    # Pre-persistence chunk: the fact sequence isn't known until
-                    # the buffered chunks are flushed to the journal. Use 0 to
-                    # signal "not yet persisted"; the host receives chunks in
-                    # stream order regardless. On replay, replay_host_events
-                    # returns these events with their real fact sequences.
-                    yield HostEvent(
-                        event_type=HostEventType.ASSISTANT_CONTENT_CHUNK,
-                        sequence=0,
-                        correlation_id=correlation_id,
-                        timestamp=datetime.now(UTC),
-                        text=chunk,
-                    )
-                    # Bounded flush: accumulate then persist when bound is hit.
-                    chunk_buffer.append(chunk)
-                    chunk_buffer_bytes += len(chunk)
-                    now = time.monotonic()
-                    if chunk_buffer_bytes >= self.CHUNK_FLUSH_BYTES or (now - last_flush) >= self.CHUNK_FLUSH_INTERVAL:
-                        await self._flush_chunks(correlation_id, chunk_buffer, chunk_index)
-                        chunk_index += len(chunk_buffer)
-                        chunk_buffer.clear()
-                        chunk_buffer_bytes = 0
-                        last_flush = now
-
-                # Flush any remaining buffered chunks before the terminal batch.
+            async def _flush_pending() -> None:
+                nonlocal chunk_index, chunk_buffer_bytes, last_flush
                 if chunk_buffer:
                     await self._flush_chunks(correlation_id, chunk_buffer, chunk_index)
+                    chunk_index += len(chunk_buffer)
+                    chunk_buffer.clear()
+                    chunk_buffer_bytes = 0
+                    last_flush = time.monotonic()
 
-                full_text = result_holder.get("full_text") or "".join(accumulated)
-                protected_payload = result_holder.get("protected_payload")
+            try:
+                # Drive the streaming STAR loop (see -> think -> act with
+                # tool-calling + reflection) instead of the text-only
+                # aquery_text_stream, so the model engages with the user's
+                # prompt. Map each StreamEvent to a HostEvent and journal the
+                # corresponding fact, reusing the existing journal helpers.
+                agen = self._agent.aquery_stream(message=user_text)
+                try:
+                    async for event in agen:
+                        # Cooperative cancellation: aquery_stream does not check
+                        # cancel_event itself, so check between events and
+                        # terminalize as TURN_CANCELLED on cancel().
+                        if self._cancel_event is not None and self._cancel_event.is_set():
+                            raise asyncio.CancelledError
+                        etype = event.event_type
+                        data = event.data
+                        if etype == StreamEventType.TEXT_DELTA:
+                            chunk = data if isinstance(data, str) else (str(data) if data else "")
+                            if not chunk:
+                                continue
+                            accumulated.append(chunk)
+                            # Pre-persistence chunk: sequence 0 = "not yet
+                            # persisted"; replay returns real sequences.
+                            yield HostEvent(
+                                event_type=HostEventType.ASSISTANT_CONTENT_CHUNK,
+                                sequence=0,
+                                correlation_id=correlation_id,
+                                timestamp=datetime.now(UTC),
+                                text=chunk,
+                            )
+                            chunk_buffer.append(chunk)
+                            chunk_buffer_bytes += len(chunk)
+                            now = time.monotonic()
+                            if chunk_buffer_bytes >= self.CHUNK_FLUSH_BYTES or (now - last_flush) >= self.CHUNK_FLUSH_INTERVAL:
+                                await _flush_pending()
+                        elif etype == StreamEventType.THINKING:
+                            thought = data if isinstance(data, str) else (str(data) if data else "")
+                            if thought:
+                                # Live-only reasoning event (not journaled).
+                                yield await self.emit_thought(thought, correlation_id)
+                        elif etype == StreamEventType.TOOL_CALL_START:
+                            await _flush_pending()
+                            for tc in data if isinstance(data, list) else ([data] if data else []):
+                                if not isinstance(tc, dict):
+                                    continue
+                                tc_id = tc.get("id") or tc.get("tool_call_id") or str(uuid4())
+                                tc_name = tc.get("name", "")
+                                tc_args = tc.get("input", tc.get("arguments", {}))
+                                yield await self.journal_tool_requested(
+                                    tc_id,
+                                    tc_name,
+                                    correlation_id,
+                                    tc_args,
+                                )
+                                yield await self.journal_tool_authorized_or_denied(
+                                    tc_id,
+                                    correlation_id,
+                                    authorized=True,
+                                )
+                                yield await self.journal_tool_started(tc_id, correlation_id)
+                        elif etype == StreamEventType.TOOL_RESULT:
+                            await _flush_pending()
+                            for tr in data if isinstance(data, list) else ([data] if data else []):
+                                if not isinstance(tr, dict):
+                                    continue
+                                tc_id = tr.get("tool_call_id") or tr.get("id") or ""
+                                yield await self.journal_tool_terminal(
+                                    tc_id,
+                                    correlation_id,
+                                    FactType.TOOL_RESULT,
+                                    result=tr.get("result"),
+                                    error=tr.get("error"),
+                                )
+                        elif etype == StreamEventType.ERROR:
+                            raise RuntimeError(str(data) if data else "stream error")
+                        elif etype == StreamEventType.DONE:
+                            break
+                finally:
+                    with contextlib.suppress(Exception):
+                        await agen.aclose()
+
+                await _flush_pending()
+
+                full_text = "".join(accumulated)
+                protected_payload = None
 
                 # --- Terminal batch: ASSISTANT_CONTENT_FINAL + terminal in ONE append. ---
                 terminal_facts = [

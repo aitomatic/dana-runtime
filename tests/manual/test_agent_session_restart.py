@@ -23,6 +23,7 @@ import tempfile
 # Required before importing dana.session
 os.environ.setdefault("DANA_SESSION_STATE_KEY", "test-key-32-bytes-ok-for-testing!")
 
+from dana.core.runtime.protocols import StreamEvent, StreamEventType  # noqa: E402
 from dana.core.session.agent_session import AgentSession, TextBlock  # noqa: E402
 from dana.core.session.journal.models import SessionRecord  # noqa: E402
 from dana.core.session.journal.sqlite import SQLiteJournalRepository  # noqa: E402
@@ -59,6 +60,14 @@ class FakeAgent:
             result_holder["full_text"] = " ".join(full)
             result_holder["protected_payload"] = None
             result_holder["finish_reason"] = "stop"
+
+    async def aquery_stream(self, *, message: str | None = None, **kwargs) -> AsyncIterator[StreamEvent]:
+        """Streaming STAR-loop stand-in: yields TEXT_DELTA per word, then DONE."""
+        words = f"You said: {message}".split()
+        for w in words:
+            yield StreamEvent(event_type=StreamEventType.TEXT_DELTA, data=w + " ", iteration=0)
+            await asyncio.sleep(0.05)
+        yield StreamEvent(event_type=StreamEventType.DONE, data=None, iteration=0)
 
 
 # ---------------------------------------------------------------------------
