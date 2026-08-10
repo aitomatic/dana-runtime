@@ -24,7 +24,6 @@ import asyncio
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-import os
 import time
 from typing import Any
 from uuid import uuid4
@@ -49,20 +48,17 @@ _TERMINAL_FACT_TYPES = frozenset({FactType.TURN_COMPLETED, FactType.TURN_CANCELL
 def default_agent_factory() -> Any:
     """Build a minimal STARAgent for host adapters (text-turn streaming).
 
-    Configured from ``DANA_LLM_PROVIDER`` / ``DANA_MODEL`` env vars. Centralizing
-    this default here lets host adapters (dana-acp, dana-code) avoid importing
-    STAR core directly — they pass ``agent_factory=None`` and rely on this default
+    Mirrors ``dana.apps.acp.agent._default_agent_factory``: we do NOT pass
+    ``llm_provider``/``model`` — STARAgent resolves them (plus api key,
+    azure endpoint/deployment, etc.) from the config manager / env. Passing
+    them explicitly produced a misconfigured LLM client (empty stream), so
+    host adapters pass ``agent_factory=None`` and rely on this default
     (ADR-001: AgentSession is the only broad host-facing module).
-
-    Tool lifecycle is owned by the AgentSession's tool engine (D2/D7.3), not
-    the agent; this factory builds a text-streaming agent only.
     """
     from dana.core.agent.star_agent import STARAgent
 
     return STARAgent(
         agent_type="dana-host",
-        llm_provider=os.environ.get("DANA_LLM_PROVIDER", "openai"),
-        model=os.environ.get("DANA_MODEL", "gpt-5"),
         auto_register=False,
         enable_skills=False,
         enable_web_search=False,
