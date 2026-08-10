@@ -38,6 +38,7 @@ TOOL_TERMINAL_STATUS: dict[HostEventType, str] = {
 # Turn-terminal kinds surfaced as banners.
 TURN_TERMINAL_KIND: dict[HostEventType, str] = {
     HostEventType.TURN_CANCELLED: "cancelled",
+    HostEventType.TURN_INTERRUPTED: "interrupted",
     HostEventType.TURN_ERROR: "error",
 }
 

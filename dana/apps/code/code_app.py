@@ -85,6 +85,10 @@ class DanaCodeApp:
         # AgentSession path state
         self.agent_session = None
         self._repo = None  # keep the journal repository alive for the session
+        # D7.3: permission policy state (AgentSession path)
+        self._grant_store = None
+        self._permission_adapter = None
+        self._grant_db = None
 
         self.renderer = None
         self._prompt_session = None
@@ -153,16 +157,19 @@ class DanaCodeApp:
                         break
 
                     if user_input.strip().startswith("/"):
-                        if self._handle_command(user_input.strip()):
+                        if await self._handle_command_async(user_input.strip()):
                             continue
                         else:
                             break
 
                     await self._converse_async(user_input)
 
-                except KeyboardInterrupt:
-                    print("\n\nGoodbye!")
-                    break
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    # Ctrl-C between turns (at the input prompt) → clear and
+                    # resume with a fresh prompt. Mid-turn Ctrl-C is absorbed
+                    # inside ``_converse_async`` (cooperative cancel). A second
+                    # SIGINT is force-raised by asyncio.run's Runner → exit.
+                    continue
                 except EOFError:
                     print("\nGoodbye!")
                     break
@@ -177,12 +184,18 @@ class DanaCodeApp:
 
         Without this, ``asyncio.run`` shutdown can hang on the abandoned
         aiosqlite worker thread (the "Event loop is closed" errors are the
-        symptom). Called from ``_run_agentsession``'s ``finally``.
+        symptom). Called from ``_run_agentsession``'s ``finally``. Also closes
+        the in-memory permission grant db (D7.3) so it does not leak a worker
+        thread on exit.
         """
         if self._repo is not None:
             with contextlib.suppress(Exception):
                 await self._repo.close()
             self._repo = None
+        if self._grant_db is not None:
+            with contextlib.suppress(Exception):
+                await self._grant_db.close()
+            self._grant_db = None
 
     async def _initialize_session(self) -> None:
         """Construct an AgentSession backed by the Session Journal.
@@ -236,6 +249,34 @@ class DanaCodeApp:
         )
         self.agent_session = session
 
+        # D7.3: wire the permission policy (evaluator + grant store) — parity
+        # with DanaACPAgent.new_session. Gate by DANA_CODE_PERMISSION_PREFLIGHT.
+        self._grant_store = None
+        self._permission_adapter = None
+        from dana.config.code_capabilities import permission_preflight_enabled
+
+        if permission_preflight_enabled():
+            import aiosqlite
+
+            from dana.apps.code.permissions import CLIPermissionAdapter
+            from dana.core.policy.evaluator import PolicyEvaluator
+            from dana.core.policy.hard_policy import create_default_hard_policy
+            from dana.core.policy.modes import PermissionMode
+            from dana.core.policy.store_schema import POLICY_SQLITE_DDL
+            from dana.core.policy.store_sqlite import SQLiteGrantStore
+
+            grant_db = await aiosqlite.connect(":memory:")
+            grant_db.row_factory = aiosqlite.Row
+            for stmt in POLICY_SQLITE_DDL:
+                await grant_db.execute(stmt)
+            await grant_db.commit()
+            self._grant_db = grant_db
+            grant_store = SQLiteGrantStore(grant_db)
+            evaluator = PolicyEvaluator(create_default_hard_policy(), grant_store, PermissionMode.DEFAULT)
+            session.set_policy_evaluator(evaluator)
+            self._grant_store = grant_store
+            self._permission_adapter = CLIPermissionAdapter(evaluator, grant_store, scope)
+
         self.renderer = RichCLIRenderer(verbose=True, show_tool_calls=True)
         self._print_banner(llm_provider, model)
 
@@ -269,15 +310,22 @@ class DanaCodeApp:
         except SessionBusy:
             print("\n⏳ A turn is already in progress. Please wait for it to finish.\n")
         except (KeyboardInterrupt, asyncio.CancelledError):
-            # Ctrl-C mid-turn. Under asyncio.run (Py 3.11+) SIGINT surfaces as
-            # CancelledError inside the task, not KeyboardInterrupt — catch both.
-            # Explicitly close the generator so its ``async with`` lock releases
-            # promptly (no stuck-busy on next turn); re-raise to let asyncio.run
-            # shut down cleanly. A journaled TURN_CANCELLED fact + interrupt-and-
-            # continue UX is the D7.3 cancel-watcher follow-up (ADR-005).
+            # Ctrl-C mid-turn → cooperative cancel (ADR-005). prompt() catches
+            # the cancellation internally and terminalizes the turn as
+            # TURN_CANCELLED — a truthful terminal fact rendered by D7.2. If the
+            # cancellation propagated here, set the cancel event and drain any
+            # remaining events so the terminal is rendered, then RESUME the
+            # REPL (absorb the cancel — do not re-raise / exit). Closing the
+            # generator ensures its ``async with`` lock releases so the next
+            # turn is never stuck-busy.
+            with contextlib.suppress(RuntimeError, Exception):
+                await self.agent_session.cancel()
+            with contextlib.suppress(Exception):
+                async for event in gen:
+                    self.renderer.handle_host_event(event)
             with contextlib.suppress(Exception):
                 await gen.aclose()
-            raise
+            print("\n⏹ Turn interrupted.\n")
 
     # ------------------------------------------------------------------
     # Legacy path (DANA_CODE_AGENTSESSION_ENABLED=0)
@@ -302,7 +350,7 @@ class DanaCodeApp:
                     break
 
                 if user_input.strip().startswith("/"):
-                    if self._handle_command(user_input.strip()):
+                    if self._handle_command_legacy(user_input.strip()):
                         continue
                     else:
                         break
@@ -386,56 +434,63 @@ class DanaCodeApp:
         banner.append(f"  {cwd}\n", style="dim")
         console.print(banner)
 
-    def _handle_command(self, command: str) -> bool:
-        """Handle slash commands. Returns True to continue, False to exit.
+    async def _handle_command_async(self, command: str) -> bool:
+        """AgentSession-path slash commands (delegates to dana.apps.code.commands).
 
-        Branches on the active path: AgentSession commands introspect
-        ``self.agent_session``; legacy commands introspect ``self.agent``.
+        Returns True to continue, False to exit.
         """
+        from dana.apps.code import commands as cmds
+
         cmd = command[1:].lower().strip()
         assert self.renderer is not None
 
         if cmd == "help":
-            print("""
-Commands:
-  /help     - Show this help
-  /compact  - Toggle verbose output
-  /status   - Show agent and model info
-  /exit     - Exit
-""")
+            print(cmds.HELP_TEXT)
             return True
-
         if cmd == "compact":
-            self.renderer.verbose = not self.renderer.verbose
-            mode = "verbose" if self.renderer.verbose else "compact"
-            print(f"\nOutput mode: {mode}\n")
+            print(cmds.compact_toggle(self))
             return True
-
         if cmd == "status":
-            if self.agent_session is not None:
-                print(f"\nSession: {self.agent_session._session_id}")
-                print(f"Provider: {self.agent_session.current_provider or os.environ.get('DANA_LLM_PROVIDER', 'unknown')}")
-                print(f"Model: {self.agent_session.current_model or os.environ.get('DANA_MODEL', 'unknown')}")
-                print(f"Permission mode: {self.agent_session.permission_mode}")
-                print()
-            elif self.agent is not None:
-                state = self.agent.get_state()
-                print(f"\nAgent: {state.get('object_id', 'unknown')}")
-                print(f"Type: {state.get('agent_type', 'unknown')}")
-                print(f"Provider: {self.agent._llm_config.get('provider', 'unknown')}")
-                print(f"Model: {self.agent._llm_config.get('model', 'unknown')}")
-                print(f"Timeline entries: {state.get('timeline_entries', 0)}")
-                print()
+            print(cmds.status_lines(self))
             return True
-
+        if cmd == "permissions":
+            print(await cmds.list_permissions_async(self))
+            return True
         if cmd == "reset":
-            if self.agent_session is not None:
-                print("\n/reset on the AgentSession path is part of D7.3 (journal semantics).\n")
-            elif self.agent is not None:
-                self.agent._timeline.timeline.clear()
-                print("\nConversation history reset.\n")
+            print(await cmds.reset_session(self))
             return True
+        if cmd == "model" or cmd.startswith("model "):
+            print(await cmds.switch_model(self, cmd))
+            return True
+        print(f"\nUnknown command: {command}")
+        print("Type /help for available commands.\n")
+        return True
 
+    def _handle_command_legacy(self, command: str) -> bool:
+        """Legacy-path slash commands (sync subset; /model + /permissions are
+        AgentSession-only)."""
+        from dana.apps.code import commands as cmds
+
+        cmd = command[1:].lower().strip()
+        assert self.renderer is not None
+
+        if cmd == "help":
+            print(cmds.HELP_TEXT)
+            return True
+        if cmd == "compact":
+            print(cmds.compact_toggle(self))
+            return True
+        if cmd == "status":
+            print(cmds.status_lines(self))
+            return True
+        if cmd == "reset":
+            assert self.agent is not None
+            self.agent._timeline.timeline.clear()
+            print("\nConversation history reset.\n")
+            return True
+        if cmd in ("model", "permissions") or cmd.startswith("model "):
+            print("\n/model and /permissions are available on the AgentSession path only.\n")
+            return True
         print(f"\nUnknown command: {command}")
         print("Type /help for available commands.\n")
         return True
