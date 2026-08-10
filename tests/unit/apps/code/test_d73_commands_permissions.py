@@ -183,6 +183,7 @@ def _fake_session(*, locked=False, provider="openai", model="gpt-5", sid="s-1", 
         current_model=model,
         permission_mode=SimpleNamespace(value="default"),
         _lock=SimpleNamespace(locked=lambda: locked),
+        append_fact=AsyncMock(),
     )
 
     def _rebind(t, p, r):
@@ -295,6 +296,39 @@ async def test_model_switch_atomic(monkeypatch):
     assert "Switched to anthropic/claude-sonnet-4" in out
     assert s.current_provider == "anthropic"
     assert s.current_model == "claude-sonnet-4"
+    # M2: a MODEL_CHANGED fact must be journaled after a successful switch
+    # (ADR-002 durability — mirrors ACP session/set_session_model).
+    s.append_fact.assert_called_once()
+    fact = s.append_fact.call_args.args[0]
+    from dana.core.session.models import FactType
+
+    assert fact.fact_type is FactType.MODEL_CHANGED
+    assert fact.payload == {"provider": "anthropic", "model": "claude-sonnet-4"}
+
+
+@pytest.mark.asyncio
+async def test_model_switch_failure_no_journal(monkeypatch):
+    """A failed switch must NOT journal a MODEL_CHANGED fact."""
+    monkeypatch.setenv("DANA_MODEL_CATALOG", '[{"provider":"anthropic","model":"claude-sonnet-4"}]')
+    s = _fake_session(provider="openai", model="gpt-5")
+    # Sabotage the switch so rebind raises → switcher.switch returns failure.
+    s.rebind_model = Mock(side_effect=RuntimeError("boom"))
+    app = _fake_app(agent_session=s)
+    out = await cmds.switch_model(app, "model anthropic/claude-sonnet-4")
+    assert "Model switch failed" in out
+    s.append_fact.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_model_no_arg_current_env_fallback(monkeypatch):
+    """When no provider/model is bound, /model Current falls back to env (parity with /status)."""
+    monkeypatch.setenv("DANA_LLM_PROVIDER", "azure")
+    monkeypatch.setenv("DANA_MODEL", "gpt-5.4")
+    monkeypatch.setenv("DANA_MODEL_CATALOG", '[{"provider":"anthropic","model":"claude-sonnet-4"}]')
+    s = _fake_session(provider=None, model=None)
+    app = _fake_app(agent_session=s)
+    out = await cmds.switch_model(app, "model")
+    assert "Current: azure/gpt-5.4" in out
 
 
 @pytest.mark.asyncio
@@ -370,3 +404,119 @@ def test_agentsession_accessors_and_set_policy_evaluator():
     s.set_policy_evaluator(evaluator)
     assert s.policy_evaluator is evaluator
     evaluator.set_mode.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# D6: Multimodal input parsing (AC #5) — _build_prompt_blocks
+# ---------------------------------------------------------------------------
+
+
+def _make_app(*, provider=None):
+    """Build a DanaCodeApp with a fake AgentSession for _build_prompt_blocks tests."""
+    from dana.apps.code.code_app import DanaCodeApp
+
+    app = DanaCodeApp()
+    app.agent_session = _fake_session(provider=provider)
+    app.renderer = SimpleNamespace(verbose=True)
+    return app
+
+
+def test_prompt_blocks_text_only_no_at(tmp_path, monkeypatch):
+    """Plain text with no @-token → single TextBlock, content_blocks=None."""
+    monkeypatch.delenv("DANA_CODE_MULTIMODAL_ENABLED", raising=False)
+    app = _make_app()
+    blocks, content = app._build_prompt_blocks("hello world")
+    assert len(blocks) == 1
+    assert blocks[0].text == "hello world"
+    assert content is None
+
+
+def test_prompt_blocks_flag_off_disables_parsing(tmp_path, monkeypatch):
+    """DANA_CODE_MULTIMODAL_ENABLED=0 → even a real @path is left as text."""
+    img = tmp_path / "pic.png"
+    img.write_bytes(b"fake-png")
+    monkeypatch.setenv("DANA_CODE_MULTIMODAL_ENABLED", "0")
+    app = _make_app()
+    blocks, content = app._build_prompt_blocks(f"look @{img}")
+    assert content is None
+    assert blocks[0].text == f"look @{img}"
+
+
+def test_prompt_blocks_image_attachment(tmp_path, monkeypatch):
+    """A real @path to a png → image content block in the payload."""
+    monkeypatch.setenv("DANA_CODE_MULTIMODAL_ENABLED", "1")
+    img = tmp_path / "pic.png"
+    img.write_bytes(b"\x89PNG\r\n fake")
+    app = _make_app(provider=None)  # fresh session → no capability check
+    blocks, content = app._build_prompt_blocks(f"see this @{img}")
+    assert content is not None
+    assert any(b.get("type") == "image" for b in content)
+    img_block = next(b for b in content if b.get("type") == "image")
+    assert "png" in img_block["media_type"]
+    # bytes are base64-encoded in the payload (journal-serializable)
+    assert isinstance(img_block["data"], str)
+    assert len(blocks) == 1
+    assert "see this" in blocks[0].text
+
+
+def test_prompt_blocks_file_resource_attachment(tmp_path, monkeypatch):
+    """A non-image @path → file_resource block (not image)."""
+    monkeypatch.setenv("DANA_CODE_MULTIMODAL_ENABLED", "1")
+    doc = tmp_path / "notes.txt"
+    doc.write_text("hello")
+    app = _make_app(provider=None)
+    blocks, content = app._build_prompt_blocks(f"read @{doc}")
+    assert content is not None
+    assert any(b.get("type") == "file_resource" for b in content)
+    fr = next(b for b in content if b.get("type") == "file_resource")
+    assert fr["uri"] == str(doc)
+
+
+def test_prompt_blocks_nonexistent_at_stays_text(tmp_path, monkeypatch):
+    """An @token that is not a real file stays literal (no false positive)."""
+    monkeypatch.setenv("DANA_CODE_MULTIMODAL_ENABLED", "1")
+    app = _make_app(provider=None)
+    blocks, content = app._build_prompt_blocks("email me@test.com and @/no/such/file")
+    assert content is None
+    assert "me@test.com" in blocks[0].text
+    assert "@/no/such/file" in blocks[0].text
+
+
+def test_prompt_blocks_provider_capability_rejects_unsupported(tmp_path, monkeypatch):
+    """ADR-009: an unsupported provider + image attachment raises before the turn."""
+    monkeypatch.setenv("DANA_CODE_MULTIMODAL_ENABLED", "1")
+    img = tmp_path / "pic.png"
+    img.write_bytes(b"fake")
+    app = _make_app(provider="unsupported-co")
+    from dana.core.content.validation import ProviderCapabilityError
+
+    with pytest.raises(ProviderCapabilityError):
+        app._build_prompt_blocks(f"@{img}")
+
+
+def test_prompt_blocks_provider_capability_allows_supported(tmp_path, monkeypatch):
+    """A supported provider (e.g. openai) + image attachment passes."""
+    monkeypatch.setenv("DANA_CODE_MULTIMODAL_ENABLED", "1")
+    img = tmp_path / "pic.png"
+    img.write_bytes(b"fake")
+    app = _make_app(provider="openai")
+    blocks, content = app._build_prompt_blocks(f"@{img}")
+    assert content is not None
+    assert any(b.get("type") == "image" for b in content)
+
+
+def test_normalized_blocks_to_text_blocks_shared_helper():
+    """The shared content helper (moved from ACP) round-trips text+image."""
+    from dana.core.content.blocks import normalized_blocks_to_text_blocks
+
+    blocks = [
+        {"type": "text", "text": "hi"},
+        {"type": "image", "media_type": "image/png", "data": b"\x89PNG"},
+    ]
+    text_blocks, payload = normalized_blocks_to_text_blocks(blocks)
+    assert len(text_blocks) == 1
+    assert "hi" in text_blocks[0].text
+    assert "[Image: image/png]" in text_blocks[0].text
+    assert payload[0]["type"] == "text"
+    assert payload[1]["type"] == "image"
+    assert isinstance(payload[1]["data"], str)  # base64-encoded

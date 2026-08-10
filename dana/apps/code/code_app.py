@@ -16,6 +16,7 @@ import importlib.metadata
 import logging
 import os
 import sys
+from typing import Any
 
 from dotenv import find_dotenv, load_dotenv
 import structlog
@@ -290,20 +291,112 @@ class DanaCodeApp:
             return await self._prompt_session.prompt_async("❯ ")
         return await asyncio.to_thread(input, "❯ ")
 
+    # ------------------------------------------------------------------
+    # D6: Multimodal input parsing (AC #5)
+    # ------------------------------------------------------------------
+
+    _IMAGE_EXTS = frozenset({"png", "jpg", "jpeg", "gif", "webp", "bmp"})
+    # Providers known to accept multimodal content (mirrors ACP
+    # ``_validate_multimodal_capability``). Used for the ADR-009 pre-turn
+    # capability check.
+    _MULTIMODAL_PROVIDERS = frozenset({"anthropic", "openai", "google", "bedrock", "vertex"})
+
+    def _build_prompt_blocks(self, message: str) -> tuple[Any, list[dict] | None]:
+        """Parse ``@/path`` attachments from ``message`` into content blocks.
+
+        Mirrors ACP's multimodal turn construction: a normalized block list is
+        built (text + image/file_resource), the provider capability is checked
+        (ADR-009), then ``normalized_blocks_to_text_blocks`` produces the
+        ``(TextBlock list, content_blocks payload)`` for ``session.prompt``.
+
+        Convention: a whitespace-delimited token starting with ``@`` whose
+        remainder is an existing file path becomes an attachment. Image
+        extensions become image blocks; other files become file-resource blocks.
+        Non-existent ``@`` paths are left as literal text (no false positives).
+
+        Gated by ``DANA_CODE_MULTIMODAL_ENABLED``: when disabled (or no
+        attachments found), returns a plain text block with ``content_blocks=None``
+        (text-only turn, unchanged behaviour).
+        """
+        from dana.config.code_capabilities import multimodal_enabled
+        from dana.core.content.blocks import normalized_blocks_to_text_blocks
+        from dana.core.content.validation import validate_provider_capability
+        from dana.core.session.agent_session import TextBlock
+
+        # Text-only fast path: flag off, or no @-token present.
+        if not multimodal_enabled() or "@" not in message:
+            return [TextBlock(text=message)], None
+
+        import mimetypes
+        import re
+
+        normalized: list[dict] = []
+        text_parts: list[str] = []
+        pos = 0
+        has_attachment = False
+        for m in re.finditer(r"@(\S+)", message):
+            text_parts.append(message[pos : m.start()])
+            token = m.group(1)
+            path = os.path.expanduser(token)
+            if not os.path.isabs(path):
+                path = os.path.join(os.getcwd(), path)
+            if not os.path.isfile(path):
+                # not a real file → keep the literal "@token" as text
+                text_parts.append(m.group(0))
+                pos = m.end()
+                continue
+            has_attachment = True
+            media_type, _ = mimetypes.guess_type(path)
+            ext = os.path.splitext(path)[1].lstrip(".").lower()
+            if ext in self._IMAGE_EXTS:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+                normalized.append({"type": "image", "media_type": media_type or "image/octet-stream", "data": data})
+                text_parts.append(f"[Image: {media_type or ext}]")
+            else:
+                normalized.append({"type": "file_resource", "uri": path, "media_type": media_type or "application/octet-stream"})
+                text_parts.append(f"[Resource: {os.path.basename(path)}]")
+            pos = m.end()
+        text_parts.append(message[pos:])  # trailing text
+
+        if not has_attachment:
+            return [TextBlock(text=message)], None
+
+        text_block = {"type": "text", "text": "".join(text_parts).strip()}
+        blocks = [text_block, *normalized]
+
+        # ADR-009: validate provider capability before the turn (mirrors ACP).
+        provider = self.agent_session.current_provider if self.agent_session is not None else None
+        if provider is not None:
+            supports = provider in self._MULTIMODAL_PROVIDERS
+            validate_provider_capability(
+                blocks,
+                provider,
+                supports_images=supports,
+                supports_embedded_resources=supports,
+                supports_file_resources=supports,
+            )
+
+        text_blocks, content_blocks_payload = normalized_blocks_to_text_blocks(blocks)
+        return text_blocks, content_blocks_payload or None
+
     async def _converse_async(self, message: str) -> None:
         """Run one turn through AgentSession, rendering the HostEvent stream.
 
         ``AgentSession.prompt()`` serializes turns: a conflicting prompt raises
         ``SessionBusy`` (caught here). The renderer consumes each HostEvent via
-        the D7.2 bridge (``handle_host_event``).
+        the D7.2 bridge (``handle_host_event``). D6: ``@/path`` attachments in
+        the message are parsed into content blocks (AC #5), mirroring ACP's
+        ``_acp_prompt_to_normalized_blocks`` -> ``normalized_blocks_to_text_blocks``
+        flow. Gated by ``DANA_CODE_MULTIMODAL_ENABLED``.
         """
-        from dana.core.session.agent_session import SessionBusy, TextBlock
+        from dana.core.session.agent_session import SessionBusy
 
         assert self.agent_session is not None
         assert self.renderer is not None
 
-        blocks = [TextBlock(text=message)]
-        gen = self.agent_session.prompt(blocks)
+        text_blocks, content_blocks = self._build_prompt_blocks(message)
+        gen = self.agent_session.prompt(text_blocks, content_blocks=content_blocks)
         try:
             async for event in gen:
                 self.renderer.handle_host_event(event)

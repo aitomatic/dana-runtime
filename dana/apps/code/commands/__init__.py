@@ -21,6 +21,10 @@ HELP_TEXT = """Commands:
   /permissions   List active durable permission grants
   /reset         Start a fresh session (clears in-memory history)
   /exit          Exit
+
+Attachments (D6): include @/path/to/file in a message to attach a file.
+  Image files (png/jpg/gif/webp/bmp) become image content blocks; other files
+  become file-resource references. Requires DANA_CODE_MULTIMODAL_ENABLED.
 """
 
 
@@ -118,7 +122,9 @@ async def switch_model(app: Any, arg: str) -> str:
     # No arg → list configured targets + current.
     target_id = arg[len("model ") :].strip() if arg.startswith("model ") else ""
     if not target_id:
-        lines = [f"\nCurrent: {s.current_provider or '?'}/{s.current_model or '?'}"]
+        cur_p = s.current_provider or os.environ.get("DANA_LLM_PROVIDER", "?")
+        cur_m = s.current_model or os.environ.get("DANA_MODEL", "?")
+        lines = [f"\nCurrent: {cur_p}/{cur_m}"]
         lines.append("Available:")
         for t in catalog.targets:
             lines.append(f"  {t.provider}/{t.model}")
@@ -159,4 +165,20 @@ async def switch_model(app: Any, arg: str) -> str:
     result = switcher.switch(target)
     if not result.success:
         return f"\nModel switch failed: {result.error}\n"
+
+    # Journal the MODEL_CHANGED fact (ADR-002 durability; mirrors ACP
+    # agent.py session/set_session_model). The journal is the sole durable
+    # authority — an in-memory rebind alone is not durable.
+    from uuid import uuid4
+
+    from dana.core.session.models import FactType, NewJournalFact
+
+    await s.append_fact(
+        NewJournalFact(
+            fact_type=FactType.MODEL_CHANGED,
+            correlation_id=str(uuid4()),
+            causation_id=None,
+            payload={"provider": target.provider, "model": target.model},
+        )
+    )
     return f"\nSwitched to {s.current_provider}/{s.current_model}\n"
