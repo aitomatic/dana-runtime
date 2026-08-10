@@ -140,34 +140,49 @@ class DanaCodeApp:
         """Async REPL over AgentSession; renders the HostEvent stream."""
         await self._initialize_session()
 
-        while True:
-            try:
-                user_input = await self._aread_input()
+        try:
+            while True:
+                try:
+                    user_input = await self._aread_input()
 
-                if not user_input.strip():
-                    continue
-
-                if user_input.strip().lower() in ["exit", "quit", "bye", "/exit"]:
-                    print("\nGoodbye!")
-                    break
-
-                if user_input.strip().startswith("/"):
-                    if self._handle_command(user_input.strip()):
+                    if not user_input.strip():
                         continue
-                    else:
+
+                    if user_input.strip().lower() in ["exit", "quit", "bye", "/exit"]:
+                        print("\nGoodbye!")
                         break
 
-                await self._converse_async(user_input)
+                    if user_input.strip().startswith("/"):
+                        if self._handle_command(user_input.strip()):
+                            continue
+                        else:
+                            break
 
-            except KeyboardInterrupt:
-                print("\n\nGoodbye!")
-                break
-            except EOFError:
-                print("\nGoodbye!")
-                break
-            except Exception as e:
-                print(f"\nError: {e}")
-                print("Type /help for commands or /exit to quit.")
+                    await self._converse_async(user_input)
+
+                except KeyboardInterrupt:
+                    print("\n\nGoodbye!")
+                    break
+                except EOFError:
+                    print("\nGoodbye!")
+                    break
+                except Exception as e:
+                    print(f"\nError: {e}")
+                    print("Type /help for commands or /exit to quit.")
+        finally:
+            await self._close_repo()
+
+    async def _close_repo(self) -> None:
+        """Close the journal repository so aiosqlite releases its connection.
+
+        Without this, ``asyncio.run`` shutdown can hang on the abandoned
+        aiosqlite worker thread (the "Event loop is closed" errors are the
+        symptom). Called from ``_run_agentsession``'s ``finally``.
+        """
+        if self._repo is not None:
+            with contextlib.suppress(Exception):
+                await self._repo.close()
+            self._repo = None
 
     async def _initialize_session(self) -> None:
         """Construct an AgentSession backed by the Session Journal.
