@@ -223,6 +223,44 @@ class AgentSession:
             self._policy_evaluator.set_mode(mode)
 
     # ------------------------------------------------------------------
+    # D3: Policy evaluator accessors (ADR-006)
+    # ------------------------------------------------------------------
+
+    def set_policy_evaluator(self, evaluator: Any) -> None:
+        """Wire the permission PolicyEvaluator (D3, ADR-006).
+
+        Mirrors how ``DanaACPAgent.new_session`` attaches an evaluator. The
+        evaluator owns grant precedence and ``affected_locations`` matching;
+        host adapters (CLI, ACP) provide the *decision* surface, not the policy.
+        """
+        self._policy_evaluator = evaluator
+        evaluator.set_mode(self._permission_mode)
+
+    @property
+    def policy_evaluator(self) -> Any:
+        """The wired PolicyEvaluator, or ``None`` when policy grants are disabled."""
+        return self._policy_evaluator
+
+    # ------------------------------------------------------------------
+    # Identity (public read accessors — host adapters must not read privates)
+    # ------------------------------------------------------------------
+
+    @property
+    def owner_scope(self) -> OwnerScope:
+        """The OwnerScope (owner + workspace) for this session."""
+        return self._owner_scope
+
+    @property
+    def session_id(self) -> str:
+        """The durable session id."""
+        return self._session_id
+
+    @property
+    def version(self) -> int:
+        """The current journal version (sequence) for this session."""
+        return self._current_version
+
+    # ------------------------------------------------------------------
     # D4: Model state (ADR-007)
     # ------------------------------------------------------------------
 

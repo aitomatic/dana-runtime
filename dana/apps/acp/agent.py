@@ -263,8 +263,8 @@ class DanaACPAgent:
         session._current_version = init_facts[0].sequence
         # Wire policy evaluator for permission adapter (D3)
         if self._policy_grants_enabled:
-            from dana.core.policy.grants import SQLiteGrantStore
             from dana.core.policy.store_schema import POLICY_SQLITE_DDL
+            from dana.core.policy.store_sqlite import SQLiteGrantStore
 
             grant_db = await aiosqlite.connect(":memory:")
             grant_db.row_factory = aiosqlite.Row
