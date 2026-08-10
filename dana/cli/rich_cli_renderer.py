@@ -69,12 +69,14 @@ class RichCLIRenderer(Notifiable):
         show_tool_calls: bool = True,
         show_reasoning: bool = True,
         max_output_lines: int = 50,
+        echo_user_message: bool = False,
     ) -> None:
         self.console = console or Console()
         self.verbose = verbose
         self.show_tool_calls = show_tool_calls
         self.show_reasoning = show_reasoning
         self.max_output_lines = max_output_lines
+        self.echo_user_message = echo_user_message
         self.state = RenderState()
         self._spinner = SpinnerComponent()
         self._stream_display = StreamDisplayComponent(max_visible_lines=20, line_threshold=max_output_lines)
@@ -758,8 +760,13 @@ class RichCLIRenderer(Notifiable):
     # -- messages & streaming ------------------------------------------
 
     def show_user_message(self, event: HostEvent) -> None:
-        """USER_MESSAGE: echo the prompt line once (verbose only)."""
-        if not self.verbose or self._caller_message_shown:
+        """USER_MESSAGE: echo the prompt line (off by default).
+
+        Interactive prompts (prompt_toolkit) already render the typed input, so
+        echoing here would duplicate it. Enable ``echo_user_message`` for
+        replay/non-interactive consumers that need to surface the user turn.
+        """
+        if not self.echo_user_message or not self.verbose or self._caller_message_shown:
             return
         self._caller_message_shown = True
         was_live = self._live is not None
