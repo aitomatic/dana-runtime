@@ -21,13 +21,13 @@ from acp import PROTOCOL_VERSION
 from acp.helpers import update_current_mode
 from acp.schema import (
     AgentCapabilities,
+    AllowedOutcome,
+    DeniedOutcome,
     Implementation,
     InitializeResponse,
     LoadSessionResponse,
     ModelInfo,
     NewSessionResponse,
-    PermissionOption,
-    PermissionOptionKind,
     PromptCapabilities,
     PromptResponse,
     RequestPermissionRequest,
@@ -315,89 +315,80 @@ class DanaACPAgent:
         session_id: str,
         **kwargs: Any,
     ) -> RequestPermissionResponse:
-        """Handle a permission request from the host (ADR-013).
+        """Resolve a permission request to an outcome (ADR-013, outcome schema).
 
-        Evaluates the requested operation through the policy evaluator and
-        returns the available permission options.
+        The installed ``acp`` schema is outcome-based: the host sends the
+        ``tool_call`` + the offered ``options``; the agent resolves to an
+        ``AllowedOutcome(selected, option_id)`` or ``DeniedOutcome(cancelled)``.
+
+        Mapping (ADR-006, fail-closed for unresolved decisions):
+        - ``PolicyDecision.DENY``        → ``DeniedOutcome(cancelled)``
+          (``denied_reason`` in ``field_meta``).
+        - ``PolicyDecision.ALLOW``       → ``AllowedOutcome(selected, allow_always
+          if a durable grant matched, else allow_once)``.
+        - ``PolicyDecision.NEEDS_PROMPT`` → ``DeniedOutcome(cancelled)``
+          (the ACP host cannot interactively prompt inside this call; it surfaces
+          the reason + offers a durable grant / mode change, then re-requests).
+        - No evaluator wired               → pre-authorize a single use
+          (no hard policy is enforceable).
         """
         session = self._sessions.get(session_id)
         if session is None:
             raise ValueError(f"Unknown session: {session_id}")
 
+        # Extract tool identity + offered options from the request. Handle both
+        # the real ``acp.schema.RequestPermissionRequest`` (carries ``tool_call``
+        # + ``options``) and simple test namespaces (``tool_name``/``arguments``).
+        tc = getattr(request, "tool_call", None)
+        if tc is not None:
+            fn = getattr(tc, "title", None) or getattr(tc, "kind", None) or getattr(tc, "tool_call_id", "") or ""
+            args = getattr(request, "arguments", None) or getattr(tc, "raw_input", None) or {}
+        else:
+            fn = getattr(request, "tool_name", "") or ""
+            args = getattr(request, "arguments", {}) or {}
+        offered = getattr(request, "options", None) or []
+
+        def _option_id(kind: str) -> str:
+            """Return the option_id for ``kind`` from the offered options, or a
+            synthetic fallback so the response is always schema-valid."""
+            for opt in offered:
+                if getattr(opt, "kind", None) == kind:
+                    return getattr(opt, "option_id", None) or kind
+            return kind
+
         evaluator = session.policy_evaluator
         if evaluator is None:
+            # No policy wired → no hard deny is enforceable; pre-authorize once.
             return RequestPermissionResponse(
-                options=[
-                    PermissionOption(
-                        kind=PermissionOptionKind.ALLOW_ONCE,
-                        display_name="Allow Once",
-                    ),
-                    PermissionOption(
-                        kind=PermissionOptionKind.ALLOW_ALWAYS,
-                        display_name="Allow Always",
-                    ),
-                    PermissionOption(
-                        kind=PermissionOptionKind.REJECT_ONCE,
-                        display_name="Reject Once",
-                    ),
-                    PermissionOption(
-                        kind=PermissionOptionKind.REJECT_ALWAYS,
-                        display_name="Reject Always",
-                    ),
-                ],
+                outcome=AllowedOutcome(outcome="selected", option_id=_option_id("allow_once")),
             )
 
-        # Build an Operation from the request and evaluate
         from dana.core.policy.operations import build_policy_operation
 
-        tool_call = {
-            "function": getattr(request, "tool_name", ""),
-            "arguments": getattr(request, "arguments", {}),
-        }
         op = build_policy_operation(
-            tool_call,
+            {"function": fn, "arguments": args},
             catalog=None,
             owner=session.owner_scope.owner_id,
             workspace=session.owner_scope.workspace,
         )
         result = await evaluator.evaluate(op, session.owner_scope)
 
-        options: list[PermissionOption] = []
         if result.decision is PolicyDecision.DENY:
             return RequestPermissionResponse(
-                options=[],
-                denied_reason=result.reason,
+                outcome=DeniedOutcome(outcome="cancelled"),
+                field_meta={"denied_reason": result.reason or "denied"},
             )
-
-        if self._policy_grants_enabled:
-            options = [
-                PermissionOption(
-                    kind=PermissionOptionKind.ALLOW_ONCE,
-                    display_name="Allow Once",
-                ),
-                PermissionOption(
-                    kind=PermissionOptionKind.ALLOW_ALWAYS,
-                    display_name="Allow Always",
-                ),
-                PermissionOption(
-                    kind=PermissionOptionKind.REJECT_ONCE,
-                    display_name="Reject Once",
-                ),
-                PermissionOption(
-                    kind=PermissionOptionKind.REJECT_ALWAYS,
-                    display_name="Reject Always",
-                ),
-            ]
-        else:
-            # Rollback: only allow-once (ADR-012)
-            options = [
-                PermissionOption(
-                    kind=PermissionOptionKind.ALLOW_ONCE,
-                    display_name="Allow Once",
-                ),
-            ]
-
-        return RequestPermissionResponse(options=options)
+        if result.decision is PolicyDecision.ALLOW:
+            kind = "allow_always" if getattr(result, "matched_grant_id", None) else "allow_once"
+            return RequestPermissionResponse(
+                outcome=AllowedOutcome(outcome="selected", option_id=_option_id(kind)),
+            )
+        # NEEDS_PROMPT → fail-closed (ADR-006): the host surfaces the reason and
+        # offers a durable grant / mode change, then re-requests.
+        return RequestPermissionResponse(
+            outcome=DeniedOutcome(outcome="cancelled"),
+            field_meta={"denied_reason": "requires user confirmation"},
+        )
 
     # ------------------------------------------------------------------
     # ACP protocol: session/set_mode (ADR-013)

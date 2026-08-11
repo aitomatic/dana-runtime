@@ -584,18 +584,15 @@ class TestParityPermission:
         assert "durable grant" in verdict.reason
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        reason=(
-            "ACP request_permission pre-existing bugs (FINDINGS 1+2): "
-            "PermissionOptionKind is typing.Literal not enum → AttributeError; "
-            "RequestPermissionResponse missing required 'outcome' field. "
-            "Filed as findings; fix in a core story."
-        ),
-        raises=Exception,
-        strict=False,
-    )
     async def test_permission_acp_deny_parity(self, tmp_path):
-        """ACP request_permission DENY → denied_reason set (currently broken)."""
+        """ACP request_permission DENY → DeniedOutcome(cancelled) with denied_reason."""
+        from acp.schema import (
+            DeniedOutcome,
+            PermissionOption,
+            RequestPermissionRequest,
+            ToolCallUpdate,
+        )
+
         from dana.apps.acp.agent import DanaACPAgent
         from dana.core.policy.evaluator import PolicyDecision
 
@@ -608,27 +605,35 @@ class TestParityPermission:
         sid = new_resp.session_id
         agent._sessions[sid].set_policy_evaluator(evaluator)
 
-        req = SimpleNamespace(tool_name="some_tool", arguments={})
+        req = RequestPermissionRequest(
+            session_id=sid,
+            tool_call=ToolCallUpdate(tool_call_id="tc1", kind="read", title="some_tool"),
+            options=[
+                PermissionOption(kind="allow_once", name="Allow Once", option_id="opt-ao"),
+                PermissionOption(kind="allow_always", name="Allow Always", option_id="opt-aa"),
+                PermissionOption(kind="reject_once", name="Reject Once", option_id="opt-ro"),
+                PermissionOption(kind="reject_always", name="Reject Always", option_id="opt-ra"),
+            ],
+        )
         resp = await agent.request_permission(req, sid)
         assert resp is not None
-        assert resp.denied_reason is not None
-        assert len(resp.options) == 0
+        assert isinstance(resp.outcome, DeniedOutcome)
+        assert resp.outcome.outcome == "cancelled"
+        assert "hard deny" in (resp.field_meta or {}).get("denied_reason", "")
 
         if agent._repository is not None:
             await agent._repository.close()
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        reason=(
-            "ACP request_permission pre-existing bug (FINDING 1): "
-            "PermissionOptionKind.ALLOW_ONCE → AttributeError. "
-            "Filed as finding; fix in a core story."
-        ),
-        raises=Exception,
-        strict=False,
-    )
     async def test_permission_acp_allow_parity(self, tmp_path):
-        """ACP request_permission ALLOW → options returned (currently broken)."""
+        """ACP request_permission ALLOW (no durable grant) → AllowedOutcome(allow_once)."""
+        from acp.schema import (
+            AllowedOutcome,
+            PermissionOption,
+            RequestPermissionRequest,
+            ToolCallUpdate,
+        )
+
         from dana.apps.acp.agent import DanaACPAgent
         from dana.core.policy.evaluator import PolicyDecision
 
@@ -641,11 +646,23 @@ class TestParityPermission:
         sid = new_resp.session_id
         agent._sessions[sid].set_policy_evaluator(evaluator)
 
-        req = SimpleNamespace(tool_name="some_tool", arguments={})
+        req = RequestPermissionRequest(
+            session_id=sid,
+            tool_call=ToolCallUpdate(tool_call_id="tc1", kind="read", title="some_tool"),
+            options=[
+                PermissionOption(kind="allow_once", name="Allow Once", option_id="opt-ao"),
+                PermissionOption(kind="allow_always", name="Allow Always", option_id="opt-aa"),
+            ],
+        )
         resp = await agent.request_permission(req, sid)
         assert resp is not None
-        assert resp.denied_reason is None
-        assert len(resp.options) > 0
+        assert isinstance(resp.outcome, AllowedOutcome)
+        assert resp.outcome.outcome == "selected"
+        # No matched_grant_id on the mock → allow_once.
+        assert resp.outcome.option_id == "opt-ao"
+
+        if agent._repository is not None:
+            await agent._repository.close()
 
         if agent._repository is not None:
             await agent._repository.close()
