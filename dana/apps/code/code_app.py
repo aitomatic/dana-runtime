@@ -197,6 +197,11 @@ class DanaCodeApp:
             with contextlib.suppress(Exception):
                 await self._grant_db.close()
             self._grant_db = None
+        # D7.5 (AC #4): release MCP transports/leases so configured stdio servers
+        # do not leak subprocesses on REPL exit.
+        if self.agent_session is not None:
+            with contextlib.suppress(Exception):
+                await self.agent_session.dispose_mcp()
 
     async def _initialize_session(self) -> None:
         """Construct an AgentSession backed by the Session Journal.

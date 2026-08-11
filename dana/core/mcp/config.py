@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 import logging
+import os
 from typing import Any
 
 
@@ -97,6 +98,33 @@ def load_mcp_config_from_dict(raw: dict[str, Any]) -> MCPConfig:
         ValueError: If the config structure is invalid.
     """
     return _parse_mcp_config(raw)
+
+
+def load_mcp_config_from_env(env_var: str = "DANA_MCP_SERVERS") -> MCPConfig | None:
+    """Load MCP configuration from an environment variable (D7.5 AC #4).
+
+    Reads ``env_var`` as a JSON array of server specs (the ``mcp_servers``
+    payload). Each spec has the shape documented in :func:`_parse_mcp_config`
+    (``name``, ``command``, ``args``, ``env``, ``cwd``, ``transport``).
+
+    Args:
+        env_var: The environment variable name (default ``DANA_MCP_SERVERS``).
+
+    Returns:
+        An ``MCPConfig`` if the variable is set and parses, or ``None`` if it
+        is unset/empty (MCP disabled by absence of config).
+
+    Raises:
+        json.JSONDecodeError: If the value is malformed JSON.
+        ValueError: If the config structure is invalid.
+    """
+    raw = os.environ.get(env_var)
+    if not raw or not raw.strip():
+        return None
+    servers_raw = json.loads(raw)
+    if not isinstance(servers_raw, list):
+        raise ValueError(f"{env_var} must be a JSON array of server specs")
+    return _parse_mcp_config({"mcp_servers": servers_raw, "mcp_enabled": True})
 
 
 def _parse_mcp_config(raw: dict[str, Any]) -> MCPConfig:

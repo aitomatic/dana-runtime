@@ -209,6 +209,9 @@ class AgentSession:
         # D4: Model state — current provider and model for compatibility gating
         self._current_provider: str | None = None
         self._current_model: str | None = None
+        # D7.5 (AC #4): MCP single-dispatch wrapper wiring (None when MCP is
+        # disabled/unconfigured). Built once when the agent is first prepared.
+        self._mcp_wiring: Any = None
 
     @property
     def last_terminal(self) -> TurnTerminal | None:
@@ -673,6 +676,9 @@ class AgentSession:
         # TODO(d2): incremental conversation view update instead of full re-read.
         if self._agent is None:
             self._agent = self._agent_factory()
+            # D7.5 (AC #4): wire MCP single-dispatch wrapper once, when the agent
+            # is first built. Both ACP and CLI sessions share this path.
+            await self._wire_mcp_tools(self._agent)
         facts = await self._repository.read_facts(self._owner_scope, self._session_id)
         self._current_version = max((f.sequence for f in facts), default=0)
         # D4: Pass current provider for compatibility gating on protected state
@@ -682,6 +688,53 @@ class AgentSession:
             self._current_provider = view.current_provider
             self._current_model = view.current_model
         self._populate_timeline(view)
+
+    async def _wire_mcp_tools(self, agent: Any) -> None:
+        """Attach the MCP single-dispatch wrapper to the agent (D7.5 AC #4).
+
+        Gated by ``DANA_CODE_MCP_ENABLED`` (default on) and the presence of an
+        MCP server config (``DANA_MCP_SERVERS``). When enabled, builds the
+        per-server transports + adapters + the ``MCPDispatchResource`` and
+        appends it to ``agent._resources`` so the STAR loop's native-tool
+        registry discovers + dispatches ``call_mcp_tool``. No policy gating
+        (catalog-coupled; deferred to the D7.6 D2 Catalog Migration story).
+        """
+        if self._mcp_wiring is not None:
+            return  # already wired
+        try:
+            from dana.config.code_capabilities import mcp_enabled
+        except Exception:
+            return
+        if not mcp_enabled():
+            return
+        try:
+            from dana.core.mcp.config import load_mcp_config_from_env
+            from dana.core.mcp.dispatch_wrapper import build_mcp_dispatch_resource
+        except Exception:
+            return
+        config = load_mcp_config_from_env()
+        if config is None:
+            return  # no MCP config -> MCP disabled by absence
+        try:
+            wiring = await build_mcp_dispatch_resource(config)
+        except Exception as exc:  # noqa: BLE001 — required-lease failure: surface, don't crash the turn
+            logger.warning(f"MCP wiring failed: {exc}")
+            return
+        if wiring is None:
+            return
+        self._mcp_wiring = wiring
+        resources = getattr(agent, "_resources", None)
+        if isinstance(resources, list):
+            resources.append(wiring.resource)
+            logger.info("MCP dispatch resource attached", tool_count=len(wiring.resource.available_tools))
+
+    async def dispose_mcp(self) -> None:
+        """Release MCP transports + leases (session teardown). Best-effort."""
+        if self._mcp_wiring is None:
+            return
+        with contextlib.suppress(Exception):
+            await self._mcp_wiring.close()
+        self._mcp_wiring = None
 
     async def _flush_chunks(self, correlation_id: str, chunk_buffer: list[str], start_index: int) -> None:
         """Persist buffered assistant text as a single ASSISTANT_CONTENT_CHUNK fact."""
