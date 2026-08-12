@@ -3,16 +3,36 @@
 Provides todo_write() tool mirroring Claude Code's TodoWrite signature.
 """
 
+from collections.abc import Mapping
+from typing import Any
+
 from pydantic import BaseModel
 
 from dana.common.protocols.war import tool_use
 from dana.core.resource.base_resource import BaseResource
 
 
+TODO_FIELDS = ("content", "status", "activeForm")
+
+
 class TodoItem(BaseModel):
     content: str
     status: str
     activeForm: str
+
+
+def _as_mapping(todo: Any) -> dict[str, Any]:
+    """Normalize a single todo item to a plain dict.
+
+    Accepts the three shapes that reach this resource: mappings (the JSON a
+    tool call decodes to), the ``TodoItem`` model declared by ``todo_write``,
+    and dataclass-style items that expose the fields as attributes.
+    """
+    if isinstance(todo, Mapping):
+        return dict(todo)
+    if isinstance(todo, BaseModel):
+        return todo.model_dump()
+    return {field: getattr(todo, field) for field in TODO_FIELDS if hasattr(todo, field)}
 
 
 class ToDoResource(BaseResource):
@@ -187,6 +207,10 @@ class ToDoResource(BaseResource):
         Returns:
             Formatted todo list with status indicators.
         """
+        # Normalize first: validation and rendering below index every item as a
+        # mapping, which the declared TodoItem model does not support.
+        todos = [_as_mapping(todo) for todo in todos]
+
         # Validate todos
         valid_statuses = {"pending", "in_progress", "completed"}
 
