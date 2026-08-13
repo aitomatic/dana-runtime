@@ -62,11 +62,16 @@ class CLIPermissionAdapter:
         grant_store: Any,
         scope: OwnerScope,
         prompt: _PromptFn | None = None,
+        catalog_getter: Any = None,
     ) -> None:
         self._evaluator = evaluator
         self._grant_store = grant_store
         self._scope = scope
         self._prompt = prompt or _default_prompt
+        # D7.6: optional catalog getter (lambda -> ToolCatalog | None) so this
+        # host adapter classifies tools the same way as the live TOOL_CALL hook.
+        # None (default) -> no catalog -> unknown/sensitive (fail-cautious).
+        self._catalog_getter = catalog_getter
 
     async def request(self, tool_call: dict[str, Any]) -> PermissionVerdict:
         """Evaluate a tool call through the policy and return a verdict.
@@ -75,7 +80,7 @@ class CLIPermissionAdapter:
         """
         op = build_policy_operation(
             tool_call,
-            catalog=None,
+            catalog=(self._catalog_getter() if self._catalog_getter is not None else None),
             owner=self._scope.owner_id,
             workspace=self._scope.workspace,
         )

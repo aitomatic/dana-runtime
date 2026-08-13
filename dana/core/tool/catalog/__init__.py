@@ -84,10 +84,13 @@ class ToolCatalog:
     Built once per turn. Duplicate identities or aliases fail construction.
     """
 
-    def __init__(self, entries: list[ToolCatalogEntry]) -> None:
+    def __init__(self, entries: list[ToolCatalogEntry], *, version: int = 0) -> None:
         self._entries = list(entries)
         self._by_name: dict[str, ToolCatalogEntry] = {}
         self._by_identity: dict[ToolIdentity, ToolCatalogEntry] = {}
+        # ADR-004: a turn pins one immutable catalog version. Default 0; the
+        # host adapter stamps a per-turn version when building the catalog.
+        self._version = int(version)
 
         for entry in entries:
             if entry.identity in self._by_identity:
@@ -106,6 +109,11 @@ class ToolCatalog:
     @property
     def entries(self) -> list[ToolCatalogEntry]:
         return list(self._entries)
+
+    @property
+    def version(self) -> int:
+        """The pinned catalog version for this turn (ADR-004). Defaults to 0."""
+        return self._version
 
     def get(self, name: str) -> ToolCatalogEntry | None:
         """Look up an entry by its primary name or alias."""

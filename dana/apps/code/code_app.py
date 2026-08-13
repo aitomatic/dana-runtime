@@ -202,6 +202,10 @@ class DanaCodeApp:
         if self.agent_session is not None:
             with contextlib.suppress(Exception):
                 await self.agent_session.dispose_mcp()
+            # D7.6: detach the TOOL_CALL permission hook so it does not outlive
+            # the session (best-effort).
+            with contextlib.suppress(Exception):
+                self.agent_session._unregister_policy_hook()
 
     async def _initialize_session(self) -> None:
         """Construct an AgentSession backed by the Session Journal.
@@ -281,7 +285,12 @@ class DanaCodeApp:
             evaluator = PolicyEvaluator(create_default_hard_policy(), grant_store, PermissionMode.DEFAULT)
             session.set_policy_evaluator(evaluator)
             self._grant_store = grant_store
-            self._permission_adapter = CLIPermissionAdapter(evaluator, grant_store, scope)
+            self._permission_adapter = CLIPermissionAdapter(
+                evaluator,
+                grant_store,
+                scope,
+                catalog_getter=lambda: self.agent_session.tool_catalog if self.agent_session is not None else None,
+            )
 
         self.renderer = RichCLIRenderer(verbose=True, show_tool_calls=True)
         self._print_banner(llm_provider, model)

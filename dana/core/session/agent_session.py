@@ -212,6 +212,18 @@ class AgentSession:
         # D7.5 (AC #4): MCP single-dispatch wrapper wiring (None when MCP is
         # disabled/unconfigured). Built once when the agent is first prepared.
         self._mcp_wiring: Any = None
+        # D7.6 (AC #1/AC #2-live): native-tool ToolCatalog for policy
+        # classification. Built per turn from the agent's native tools; fed to
+        # build_policy_operation + the TOOL_CALL permission hook. None = no
+        # policy classification (text-only / not-yet-prepared).
+        self._tool_catalog: Any = None
+        # D7.6: EventBus TOOL_CALL permission-hook unsubscribe handle (None when
+        # the hook is not registered). Built once when the agent is first
+        # prepared + a policy_evaluator is wired + preflight enabled.
+        self._policy_unsub: Any = None
+        # D7.6: per-turn catalog version counter (AC #1 — stable identity +
+        # per-turn versioned; ADR-004). Bumped each turn when the catalog is built.
+        self._catalog_version: int = 0
 
     @property
     def last_terminal(self) -> TurnTerminal | None:
@@ -688,6 +700,11 @@ class AgentSession:
             self._current_provider = view.current_provider
             self._current_model = view.current_model
         self._populate_timeline(view)
+        # D7.6 (AC #1/AC #2-live): build the native-tool catalog for policy
+        # classification (per-turn pinned version) + register the TOOL_CALL
+        # permission hook. Idempotent: the hook is registered once.
+        await self._build_tool_catalog()
+        self._register_policy_hook()
 
     async def _wire_mcp_tools(self, agent: Any) -> None:
         """Attach the MCP single-dispatch wrapper to the agent (D7.5 AC #4).
@@ -735,6 +752,125 @@ class AgentSession:
         with contextlib.suppress(Exception):
             await self._mcp_wiring.close()
         self._mcp_wiring = None
+
+    # ------------------------------------------------------------------
+    # D7.6: native-tool catalog (policy classification) + TOOL_CALL hook
+    # ------------------------------------------------------------------
+
+    @property
+    def tool_catalog(self) -> Any:
+        """The per-turn native-tool ToolCatalog for policy classification (D7.6).
+
+        ``None`` until the agent is prepared or when preflight is disabled.
+        Host permission adapters (CLI, ACP) feed this to
+        :func:`build_policy_operation` so effect classification is consistent.
+        """
+        return self._tool_catalog
+
+    async def _build_tool_catalog(self) -> None:
+        """Build the native-tool catalog from the agent's native-tool schemas.
+
+        Pins a per-turn version (AC #1). No-op if the agent has no runtime /
+        native-tools (text-only). Gated by ``DANA_CODE_TOOL_CATALOG_ENABLED``
+        (default on). Does NOT reroute execution through the D2 engine
+        (Decision 2): the catalog feeds the policy classifier only.
+        """
+        try:
+            from dana.config.code_capabilities import tool_catalog_enabled
+        except Exception:
+            tool_catalog_enabled = lambda: True  # noqa: E731
+        if not tool_catalog_enabled():
+            self._tool_catalog = None
+            return
+        runtime = getattr(self._agent, "_runtime", None) if self._agent is not None else None
+        native_tools = getattr(runtime, "_native_tools", None) if runtime is not None else None
+        if not native_tools:
+            self._tool_catalog = None
+            return
+        from dana.core.tool.native_catalog import build_native_tool_catalog
+
+        self._catalog_version += 1
+        self._tool_catalog = build_native_tool_catalog(
+            list(native_tools),
+            version=self._catalog_version,
+        )
+
+    def _register_policy_hook(self) -> None:
+        """Subscribe the TOOL_CALL permission hook on the agent's EventBus.
+
+        Gated by ``DANA_CODE_PERMISSION_PREFLIGHT_ENABLED`` (default on) AND a
+        wired ``policy_evaluator``. Idempotent: skips if already registered or
+        if the gate is closed. The hook blocks ONLY on ``PolicyDecision.DENY``;
+        ``ALLOW``/``NEEDS_PROMPT`` proceed (interactive prompting is a
+        host-layer follow-up per the D7.5 adjusted ruling).
+        """
+        if self._policy_unsub is not None:
+            return  # already registered
+        if self._policy_evaluator is None:
+            return  # no policy -> no gate (today's authorized=True behaviour)
+        try:
+            from dana.config.code_capabilities import permission_preflight_enabled
+        except Exception:
+            permission_preflight_enabled = lambda: True  # noqa: E731
+        if not permission_preflight_enabled():
+            return
+        bus = getattr(self._agent, "event_bus", None)
+        if bus is None or not hasattr(bus, "subscribe"):
+            return
+        from dana.core.ext.events import TOOL_CALL
+
+        self._policy_unsub = bus.subscribe(TOOL_CALL, self._on_tool_call)
+        logger.info(
+            "permission preflight hook registered",
+            session_id=self._session_id,
+            catalog_version=self._catalog_version,
+        )
+
+    def _unregister_policy_hook(self) -> None:
+        """Detach the TOOL_CALL permission hook (session teardown). Best-effort."""
+        if self._policy_unsub is None:
+            return
+        with contextlib.suppress(Exception):
+            self._policy_unsub()
+        self._policy_unsub = None
+
+    async def _on_tool_call(self, event: Any) -> dict[str, Any] | None:
+        """EventBus ``TOOL_CALL`` handler — hard-deny enforcement (D7.6 AC #2-live).
+
+        Reconstructs a policy ``Operation`` from the bus ``Operation`` + the
+        per-turn catalog and evaluates it through the wired ``PolicyEvaluator``.
+        Returns ``{"block": True, "reason": ...}`` ONLY on ``PolicyDecision.DENY``;
+        ``ALLOW``/``NEEDS_PROMPT`` return ``None`` (pass-through -> the tool
+        executes). The tool_executor respects ``block`` by skipping dispatch and
+        surfacing a ``policy_block`` tool_result.
+        """
+        if self._policy_evaluator is None:
+            return None
+        # No catalog (disabled / text-only) -> cannot classify -> pass-through
+        # (proceed). Without this guard, preflight-on + catalog-off would DENY
+        # every tool (unknown/sensitive) and regress the P0 turn path.
+        if self._tool_catalog is None:
+            return None
+        ext_op = event.payload.get("operation") if isinstance(getattr(event, "payload", None), dict) else None
+        if ext_op is None:
+            return None
+        from dana.core.policy.evaluator import PolicyDecision
+        from dana.core.policy.operations import build_policy_operation
+
+        tool_call = {
+            "function": getattr(ext_op.tool_identity, "name", ""),
+            "arguments": dict(ext_op.arguments),
+        }
+        op = build_policy_operation(
+            tool_call,
+            catalog=self._tool_catalog,
+            owner=self._owner_scope.owner_id,
+            workspace=self._owner_scope.workspace,
+        )
+        result = await self._policy_evaluator.evaluate(op, self._owner_scope)
+        if result.decision is PolicyDecision.DENY:
+            return {"block": True, "reason": f"denied: {result.reason}"}
+        return None  # ALLOW / NEEDS_PROMPT -> proceed
 
     async def _flush_chunks(self, correlation_id: str, chunk_buffer: list[str], start_index: int) -> None:
         """Persist buffered assistant text as a single ASSISTANT_CONTENT_CHUNK fact."""

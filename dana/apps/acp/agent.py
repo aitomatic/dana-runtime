@@ -367,7 +367,7 @@ class DanaACPAgent:
 
         op = build_policy_operation(
             {"function": fn, "arguments": args},
-            catalog=None,
+            catalog=session.tool_catalog,
             owner=session.owner_scope.owner_id,
             workspace=session.owner_scope.workspace,
         )
