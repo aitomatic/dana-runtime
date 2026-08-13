@@ -75,7 +75,7 @@ def create_default_hard_policy() -> HardPolicy:
 
     # Block destructive operations on protected paths
     _PROTECTED_PATHS = frozenset({".env", "node_modules"})
-    _DESTRUCTIVE_KINDS = {EffectKind.DELETE, EffectKind.MODIFY}
+    _DESTRUCTIVE_KINDS = {EffectKind.DELETE, EffectKind.MODIFY, EffectKind.CREATE}
 
     def _has_destructive_effect(op: Operation) -> bool:
         return any(e.kind in _DESTRUCTIVE_KINDS for e in op.effects.effects)
@@ -90,7 +90,7 @@ def create_default_hard_policy() -> HardPolicy:
     # Block rm -rf in bash commands (defense-in-depth)
     policy.deny(
         lambda op: "hard deny: rm -rf blocked"
-        if op.tool_identity.name == "bash_tool" and "rm -rf" in str(op.arguments.get("command", ""))
+        if op.tool_identity.name == "bash__execute" and "rm -rf" in str(op.arguments.get("command", ""))
         else None
     )
 

@@ -356,11 +356,11 @@ class TestDefaultHardPolicy:
         assert policy.is_blocked(op) is True
 
     def test_default_policy_blocks_rm_rf(self):
-        """Default policy blocks rm -rf in bash_tool."""
+        """Default policy blocks rm -rf in bash__execute."""
         policy = create_default_hard_policy()
 
         op = Operation(
-            tool_identity=ToolIdentity(name="bash_tool"),
+            tool_identity=ToolIdentity(name="bash__execute"),
             arguments={"command": "rm -rf /tmp"},
             effects=EffectMetadata(
                 effects=(Effect(kind=EffectKind.EXECUTE, target="shell"),),
@@ -373,10 +373,47 @@ class TestDefaultHardPolicy:
         policy = create_default_hard_policy()
 
         op = Operation(
-            tool_identity=ToolIdentity(name="bash_tool"),
+            tool_identity=ToolIdentity(name="bash__execute"),
             arguments={"command": "ls -la"},
             effects=EffectMetadata(
                 effects=(Effect(kind=EffectKind.EXECUTE, target="shell"),),
+            ),
+        )
+        assert policy.is_blocked(op) is False
+
+    def test_default_policy_blocks_destructive_on_protected_path(self):
+        """Default policy blocks DELETE/MODIFY/CREATE on protected paths (.env, node_modules)."""
+        policy = create_default_hard_policy()
+
+        for kind in (EffectKind.DELETE, EffectKind.MODIFY, EffectKind.CREATE):
+            op = Operation(
+                tool_identity=ToolIdentity(name="Write"),
+                arguments={"path": "./.env"},
+                effects=EffectMetadata(
+                    effects=(Effect(kind=kind, target=".env"),),
+                    is_sensitive=False,
+                ),
+            )
+            assert policy.is_blocked(op) is True, f"{kind} on .env should be hard-denied"
+
+        # node_modules protected too
+        op = Operation(
+            tool_identity=ToolIdentity(name="Edit"),
+            arguments={"path": "app/node_modules/pkg"},
+            effects=EffectMetadata(
+                effects=(Effect(kind=EffectKind.MODIFY, target="node_modules"),),
+                is_sensitive=False,
+            ),
+        )
+        assert policy.is_blocked(op) is True
+
+        # Same effect on a non-protected path is allowed (flows to mode/grant/prompt)
+        op = Operation(
+            tool_identity=ToolIdentity(name="Write"),
+            arguments={"path": "/tmp/scratch.txt"},
+            effects=EffectMetadata(
+                effects=(Effect(kind=EffectKind.CREATE, target="/tmp/scratch.txt"),),
+                is_sensitive=False,
             ),
         )
         assert policy.is_blocked(op) is False
