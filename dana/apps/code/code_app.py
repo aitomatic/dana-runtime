@@ -295,6 +295,26 @@ class DanaCodeApp:
         self.renderer = RichCLIRenderer(verbose=True, show_tool_calls=True)
         self._print_banner(llm_provider, model)
 
+        # D7.6 follow-up: wire the interactive NEEDS_PROMPT prompt into the
+        # live TOOL_CALL hook (CLI-only). On NEEDS_PROMPT the hook calls this
+        # callback, which pauses the renderer's Live display, prompts the user
+        # via the CLIPermissionAdapter (sync input() off-thread), then resumes.
+        # allow -> the tool proceeds; deny -> blocked + journaled. ACP has no
+        # callback (request_permission is its resolution surface).
+        if self._permission_adapter is not None and self.agent_session is not None:
+            adapter = self._permission_adapter
+
+            async def _permission_prompt(op: Any) -> Any:
+                if self.renderer is not None:
+                    self.renderer.pause_live()
+                try:
+                    return await adapter.prompt_and_persist(op)
+                finally:
+                    if self.renderer is not None:
+                        self.renderer.resume_live()
+
+            self.agent_session.set_permission_prompt_callback(_permission_prompt)
+
     async def _aread_input(self) -> str:
         """Read one line of input asynchronously.
 

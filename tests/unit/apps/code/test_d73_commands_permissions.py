@@ -159,6 +159,50 @@ async def test_permission_default_prompt_eof_denies(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# CLIPermissionAdapter.prompt_and_persist (D7.6 follow-up — the live hook entry)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_prompt_and_persist_allow_once():
+    # The live TOOL_CALL hook calls prompt_and_persist(op) on NEEDS_PROMPT.
+    from dana.core.policy.operations import build_policy_operation
+    from dana.core.tool.native_catalog import build_native_tool_catalog
+    from tests.unit.core.test_d76_native_catalog_policy import KNOWN_TOOLS, _native_schema
+
+    catalog = build_native_tool_catalog([_native_schema(n) for n in KNOWN_TOOLS])
+    op = build_policy_operation(
+        {"function": "Edit", "arguments": {"path": "/tmp/a.txt"}},
+        catalog=catalog,
+        owner=SCOPE.owner_id,
+        workspace=SCOPE.workspace,
+    )
+    adapter, store = _adapter(PolicyDecision.NEEDS_PROMPT, prompt_reply="1")
+    verdict = await adapter.prompt_and_persist(op)
+    assert verdict.allowed is True
+    assert verdict.persisted is False
+    assert store.created == []  # allow once -> no durable grant
+
+
+@pytest.mark.asyncio
+async def test_prompt_and_persist_allow_always_persists():
+    from dana.core.policy.operations import build_policy_operation
+    from dana.core.tool.native_catalog import build_native_tool_catalog
+    from tests.unit.core.test_d76_native_catalog_policy import KNOWN_TOOLS, _native_schema
+
+    catalog = build_native_tool_catalog([_native_schema(n) for n in KNOWN_TOOLS])
+    op = build_policy_operation(
+        {"function": "Edit", "arguments": {"path": "/tmp/a.txt"}},
+        catalog=catalog,
+        owner=SCOPE.owner_id,
+        workspace=SCOPE.workspace,
+    )
+    adapter, store = _adapter(PolicyDecision.NEEDS_PROMPT, prompt_reply="2")
+    verdict = await adapter.prompt_and_persist(op)
+    assert verdict.allowed is True
+    assert verdict.persisted is True
+    assert len(store.created) == 1  # durable grant created for the MODIFY effect
+
+
+# ---------------------------------------------------------------------------
 # Slash-command handlers (AC #3, #6)
 # ---------------------------------------------------------------------------
 

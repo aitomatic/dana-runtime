@@ -178,6 +178,17 @@ class RichCLIRenderer(Notifiable):
             self._live.stop()
             self._live = None
 
+    def pause_live(self) -> None:
+        """Pause the live streaming display for a host interaction (e.g. a
+        permission prompt). Stops the transient Live so the prompt renders
+        cleanly; the stream buffer is preserved for ``resume_live()``.
+        """
+        self._stop_live()
+
+    def resume_live(self) -> None:
+        """Resume the live streaming display after a ``pause_live()`` interaction."""
+        self._ensure_live()
+
     def _is_in_subagent(self) -> bool:
         """Check if we're currently inside a subagent context."""
         return self.state.active_subagent is not None

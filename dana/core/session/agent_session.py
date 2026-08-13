@@ -206,6 +206,10 @@ class AgentSession:
         self._permission_mode: PermissionMode = PermissionMode.DEFAULT
         # D3: Policy evaluator (optional — wired by ACP agent for permission adapter)
         self._policy_evaluator: Any = None
+        # D7.6 follow-up: host-provided interactive prompt callback for
+        # NEEDS_PROMPT (CLI-only; None on ACP -> proceed, request_permission is
+        # the ACP resolution surface). Async callable (operation) -> PermissionVerdict.
+        self._permission_prompt_callback: Any = None
         # D4: Model state — current provider and model for compatibility gating
         self._current_provider: str | None = None
         self._current_model: str | None = None
@@ -262,6 +266,18 @@ class AgentSession:
         """
         self._policy_evaluator = evaluator
         evaluator.set_mode(self._permission_mode)
+
+    def set_permission_prompt_callback(self, callback: Any) -> None:
+        """Wire a host-provided interactive prompt for NEEDS_PROMPT (CLI-only).
+
+        The callback is an async callable ``(operation) -> PermissionVerdict``
+        invoked by the ``TOOL_CALL`` hook when the policy reaches
+        ``NEEDS_PROMPT``. ``allowed=True`` -> the tool proceeds; ``allowed=False``
+        -> the tool is blocked (journal denied, not executed). When ``None``
+        (the default; e.g. ACP), NEEDS_PROMPT proceeds (the host's own
+        ``request_permission`` is the resolution surface).
+        """
+        self._permission_prompt_callback = callback
 
     @property
     def policy_evaluator(self) -> Any:
@@ -870,7 +886,11 @@ class AgentSession:
         result = await self._policy_evaluator.evaluate(op, self._owner_scope)
         if result.decision is PolicyDecision.DENY:
             return {"block": True, "reason": f"denied: {result.reason}"}
-        return None  # ALLOW / NEEDS_PROMPT -> proceed
+        if result.decision is PolicyDecision.NEEDS_PROMPT and self._permission_prompt_callback is not None:
+            verdict = await self._permission_prompt_callback(op)
+            if not verdict.allowed:
+                return {"block": True, "reason": f"denied: {verdict.reason}"}
+        return None  # ALLOW / NEEDS_PROMPT (no callback) -> proceed
 
     async def _flush_chunks(self, correlation_id: str, chunk_buffer: list[str], start_index: int) -> None:
         """Persist buffered assistant text as a single ASSISTANT_CONTENT_CHUNK fact."""

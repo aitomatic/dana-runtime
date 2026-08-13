@@ -13,6 +13,7 @@ The adapter owns only the *decision surface*; grant precedence and
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -94,11 +95,22 @@ class CLIPermissionAdapter:
         # NEEDS_PROMPT — ask the terminal user.
         return await self._prompt_and_maybe_persist(op)
 
+    async def prompt_and_persist(self, op: Any) -> PermissionVerdict:
+        """Prompt the terminal user for a NEEDS_PROMPT operation (host hook).
+
+        Entry point for the live TOOL_CALL permission hook on AgentSession: the
+        hook has already evaluated the policy and reached NEEDS_PROMPT; this
+        method prompts the user (allow once/always/deny once/always) and
+        persists a durable grant on an 'always' choice. The sync input() prompt
+        runs off-thread (asyncio.to_thread) so the event loop is not blocked.
+        """
+        return await self._prompt_and_maybe_persist(op)
+
     async def _prompt_and_maybe_persist(self, op: Any) -> PermissionVerdict:
         name = op.tool_identity.name
         locs = ", ".join(op.affected_locations) if op.affected_locations else "(any)"
         prompt = f"\n🔐 Tool '{name}' wants to run (affects: {locs}).\n  [1] allow once  [2] allow always  [3] deny once  [4] deny always: "
-        choice = self._prompt(prompt)
+        choice = await asyncio.to_thread(self._prompt, prompt)
 
         if choice == "1":
             return PermissionVerdict(allowed=True, reason="allowed once (user)")

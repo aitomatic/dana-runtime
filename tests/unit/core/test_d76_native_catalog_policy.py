@@ -234,6 +234,43 @@ class TestToolCallPolicyHook:
         assert out is None  # NEEDS_PROMPT -> proceed (interactive prompt is a host follow-up)
 
     @pytest.mark.asyncio
+    async def test_needs_prompt_callback_allow_proceeds(self):
+        # D7.6 follow-up: a host prompt callback that allows -> proceed.
+        from types import SimpleNamespace
+
+        from dana.core.policy.evaluator import PolicyDecision
+
+        catalog = build_native_tool_catalog([_native_schema(n) for n in KNOWN_TOOLS])
+        session = _make_session_with_catalog(catalog, evaluator=_PolicyEvalMock(PolicyDecision.NEEDS_PROMPT))
+        called = []
+
+        async def _allow(op):
+            called.append(op.tool_identity.name)
+            return SimpleNamespace(allowed=True, reason="allowed once (user)")
+
+        session.set_permission_prompt_callback(_allow)
+        out = await session._on_tool_call(_tool_call_event("Edit"))
+        assert out is None  # allowed -> proceed
+        assert called == ["Edit"]  # callback invoked with the operation
+
+    @pytest.mark.asyncio
+    async def test_needs_prompt_callback_deny_blocks(self):
+        # D7.6 follow-up: a host prompt callback that denies -> block.
+        from types import SimpleNamespace
+
+        from dana.core.policy.evaluator import PolicyDecision
+
+        catalog = build_native_tool_catalog([_native_schema(n) for n in KNOWN_TOOLS])
+        session = _make_session_with_catalog(catalog, evaluator=_PolicyEvalMock(PolicyDecision.NEEDS_PROMPT))
+
+        async def _deny(op):
+            return SimpleNamespace(allowed=False, reason="denied once (user)")
+
+        session.set_permission_prompt_callback(_deny)
+        out = await session._on_tool_call(_tool_call_event("Edit"))
+        assert out == {"block": True, "reason": "denied: denied once (user)"}
+
+    @pytest.mark.asyncio
     async def test_no_catalog_pass_through(self):
         # preflight-on + catalog-off (None) must NOT deny everything (P0 guard).
         from dana.core.policy.evaluator import PolicyDecision
