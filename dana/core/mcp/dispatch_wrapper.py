@@ -30,6 +30,45 @@ from dana.core.mcp.leases import MCPLeaseManager
 logger = logging.getLogger(__name__)
 
 
+def _format_mcp_result(result: dict[str, Any]) -> str:
+    """Render an MCPExecutionAdapter result dict as a string for the model."""
+    if not result.get("success", True):
+        err = result.get("result", "unknown error")
+        return f"MCP tool error: {err}"
+    content = result.get("result")
+    if isinstance(content, str):
+        return content
+    # MCP content is often a list of content blocks; flatten to text.
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(str(block.get("text", block)))
+            else:
+                parts.append(str(block))
+        return "\n".join(parts) if parts else ""
+    return str(content) if content is not None else ""
+
+
+def _make_mcp_dispatcher(adapter: MCPExecutionAdapter, tool_name: str) -> Any:
+    """Build an async dispatch callable for one MCP tool (per-tool UX, A2).
+
+    Returns ``async (arguments: dict) -> str`` (the formatted result), so the
+    ToolExecutor's MCP dispatch path can ``await`` it and wrap the string as a
+    tool-success result. Errors are surfaced to the model, never raised.
+    """
+
+    async def dispatch(arguments: dict[str, Any]) -> str:
+        try:
+            result = await adapter.call_tool(tool_name, arguments or {})
+        except Exception as exc:  # noqa: BLE001 — surface to the model, never crash the turn
+            logger.warning("MCP dispatch failed for '%s': %s", tool_name, exc)
+            return f"Error calling MCP tool '{tool_name}': {exc}"
+        return _format_mcp_result(result)
+
+    return dispatch
+
+
 class MCPDispatchResource:
     """A native-tool resource that dispatches to MCP tools by name (D7.5 AC #4).
 
@@ -85,22 +124,7 @@ class MCPDispatchResource:
 
     def _format_result(self, result: dict[str, Any]) -> str:
         """Render an MCPExecutionAdapter result dict as a string for the model."""
-        if not result.get("success", True):
-            err = result.get("result", "unknown error")
-            return f"MCP tool error: {err}"
-        content = result.get("result")
-        if isinstance(content, str):
-            return content
-        # MCP content is often a list of content blocks; flatten to text
-        if isinstance(content, list):
-            parts: list[str] = []
-            for block in content:
-                if isinstance(block, dict):
-                    parts.append(str(block.get("text", block)))
-                else:
-                    parts.append(str(block))
-            return "\n".join(parts) if parts else ""
-        return str(content) if content is not None else ""
+        return _format_mcp_result(result)
 
     def _refresh_docstring(self) -> None:
         """Inject the available-tools list into ``call``'s docstring (schema description).
@@ -120,7 +144,14 @@ class MCPDispatchResource:
 
 
 class MCPWiring:
-    """Holds the built MCP dispatch resource + open transports for cleanup."""
+    """Holds the built MCP dispatch resource + open transports for cleanup.
+
+    D7 follow-up 1+2 (per-tool UX): also exposes the per-MCP tool schemas
+    (correct inputSchema-derived OpenAI schemas, namespaced ``server:tool``),
+    the set of MCP tool names (for policy classification), and a dispatch map
+    (tool_name -> async callable returning the formatted result string) so the
+    model can call each MCP tool BY NAME and the ToolExecutor dispatches it.
+    """
 
     def __init__(
         self,
@@ -128,11 +159,19 @@ class MCPWiring:
         lease_manager: MCPLeaseManager,
         transports: list[Any],
         contexts: list[Any],
+        *,
+        mcp_schemas: list[dict[str, Any]] | None = None,
+        mcp_names: frozenset[str] | None = None,
+        dispatch_map: dict[str, Any] | None = None,
     ) -> None:
         self.resource = resource
         self.lease_manager = lease_manager
         self._transports = transports
         self._contexts = contexts  # asynccontextmanager instances awaiting __aexit__
+        # D7 follow-up 1+2: per-tool MCP UX + per-MCP policy.
+        self.mcp_schemas: list[dict[str, Any]] = list(mcp_schemas or [])
+        self.mcp_names: frozenset[str] = mcp_names or frozenset()
+        self.dispatch_map: dict[str, Any] = dict(dispatch_map or {})
 
     async def close(self) -> None:
         """Release leases + close transports (session teardown)."""
@@ -205,6 +244,10 @@ async def build_mcp_dispatch_resource(
     descriptions: dict[str, str] = {}
     transports: list[Any] = []
     contexts: list[Any] = []
+    # D7 follow-up 1+2: per-tool MCP UX (real inputSchema schemas) + dispatch map.
+    mcp_schemas: list[dict[str, Any]] = []
+    mcp_names: set[str] = set()
+    dispatch_map: dict[str, Any] = {}
 
     for server in config.servers:
         lease = lease_manager.create_lease(server.name, required=True)
@@ -219,6 +262,8 @@ async def build_mcp_dispatch_resource(
             await perform_handshake(transport.session, client_name="dana", client_version="0.2.0")
             tools = await discover_tools(transport.session)
             adapter = MCPExecutionAdapter(transport, cancellation_tracker)
+            from dana.core.mcp.schema_conversion import mcp_tool_to_catalog_entry
+
             for tool in tools:
                 namespaced = f"{server.name}:{tool.name}"
                 adapters[namespaced] = adapter
@@ -226,6 +271,11 @@ async def build_mcp_dispatch_resource(
                 if tool.name not in adapters:
                     adapters[tool.name] = adapter
                 descriptions[namespaced] = tool.description or tool.name
+                # D7 follow-up 1+2: per-tool schema (correct inputSchema) + dispatch.
+                entry = mcp_tool_to_catalog_entry(tool, server.name)
+                mcp_schemas.append(entry.schema)
+                mcp_names.add(namespaced)
+                dispatch_map[namespaced] = _make_mcp_dispatcher(adapter, namespaced)
             lease.activate([])
             logger.info("MCP server '%s' connected (%d tools)", server.name, len(tools))
         except Exception as exc:  # noqa: BLE001
@@ -248,4 +298,12 @@ async def build_mcp_dispatch_resource(
 
     resource = MCPDispatchResource(adapters, descriptions)
     resource._refresh_docstring()
-    return MCPWiring(resource, lease_manager, transports, contexts)
+    return MCPWiring(
+        resource,
+        lease_manager,
+        transports,
+        contexts,
+        mcp_schemas=mcp_schemas,
+        mcp_names=frozenset(mcp_names),
+        dispatch_map=dispatch_map,
+    )

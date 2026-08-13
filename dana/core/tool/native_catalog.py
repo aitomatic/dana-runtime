@@ -67,10 +67,21 @@ _NATIVE_TOOL_EFFECTS: dict[str, tuple[tuple[EffectKind, ...], bool]] = {
 }
 
 
-def _effect_metadata_for(name: str) -> EffectMetadata:
-    """Resolve effect metadata for a native tool name (fail-cautious on miss)."""
+def _effect_metadata_for(name: str, mcp_names: frozenset[str] | None = None) -> EffectMetadata:
+    """Resolve effect metadata for a native tool name (fail-cautious on miss).
+
+    Namespaced MCP tool names (``server:tool``) registered in ``mcp_names`` are
+    classified EXECUTE / non-sensitive (D7 follow-up 2: per-MCP policy) so they
+    flow to mode/grant/prompt instead of being hard-denied as unknown.
+    """
     spec = _NATIVE_TOOL_EFFECTS.get(name)
     if spec is None:
+        # D7 follow-up 2: a registered MCP tool -> EXECUTE, non-sensitive.
+        if mcp_names and name in mcp_names:
+            return EffectMetadata(
+                effects=(Effect(kind=EffectKind.EXECUTE, target="mcp"),),
+                is_sensitive=False,
+            )
         # Unknown/unlisted tool -> fail-cautious (is_sensitive=True -> hard-deny).
         return EffectMetadata.unknown()
     kinds, is_sensitive = spec
@@ -87,6 +98,7 @@ def build_native_tool_catalog(
     native_tools: list[Mapping[str, Any]],
     *,
     version: int = 0,
+    mcp_names: frozenset[str] | None = None,
 ) -> ToolCatalog:
     """Build a policy-classification catalog from the agent's native-tool schemas.
 
@@ -102,6 +114,9 @@ def build_native_tool_catalog(
         native_tools: The agent's native-tool schema list (``runtime._native_tools``).
         version: A per-turn pinned catalog version (AC #1 — stable identity +
             per-turn versioned; ADR-004).
+        mcp_names: Namespaced MCP tool names (``server:tool``) to classify as
+            EXECUTE / non-sensitive (D7 follow-up 2: per-MCP policy). Other
+            unknown names stay fail-cautious.
 
     Returns:
         A :class:`ToolCatalog` with one entry per native tool, classified for
@@ -123,7 +138,7 @@ def build_native_tool_catalog(
                 identity=ToolIdentity(name=name, source="native"),
                 schema=schema,
                 adapter=lambda _args, _n=name: _n,  # no-op; execution not routed here
-                effects=_effect_metadata_for(name),
+                effects=_effect_metadata_for(name, mcp_names),
             )
         )
     return ToolCatalog(entries, version=version)

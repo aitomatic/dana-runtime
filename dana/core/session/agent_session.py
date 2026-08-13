@@ -799,16 +799,46 @@ class AgentSession:
             self._tool_catalog = None
             return
         runtime = getattr(self._agent, "_runtime", None) if self._agent is not None else None
-        native_tools = getattr(runtime, "_native_tools", None) if runtime is not None else None
+        if runtime is None:
+            self._tool_catalog = None
+            return
+        # Ensure _native_tools is built (cached/idempotent) so MCP schemas can be
+        # appended (D7 follow-up 1+2: per-tool MCP UX surfaces via _native_tools).
+        if hasattr(runtime, "_build_native_tools_if_supported"):
+            runtime._build_native_tools_if_supported(self._agent)
+        native_tools = getattr(runtime, "_native_tools", None)
         if not native_tools:
             self._tool_catalog = None
             return
+
+        # D7 follow-up 1+2: per-tool MCP UX + per-MCP policy. Append the per-MCP
+        # schemas (correct inputSchema, namespaced server:tool) to _native_tools
+        # so the LLM sees each MCP tool by name; wire the MCP dispatch map on the
+        # agent's ToolExecutor (additive, checked before the registry); collect
+        # mcp_names so the policy classifier treats them as EXECUTE/non-sensitive.
+        # Idempotent: MCP schemas are appended once (the cached _native_tools is
+        # not rebuilt, so they persist across turns).
+        mcp_names: frozenset[str] = frozenset()
+        wiring = self._mcp_wiring
+        if wiring is not None and getattr(wiring, "mcp_schemas", None):
+            existing = {(t.get("function", t).get("name") if isinstance(t, dict) else None) for t in native_tools}
+            for schema in wiring.mcp_schemas:
+                name = schema.get("function", {}).get("name") if isinstance(schema, dict) else None
+                if name and name not in existing:
+                    native_tools.append(schema)
+                    existing.add(name)
+            mcp_names = wiring.mcp_names
+            tool_executor = getattr(runtime, "_tool_executor", None)
+            if tool_executor is not None and hasattr(tool_executor, "set_mcp_dispatch_getter"):
+                tool_executor.set_mcp_dispatch_getter(lambda w=wiring: w.dispatch_map)
+
         from dana.core.tool.native_catalog import build_native_tool_catalog
 
         self._catalog_version += 1
         self._tool_catalog = build_native_tool_catalog(
             list(native_tools),
             version=self._catalog_version,
+            mcp_names=mcp_names,
         )
 
     def _register_policy_hook(self) -> None:

@@ -59,11 +59,22 @@ class ToolExecutor:
         tool_name_registry_getter: Callable[[], dict[str, tuple[Any, str]]] | None = None,
         max_workers: int | None = None,
         tool_catalog: ToolCatalog | None = None,
+        mcp_dispatch_getter: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self._agent_getter = agent_getter
         self._tool_name_registry_getter = tool_name_registry_getter
         self._max_workers = max_workers
         self._tool_catalog = tool_catalog
+        # D7 follow-up 1+2: per-tool MCP dispatch map (tool_name -> async callable).
+        self._mcp_dispatch_getter = mcp_dispatch_getter
+
+    def set_mcp_dispatch_getter(self, getter: Callable[[], dict[str, Any]] | None) -> None:
+        """Wire the MCP dispatch map getter (per-tool MCP UX, A2).
+
+        The getter returns ``{tool_name: async callable(arguments) -> str}``;
+        ``None`` disables MCP per-tool dispatch (fall through to the registry).
+        """
+        self._mcp_dispatch_getter = getter
 
     # ------------------------------------------------------------------
     # Public API — ToolExecutorProtocol
@@ -294,10 +305,20 @@ class ToolExecutor:
         emit is shared). Raises propagate to the caller's never-raise guard.
 
         Dispatch order:
+        0. MCP per-tool dispatch map (D7 follow-up 1+2, A2) — namespaced MCP tools.
         1. ToolCatalog (if wired) — primary path per ADR-004.
         2. @named_tool registry — legacy fast path.
         3. Standard name parsing fallback.
         """
+        # --- MCP per-tool dispatch (D7 follow-up 1+2, A2) ---
+        # Namespaced MCP tool names (server:tool) do not collide with native
+        # @named_tool names, so checking here is additive + safe.
+        if self._mcp_dispatch_getter is not None:
+            mcp_map = self._mcp_dispatch_getter()
+            if mcp_map and function_name in mcp_map:
+                formatted = await mcp_map[function_name](arguments)
+                return create_tool_success("mcp", function_name, formatted)
+
         # --- ToolCatalog fast path (ADR-004) ---
         if self._tool_catalog is not None:
             entry = self._tool_catalog.get(function_name)
