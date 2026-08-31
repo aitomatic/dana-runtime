@@ -7,7 +7,8 @@ AC: Cancellation leaks no owned process.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+import signal
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -120,11 +121,11 @@ class TestMCPCleanupHandler:
         handler.assert_no_leaks()  # Should not raise
 
     def test_reap_child_pids(self, handler):
-        """AC: Reap child PIDs sends SIGTERM."""
+        """AC: Reap child PIDs sends SIGTERM, then SIGKILL after the grace period."""
         with patch("os.kill") as mock_kill:
             handler.register_child_pid("filesystem", 12345)
             handler._reap_child_pids("filesystem")
-            mock_kill.assert_called_once_with(12345, 15)  # SIGTERM = 15
+            assert mock_kill.call_args_list == [call(12345, signal.SIGTERM), call(12345, signal.SIGKILL)]
 
     def test_reap_child_pids_already_exited(self, handler):
         """AC: Reap child PIDs handles already-exited processes."""
