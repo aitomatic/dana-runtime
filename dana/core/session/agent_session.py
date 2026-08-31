@@ -773,6 +773,15 @@ class AgentSession:
         # TODO(d2): incremental conversation view update instead of full re-read.
         if self._agent is None:
             self._agent = self._agent_factory()
+            # D8 identity reconciliation: STARAgent assigns its own uuid
+            # ``_session_id`` at construction, so timeline persistence
+            # (``timeline.save``) would key off an id that diverges from the
+            # journal session id. Pure relabel (journal stays the authority;
+            # _populate_timeline rebuilds the entries below), so a later
+            # ``timeline.save`` lands under the journal session id.
+            set_sid = getattr(self._agent, "set_session_id", None)
+            if callable(set_sid):
+                set_sid(self._session_id)
             # D7.5 (AC #4): wire MCP single-dispatch wrapper once, when the agent
             # is first built. Both ACP and CLI sessions share this path.
             await self._wire_mcp_tools(self._agent)
