@@ -14,7 +14,10 @@ build-backend = "setuptools.build_meta"
 # =============================================================================
 
 [project]
-name = "dana"
+# PyPI distribution name. The import package stays `dana`, but the distribution
+# is `dana-agent`: the `dana` name on PyPI is taken by an unrelated project
+# (the Dana DSL). See dana/apps/cli_flags.py for the matching version lookup.
+name = "dana-agent"
 version = "0.2.0"
 description = "Dana Agent - Domain-Aware Neurosymbolic Agents"
 readme = "README.md"
@@ -33,7 +36,7 @@ maintainers = [
 ]
 
 # Core runtime dependencies - minimal set for LLM agent functionality
-# Install with: pip install dana
+# Install with: pip install dana-agent
 dependencies = [
     # Core LLM Integration
     "openai>=1.55.3",
@@ -76,46 +79,46 @@ dana-acp = "dana.apps.acp.__main__:main"
 # Optional dependency groups
 [project.optional-dependencies]
 
-# Web scraping with full HTML/XML parsing - Install with: pip install dana[web]
+# Web scraping with full HTML/XML parsing - Install with: pip install dana-agent[web]
 web = [
     "lxml>=5.0.0",
     "readability-lxml>=0.8.1",
 ]
 
-# Local LLM providers (Ollama, LlamaStack) - Install with: pip install dana[local]
+# Local LLM providers (Ollama, LlamaStack) - Install with: pip install dana-agent[local]
 # llama-stack requires Python >=3.12; gated by marker so [local] resolves on 3.11 (ollama-only).
 local = [
     "llama-stack>=0.3.0; python_version>='3.12'",
     "ollama>=0.6.0",
 ]
 
-# Data processing and visualization - Install with: pip install dana[data]
+# Data processing and visualization - Install with: pip install dana-agent[data]
 data = [
     "pandas>=2.2.0,<2.3.0",
     "matplotlib>=3.10.6",
 ]
 
-# Semantic memory with vector search - Install with: pip install dana[memory]
+# Semantic memory with vector search - Install with: pip install dana-agent[memory]
 memory = [
     "lancedb>=0.20.0",
     "sentence-transformers>=3.0.0",
 ]
 
-# Knowledge graph support - Install with: pip install dana[knowledge]
+# Knowledge graph support - Install with: pip install dana-agent[knowledge]
 knowledge = [
     "rdflib>=7.5.0",
     "rank-bm25>=0.2.2",
 ]
 
-# Observability and tracing - Install with: pip install dana[observability]
+# Observability and tracing - Install with: pip install dana-agent[observability]
 observability = [
     "langfuse>=3.5.1",
     "langsmith>=0.8,<0.9",  # Alternative tracing backend (exclusive with langfuse)
 ]
 
-# Full installation with all optional features - Install with: pip install dana[full]
+# Full installation with all optional features - Install with: pip install dana-agent[full]
 full = [
-    "dana[web,local,data,memory,knowledge,observability]",
+    "dana-agent[web,local,data,memory,knowledge,observability]",
 ]
 
 dev = [

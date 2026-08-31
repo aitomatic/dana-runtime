@@ -70,7 +70,8 @@ def _dana_version() -> str:
     try:
         from importlib.metadata import version
 
-        return version("dana")
+        # Distribution name is dana-agent; the import package is dana.
+        return version("dana-agent")
     except Exception:
         return "0.0.0+unknown"
 

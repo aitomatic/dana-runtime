@@ -17,7 +17,8 @@ from pathlib import Path
 def _version() -> str:
     """Installed package version, falling back to pyproject.toml for source checkouts."""
     try:
-        return metadata.version("dana")
+        # Distribution name is dana-agent; the import package is dana.
+        return metadata.version("dana-agent")
     except metadata.PackageNotFoundError:
         pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
         for line in pyproject.read_text(encoding="utf-8").splitlines():
