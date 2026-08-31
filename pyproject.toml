@@ -298,4 +298,10 @@ markers = [
 [dependency-groups]
 dev = [
     "langfuse>=3.5.1",
+    # Test toolchain must live here (not only in the `dana[dev]` extra) so that
+    # `uv sync` installs it: otherwise `uv run pytest` silently falls through
+    # to a foreign interpreter on PATH (e.g. a pyenv shim) with a stale `mcp`.
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.13.0",
 ]

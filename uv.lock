@@ -683,6 +683,9 @@ web = [
 [package.dev-dependencies]
 dev = [
     { name = "langfuse" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "ruff" },
 ]
 
 [package.metadata]
@@ -733,7 +736,12 @@ requires-dist = [
 provides-extras = ["web", "local", "data", "memory", "knowledge", "observability", "full", "dev", "docs"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "langfuse", specifier = ">=3.5.1" }]
+dev = [
+    { name = "langfuse", specifier = ">=3.5.1" },
+    { name = "pytest", specifier = ">=8.0.0" },
+    { name = "pytest-asyncio", specifier = ">=0.23.0" },
+    { name = "ruff", specifier = ">=0.13.0" },
+]
 
 [[package]]
 name = "deprecation"
