@@ -14,7 +14,7 @@ class MockAgent:
 
 
 async def main():
-    session = await AgentSession.create(agent_factory=MockAgent if os.environ.get("DANA_MOCK_LLM") == "1" else None)
+    session = await AgentSession.create(agent_factory=MockAgent if os.environ.get("DANA_MOCK_LLM") in ("1", "true") else None)
     [print(e.text) async for e in session.prompt([TextBlock(text="hello")]) if e.event_type.name == "ASSISTANT_CONTENT_FINAL"]
     await session._repository.close()
 
