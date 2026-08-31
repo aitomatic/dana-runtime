@@ -29,8 +29,6 @@ def _build_instance(**overrides) -> ClaudeCodeSkills:
 
 
 def test_init_default_values(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(ClaudeCodeSkills, "_check_claude_available", lambda self: True)
-    monkeypatch.setattr(ClaudeCodeSkills, "_discover_skills", lambda self: [])
     skills = ClaudeCodeSkills(auto_register=False)
 
     assert skills._output_dir == "./skill_output"
@@ -40,8 +38,6 @@ def test_init_default_values(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_init_custom_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    monkeypatch.setattr(ClaudeCodeSkills, "_check_claude_available", lambda self: True)
-    monkeypatch.setattr(ClaudeCodeSkills, "_discover_skills", lambda self: [])
     skills = ClaudeCodeSkills(
         skills_dir=str(tmp_path),
         output_dir="./out",

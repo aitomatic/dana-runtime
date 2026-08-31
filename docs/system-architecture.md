@@ -494,11 +494,11 @@ Resource Execution
 ## Streaming Architecture
 
 ```
-Agent.stream_response(messages)
+Agent.aquery_stream(message=…)
     │
-    ├─ Runtime.stream_complete(messages, tools)
+    ├─ STAR loop streaming (_see/_think/_act, StreamEvent per phase)
     │  │
-    │  └─ Provider-specific streaming
+    │  └─ Runtime LLM streaming (llm_caller.call_llm_stream)
     │     (Server-Sent Events or chunked)
     │
     ├─ Token-by-token yield

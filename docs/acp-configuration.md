@@ -9,7 +9,7 @@ This guide describes how to run Dana as an [Agent Client Protocol](https://agent
 Dana is installed with its ACP extras:
 
 ```bash
-uv pip install dana[acp]
+uv pip install dana-agent
 ```
 
 The ACP entry point is the stdio agent `dana-acp`, exposed as the module `dana.apps.acp`:
