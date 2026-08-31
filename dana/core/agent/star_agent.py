@@ -96,7 +96,8 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                 response parsing, and tool execution. Defaults to DefaultRuntime.
             codec: Codec class for tool call encoding/decoding (default: NativeToolsCodec).
             ltmemory_path: Optional path for long-term memory storage (enables cross-session learning)
-            enable_skills: Whether to enable Claude Code skills resource discovery
+            enable_skills: Whether to enable Claude Code skills resource discovery (default True,
+                gated at runtime by DANA_CLAUDE_SKILLS=1 — without the env var no scan happens)
             skills_output_dir: Directory to use for skill output files
             identity_override: Optional identity string that overrides the class docstring.
                 Used by fork subagents to inject skill content as their identity.
@@ -239,10 +240,14 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
 
         if enable_skills:
             from dana.core.skills import ClaudeCodeSkills
+            from dana.core.skills.claude_code_skills import claude_skills_enabled
 
-            skills = ClaudeCodeSkills(output_dir=skills_output_dir, notifier=self)
-            if skills.enabled:
-                self.with_resources(skills)
+            # D8: skills discovery is opt-in — default agent construction never scans
+            # ~/.claude/skills unless DANA_CLAUDE_SKILLS=1 is set.
+            if claude_skills_enabled():
+                skills = ClaudeCodeSkills(output_dir=skills_output_dir, notifier=self)
+                if skills.enabled:
+                    self.with_resources(skills)
 
         if enable_code_execution:
             from dana.common.resource import CodeExecutionResource
