@@ -75,6 +75,21 @@ uv sync
 
 Requires Python >= 3.11.
 
+#### Install from PyPI
+
+Once the first release is published, Dana can be installed directly (the
+PyPI distribution is `dana-agent`; the import package is `dana`):
+
+```bash
+pip install dana-agent
+```
+
+> **Note:** the first PyPI release is pending — the publish workflow is in
+> place, but the upload requires the maintainer's one-time Trusted Publisher
+> setup on PyPI. Until it lands, use the git-clone installation above, or
+> install a locally built wheel:
+> `pip install <path>/dist/dana_agent-*.whl`.
+
 ### Configure an LLM provider
 
 Dana reads provider keys from environment variables (or a `.env` file at the
