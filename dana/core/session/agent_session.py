@@ -35,7 +35,8 @@ import structlog
 
 from dana.core.policy.modes import PermissionMode
 from dana.core.session.journal.protocol import JournalRepository
-from dana.core.session.models import FactType, NewJournalFact, OwnerScope
+from dana.core.session.legacy_timeline_migration import recover_interrupted_turns
+from dana.core.session.models import FactType, JournalFact, NewJournalFact, OwnerScope
 from dana.core.session.projections.conversation import ConversationProjector, ConversationView
 from dana.core.session.projections.host_events import HostEvent, HostEventProjector, HostEventType
 from dana.core.session.protected_state import ProtectedStateCodec
@@ -332,6 +333,74 @@ class AgentSession:
         """
         self._current_provider = target.provider
         self._current_model = target.model
+
+    # ------------------------------------------------------------------
+    # D8: Convenience constructor
+    # ------------------------------------------------------------------
+
+    @classmethod
+    async def create(
+        cls,
+        session_id: str | None = None,
+        journal_path: str | None = None,
+        owner_scope: OwnerScope | None = None,
+        agent_factory: Callable[[], Any] | None = None,
+    ) -> AgentSession:
+        """Convenience constructor: journal + SESSION_CREATED + agent in one call (D8).
+
+        Mirrors ``DanaACPAgent.new_session`` / ``DanaCodeApp._initialize_session``:
+        ``OwnerScope`` (``$USER`` + cwd by default), SQLite journal at
+        ``journal_path`` (or ``DANA_CODE_JOURNAL`` / ``DANA_ACP_JOURNAL`` /
+        ``~/.dana/journal.db``; the directory is created), one SESSION_CREATED
+        fact, and :func:`default_agent_factory`. Returns the session with its
+        version already set — ``prompt`` can be called immediately.
+
+        Idempotent on an existing journal: when ``session_id`` already exists,
+        resumes it instead (no duplicate SESSION_CREATED; interrupted turns are
+        recovered first, matching the ACP ``session/load`` path).
+        """
+        import os
+
+        from dana.core.session.journal.models import SessionNotFound, SessionRecord
+        from dana.core.session.journal.sqlite import SQLiteJournalRepository
+
+        if journal_path is None:
+            journal_path = os.environ.get("DANA_CODE_JOURNAL") or os.environ.get("DANA_ACP_JOURNAL") or "~/.dana/journal.db"
+        journal_path = os.path.expanduser(journal_path)
+        os.makedirs(os.path.dirname(journal_path) or ".", exist_ok=True)
+        repo = await SQLiteJournalRepository.open(journal_path)
+
+        scope = owner_scope or OwnerScope(owner_id=os.environ.get("USER", "local"), workspace=os.getcwd())
+        sid = session_id or str(uuid4())
+
+        try:
+            await repo.load_session(scope, sid)
+        except SessionNotFound:
+            record = SessionRecord.new(sid, scope)
+            init_facts = [
+                JournalFact(
+                    fact_id=str(uuid4()),
+                    owner_scope=scope,
+                    session_id=sid,
+                    sequence=1,
+                    fact_type=FactType.SESSION_CREATED,
+                    timestamp=datetime.now(UTC),
+                    correlation_id=str(uuid4()),
+                    causation_id=None,
+                    schema_version=1,
+                    payload={},
+                ),
+            ]
+            await repo.create_session(record, init_facts)
+            session = cls(owner_scope=scope, session_id=sid, repository=repo, agent_factory=agent_factory)
+            session._current_version = init_facts[0].sequence
+            return session
+
+        # Existing journal -> resume (idempotent: no duplicate SESSION_CREATED).
+        await recover_interrupted_turns(repo, scope, sid)
+        session = cls(owner_scope=scope, session_id=sid, repository=repo, agent_factory=agent_factory)
+        await session.load()
+        return session
 
     # ------------------------------------------------------------------
     # Public lifecycle
