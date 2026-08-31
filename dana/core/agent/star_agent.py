@@ -643,36 +643,6 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             input_handler=input_handler,
         )
 
-    def __getattr__(self, name: str):
-        """
-        Magic function: Convert unknown method calls to natural language and call converse.
-
-        Examples:
-            agent.hi_how_are_you() -> converse("hi how are you")
-            agent.research_coffee_companies() -> converse("research coffee companies")
-            agent.find_exporters_in_dak_lak() -> converse("find exporters in dak lak")
-        """
-
-        def magic_method(*args, **kwargs):
-            # Convert method name to natural language
-            # Replace underscores with spaces and clean up
-            natural_language = name.replace("_", " ").strip()
-
-            # Add any positional arguments as additional context
-            if args:
-                args_str = " ".join(str(arg) for arg in args)
-                natural_language += f" {args_str}"
-
-            # Add any keyword arguments as additional context
-            if kwargs:
-                kwargs_str = " ".join(f"{k}={v}" for k, v in kwargs.items())
-                natural_language += f" {kwargs_str}"
-
-            # Call converse with the natural language message (starts interactive conversation)
-            return self.converse(initial_message=natural_language)
-
-        return magic_method
-
     # ============================================================================
     # TIMELINE COMPRESSION
     # ============================================================================
