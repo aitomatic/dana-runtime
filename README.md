@@ -139,9 +139,15 @@ dana-code         # coding agent
 
 ### config.json
 
-Dana ships defaults in `dana/config.json`; override per-user at
-`~/.dana/config.json` or `./config.json`, or point `DANA_CONFIG_PATH` at a
-custom location. Provider entries use this shape:
+Dana ships defaults in `dana/config.json`, which is loaded automatically.
+To override it, point `DANA_CONFIG_PATH` at a custom file — the env var takes
+precedence over the packaged defaults:
+
+```bash
+export DANA_CONFIG_PATH="/path/to/your/config.json"
+```
+
+Provider entries use this shape (`models` maps alias → model ID):
 
 ```json
 {
@@ -153,7 +159,12 @@ custom location. Provider entries use this shape:
         "base_url": "https://api.openai.com/v1",
         "api_key_env": "OPENAI_API_KEY",
         "default_model": "gpt-4.1",
-        "models": ["gpt-4.1", "gpt-4.1-mini", "o3", "o4-mini"]
+        "models": {
+          "gpt-4.1": "gpt-4.1",
+          "gpt-4.1-mini": "gpt-4.1-mini",
+          "o3": "o3",
+          "o4-mini": "o4-mini"
+        }
       }
     }
   }
