@@ -2,11 +2,11 @@
 
 **STAR Pattern Agent Framework for Python**
 
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version 0.1.1](https://img.shields.io/badge/version-0.1.1-green.svg)](#release-status)
+[![Version 0.2.0](https://img.shields.io/badge/version-0.2.0-green.svg)](#version-history)
 
-Dana is a production-ready Python agentic runtime implementing the **STAR pattern (See-Think-Act-Reflect)** for building sophisticated conversational AI agents. It provides multi-provider LLM support, extensible tool frameworks, intelligent context management, and rich terminal interfaces.
+Dana is a Python agentic runtime implementing the **STAR pattern (See-Think-Act-Reflect)** for building conversational AI agents. It provides multi-provider LLM support, extensible tool resources, timeline-based context management with automatic compression, and a set of CLI applications.
 
 ## Features
 
@@ -25,41 +25,40 @@ Structured reasoning loop for transparent, explainable agent behavior:
 - **Local Models** - LLaMA Stack, Ollama
 - **Custom Endpoints** - Anthropic-like protocol support
 
-### 🛠️ Built-in Resources (9)
+### 🛠️ Built-in Resources
 - **BashResource** - Execute shell commands
 - **FileIOResource** - Read/write files
 - **FileEditResource** - Edit files with diffs
 - **SearchResource** - Web search integration
 - **TaskResource** - Task management
 - **TodoResource** - Todo list operations
-- **SkillResource** - Claude Code skills
-- **WebResearchResource** - Advanced web research
-- **MCPResource** - Model Context Protocol support
+- **SkillResource** - Claude Code skills (gated by `DANA_CLAUDE_SKILLS=1`)
+- **CodeExecutionResource** - Sandboxed Python execution
+- **Web research pipeline** - search, fetch, extract, synthesize resources
 
-### 📝 Intelligent Timeline Management
-- Chronological conversation history with 9 entry types
-- Token-aware automatic compression at 80% threshold
+### 📝 Timeline Management
+- Chronological conversation history
+- Token-aware automatic compression
 - LLM-based history summarization
-- Serializable persistence
+- Serializable persistence per session
 
 ### 🧠 Memory Systems
 - **Short-Term Memory** - Per-session caching
 - **Long-Term Memory** - Persistent markdown storage
 - Memory types: lessons, episodes, facts, patterns
 
-### 🌐 Web Research Pipeline
-- HTML extraction and cleaning
-- Multi-source synthesis
-- URL caching
-- Search result aggregation
+## ✨ CLI Applications
 
-### ✨ CLI Applications
+All six entrypoints answer `--help` and `--version`:
+
 | Command | Purpose |
 |---------|---------|
-| `adana` | Interactive conversational agent |
-| `adana-repl` | Interactive Python REPL |
+| `dana-agent` | Interactive conversational agent |
+| `dana-agent-repl` | Interactive Python REPL with Dana imported |
 | `dana-code` | Coding-focused agent with rich UI |
+| `dana-memory` | Memory store inspection (`--json` for machine-readable output) |
 | `dana-init` | Bootstrap config setup |
+| `dana-acp` | Agent Client Protocol (ACP) server |
 
 ## Quick Start
 
@@ -72,55 +71,90 @@ cd dana-runtime
 
 # Install dependencies
 uv sync
+```
 
-# Initialize configuration
+Requires Python >= 3.11.
+
+### Configure an LLM provider
+
+Dana reads provider keys from environment variables (or a `.env` file at the
+repo root, loaded automatically):
+
+```bash
+# Required (at least one provider)
+export OPENAI_API_KEY="sk-..."
+export ANTHROPIC_API_KEY="sk-ant-..."
+```
+
+Or bootstrap interactively:
+
+```bash
 dana-init
 ```
 
 ### First Agent
 
 ```python
+import asyncio
+
 from dana.core.agent import STARAgent
 
-# Create agent
-agent = STARAgent(model="gpt-4.1")
 
-# Query agent
-response = await agent.aquery(message="What time is it?")
-print(response)
+async def main():
+    agent = STARAgent(model="gpt-4.1")
+    response = await agent.aquery(message="What time is it?")
+    print(response["response"])
+
+
+asyncio.run(main())
 ```
 
-### Run Interactive Agent
+`aquery` returns a dict with keys such as `response`, `reasoning`,
+`tool_calls`, and `done`. This sample requires an LLM API key.
+
+### Embedding: AgentSession hello world
+
+For host applications (durable conversation, turn events, journalling), use
+`AgentSession` instead of driving `STARAgent` directly. A 15-line working
+example lives at [docs/examples/host_hello.py](docs/examples/host_hello.py):
+
+```python
+session = await AgentSession.create()
+[print(e.text) async for e in session.prompt([TextBlock(text="hello")]) if e.event_type.name == "ASSISTANT_CONTENT_FINAL"]
+```
+
+Run it with `uv run python docs/examples/host_hello.py` (live LLM; set
+`DANA_MOCK_LLM=1` for a canned reply — the mock switch is a property of that
+example script, not a library feature).
+
+### Run Interactive Agents
 
 ```bash
-# Start main conversational agent
-adana
-
-# Start Python REPL with Dana imported
-adana-repl
-
-# Start coding agent
-dana-code
+dana-agent        # main conversational agent
+dana-agent-repl   # Python REPL with Dana imported
+dana-code         # coding agent
 ```
 
 ## Configuration
 
 ### config.json
 
-Create `~/.dana/config.json` or `./config.json`:
+Dana ships defaults in `dana/config.json`; override per-user at
+`~/.dana/config.json` or `./config.json`, or point `DANA_CONFIG_PATH` at a
+custom location. Provider entries use this shape:
 
 ```json
 {
-  "llm_providers": {
-    "openai": {
-      "priority": 100,
-      "api_key": "${OPENAI_API_KEY}",
-      "models": ["gpt-4.1", "gpt-4.1-mini"]
-    },
-    "anthropic": {
-      "priority": 90,
-      "api_key": "${ANTHROPIC_API_KEY}",
-      "models": ["claude-sonnet-4-6"]
+  "llm": {
+    "providers": {
+      "openai": {
+        "name": "OpenAI",
+        "priority": 100,
+        "base_url": "https://api.openai.com/v1",
+        "api_key_env": "OPENAI_API_KEY",
+        "default_model": "gpt-4.1",
+        "models": ["gpt-4.1", "gpt-4.1-mini", "o3", "o4-mini"]
+      }
     }
   }
 }
@@ -134,15 +168,7 @@ export OPENAI_API_KEY="sk-..."
 export ANTHROPIC_API_KEY="sk-ant-..."
 
 # Optional
-export DANA_DEBUG=true          # Enable debug logging
-export DANA_CONFIG_PATH="/path" # Custom config location
-```
-
-### Initialize Config
-
-```bash
-dana-init
-# Interactive setup for API keys and preferences
+export DANA_CONFIG_PATH="/path/to/config.json"  # Custom config location
 ```
 
 ## Architecture
@@ -163,15 +189,17 @@ Data Persistence & Infrastructure
 
 **Key Components:**
 - **STARAgent** - Main orchestrator with streaming support
+- **AgentSession** - Host-facing conversational session with durable journal
 - **Resource System** - Tool execution framework with auto-registration
 - **Timeline** - Conversation history with compression
 - **Runtime** - Provider-agnostic LLM abstraction
-- **Memory** - Short-term and long-term persistence
 - **Workflow** - Multi-step composition engine
 
 For detailed architecture, see [docs/system-architecture.md](docs/system-architecture.md).
 
 ## Usage Examples
+
+All examples below require an LLM API key unless noted.
 
 ### Basic Agent
 
@@ -180,14 +208,37 @@ from dana.core.agent import STARAgent
 
 agent = STARAgent(model="gpt-4.1")
 response = await agent.aquery(message="Summarize Python features")
-print(response)
+print(response["response"])
 ```
 
-### With Custom Resources
+### Streaming Responses
 
 ```python
+import asyncio
+
 from dana.core.agent import STARAgent
+
+
+async def main():
+    agent = STARAgent(model="gpt-4.1")
+    async for event in agent.aquery_stream(message="Write a poem"):
+        print(event.event_type.name, event.data)
+
+
+asyncio.run(main())
+```
+
+Emits `THINKING`, `TEXT_DELTA`, and `DONE` events. For a raw
+text-only stream, hosts can use `aquery_text_stream(message=...,
+cancel_event=...)` after adding the user message to the timeline (see
+[docs/examples/host_hello.py](docs/examples/host_hello.py) for the preferred
+session-level path).
+
+### Custom Resources
+
+```python
 from dana.core.resource import BaseResource
+
 
 class MyResource(BaseResource):
     """Custom resource for your domain."""
@@ -195,7 +246,8 @@ class MyResource(BaseResource):
     async def my_tool(self, param: str) -> str:
         return f"Processed: {param}"
 
-# Register (auto-registers on instantiation)
+
+# Auto-registers with the global registry on instantiation
 my_resource = MyResource()
 
 # Use in agent
@@ -203,53 +255,30 @@ agent = STARAgent(model="gpt-4.1")
 response = await agent.aquery(message="Call my_tool with 'hello'")
 ```
 
-### Streaming Responses
-
-```python
-agent = STARAgent(model="gpt-4.1")
-
-import asyncio
-
-async for token in agent.aquery_text_stream(
-    message="Write a poem", cancel_event=asyncio.Event()
-):
-    print(token, end="", flush=True)
-print()
-```
-
 ### Web Research
 
 ```python
-from dana.lib.resources.web_research import WebResearchResource
+from dana.lib.agents.web_research import WebResearchAgent
 
-research = WebResearchResource()
-result = await research.research(
-    topic="Python 3.12 features",
-    num_sources=3
-)
-print(result)
+research = WebResearchAgent()
+result = await research.aquery(message="Research Python 3.12 features")
+print(result["response"])
 ```
 
 ### Workflows
 
 ```python
-from dana.core.workflow import BaseWorkflow, WorkflowExecutor
+from dana.core.workflow import BaseWorkflow
+
 
 class ResearchWorkflow(BaseWorkflow):
+    """Research a topic and report."""
+
     async def execute(self, topic: str):
-        # Step 1: Research
-        research_result = await self.research(topic)
+        return {"topic": topic}
 
-        # Step 2: Summarize
-        summary = await self.summarize(research_result)
 
-        # Step 3: Generate report
-        report = await self.generate_report(summary)
-
-        return report
-
-executor = WorkflowExecutor(ResearchWorkflow())
-result = await executor.run(topic="AI trends")
+workflow = ResearchWorkflow(workflow_id="research")
 ```
 
 ## Development
@@ -263,45 +292,36 @@ uv sync
 # Run tests
 make test
 
+# Run unit tests only
+make test-unit
+
 # Run linting
 make lint
 
 # Format code
 make format
 
-# Type checking
-make type-check
+# Auto-fix lint issues
+make fix
 ```
 
 ### Testing
 
 ```bash
-# Run all tests
-make test
-
-# Run unit tests only
-make test-unit
-
-# Run with coverage
-make test-cov
-
-# Run against live LLMs
-make test-live
-
-# Mock LLM testing
-DANA_MOCK_LLM=true make test
+make test          # All tests (excludes live)
+make test-unit     # Unit tests only
+make test-live     # Live tests (requires API keys)
+make test-cov      # Coverage report
 ```
 
 ### Code Quality
 
 **Tools:**
 - **Ruff** - Linting & formatting (line-length 140)
-- **MyPy** - Type checking
 - **Pytest** - Testing framework
 
 **Standards:**
 - Type hints required on all functions
-- >70% code coverage target
 - All tests must pass before commit
 - Follow [code-standards.md](docs/code-standards.md)
 
@@ -313,6 +333,7 @@ DANA_MOCK_LLM=true make test
 - **[System Architecture](docs/system-architecture.md)** - Architecture diagrams and data flows
 - **[Branching Strategy](docs/branching-strategy.md)** - Git branching model and release flow
 - **[Project Roadmap](docs/project-roadmap.md)** - Development timeline and milestones
+- **[Extending Dana](docs/extending-dana.md)** - Adding agents, resources, workflows
 
 ## API Reference
 
@@ -320,11 +341,19 @@ DANA_MOCK_LLM=true make test
 
 ```python
 agent = STARAgent(
-    model: str,                      # e.g., "gpt-4.1"
-    tools: Optional[list[str]],      # Enabled tool names
-    max_tokens: int = 4096,          # Context limit
-    compression_threshold: float = 0.8  # Auto-compress at %
+    model: str | None,               # e.g. "gpt-4.1"
+    llm_provider: str | None,        # e.g. "openai", "anthropic"
+    max_context_tokens: int = 4000,  # Timeline context budget
+    enable_web_search: bool = False,     # search() + fetch_url(), no API key
+    enable_code_execution: bool = False, # sandboxed Python execution
+    enable_skills: bool = True,          # Claude Code skills (DANA_CLAUDE_SKILLS=1 gates the scan)
 )
+
+# Query agent (async; returns a dict)
+response = await agent.aquery(message: str)
+
+# Stream events (THINKING / TEXT_DELTA / DONE)
+async for event in agent.aquery_stream(message: str): ...
 
 # Ephemeral replacement for this agent instance (no repository write)
 agent.override_system_prompt_template("You are a domain specialist.")
@@ -335,16 +364,9 @@ agent.override_system_prompt_template(
     persist=True,
 )
 
-# Query agent
-response = await agent.aquery(message: str) -> dict
-
-# Stream response
-async for token in agent.aquery_text_stream(message: str, cancel_event: asyncio.Event):
-    # Handle token
-
-# Access conversation history
-timeline = agent.state.timeline
-messages = await timeline.get_entries()
+# Conversation state
+state = agent.get_state()                    # dict
+summary = agent.get_timeline_summary()      # str
 ```
 
 `persist=False` is the default: the override is ephemeral, scoped to the agent
@@ -359,75 +381,15 @@ output-format instruction in the replacement.
 ```python
 from dana.core.resource import BaseResource
 
+
 class CustomResource(BaseResource):
     async def my_tool(self, param: str) -> str:
         """Tool docstring becomes tool description."""
         return result
 
+
 # Auto-registers on instantiation
 resource = CustomResource()
-```
-
-## Performance
-
-| Operation | Latency | Notes |
-|-----------|---------|-------|
-| Message processing | <5s avg | Depends on LLM |
-| Tool execution | Variable | Depends on tool |
-| Timeline compression | 1-2s | LLM-based |
-| Streaming first token | 1-3s | LLM latency |
-
-**Optimization Tips:**
-- Use `stream_response()` for better perceived latency
-- Enable memory caching for repeated queries
-- Batch multiple requests when possible
-- Use compression threshold of 0.7 for faster responses
-
-## Troubleshooting
-
-### API Key Issues
-
-```python
-# Verify API key is set
-import os
-print(os.getenv("OPENAI_API_KEY"))
-
-# Or use config.json
-dana-init  # Re-run setup
-```
-
-### Timeout Issues
-
-```python
-# Increase timeout in agent creation
-agent = STARAgent(
-    model="gpt-4.1",
-    timeout=30  # seconds
-)
-```
-
-### Debug Mode
-
-```bash
-# Enable debug logging
-export DANA_DEBUG=true
-adana
-
-# Or in code
-import structlog
-structlog.configure(
-    processors=[structlog.processors.JSONRenderer()]
-)
-```
-
-### Memory Issues
-
-```python
-# Reduce context limit
-agent = STARAgent(model="gpt-4.1", max_tokens=2048)
-
-# Or adjust compression
-agent.state.timeline.compression_threshold = 0.6
 ```
 
 ## Contributing
@@ -440,16 +402,9 @@ agent.state.timeline.compression_threshold = 0.6
 6. Push to fork
 7. Create pull request
 
-**Development Rules:**
-- Type hints required
-- >70% test coverage
-- All tests passing
-- Ruff linting compliant
-- MyPy type checking passes
-
 ## License
 
-MIT License - see [LICENSE](LICENSE) file
+MIT License — see [LICENSE](LICENSE). Copyright (c) 2026 Dana Contributors.
 
 ## Citation
 
@@ -467,23 +422,10 @@ MIT License - see [LICENSE](LICENSE) file
 - **Documentation:** [docs/](docs/) directory
 - **Issues:** GitHub Issues
 - **Discussions:** GitHub Discussions
-- **Email:** support@aitomatic.com
-
-## Roadmap
-
-**Current Phase:** Enhancement (Q2 2026)
-
-| Phase | Timeline | Status |
-|-------|----------|--------|
-| 1. Foundation | Q1 2026 | ✅ Complete |
-| 2. Enhancement | Q2 2026 | ⚠️ In Progress |
-| 3. Extended Features | Q3 2026 | 🔜 Planned |
-| 4. Production Hardening | Q4 2026 | 🔜 Planned |
-
-See [project-roadmap.md](docs/project-roadmap.md) for detailed timeline.
 
 ## Version History
 
+- **0.2.0** - CLI entrypoints (`dana-agent`, `dana-agent-repl`, `dana-code`, `dana-memory`, `dana-init`, `dana-acp`) with `--help`/`--version`; `AgentSession` host API
 - **0.1.1** (2026-03-21) - Stable, production-ready
 - **0.1.0** (2026-03-01) - Initial release
 
@@ -493,6 +435,4 @@ Dana is developed by [Aitomatic, Inc.](https://aitomatic.com) with contributions
 
 ---
 
-**Quick Links:** [Docs](docs/) | [Examples](#usage-examples) | [API Reference](#api-reference) | [Contributing](#contributing) | [License](LICENSE)
-
-**Latest Release:** 0.1.1 | **Last Updated:** 2026-03-21
+**Quick Links:** [Docs](docs/) | [Examples](docs/examples/) | [API Reference](#api-reference) | [Contributing](#contributing) | [License](LICENSE)
