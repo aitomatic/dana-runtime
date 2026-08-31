@@ -8,9 +8,16 @@ and RichCLIRenderer.
 
 import sys
 
+from dana.apps.cli_flags import standard_parser
+
 
 def main():
     """Main entry point for Dana Code."""
+    standard_parser(
+        "dana-code",
+        "Dana Code — interactive coding agent with a rich terminal UI",
+    ).parse_args()
+
     try:
         from dotenv import find_dotenv, load_dotenv
 

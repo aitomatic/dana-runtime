@@ -3,8 +3,15 @@
 from pathlib import Path
 import shutil
 
+from dana.apps.cli_flags import standard_parser
+
 
 def main():
+    standard_parser(
+        "dana-init",
+        "Copy the default Dana config.json into the current directory",
+    ).parse_args()
+
     src = Path(__file__).parent.parent.parent / "config.json"  # dana/config.json
     dest = Path.cwd() / "dana" / "config.json"
 

@@ -8,9 +8,16 @@ resources, and workflows through natural conversation.
 
 import sys
 
+from dana.apps.cli_flags import standard_parser
+
 
 def main():
     """Main entry point for the Dana conversational agent."""
+    standard_parser(
+        "dana-agent",
+        "Dana conversational agent — manages agents, resources, and workflows via conversation",
+    ).parse_args()
+
     try:
         # Load .env files manually
         from dotenv import find_dotenv, load_dotenv

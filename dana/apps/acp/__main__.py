@@ -36,7 +36,14 @@ def configure_stderr_logging() -> None:
 
 
 def main() -> None:
-    """Synchronous entry point — configures logging and runs the async agent."""
+    """Synchronous entry point — answers --help/--version, then runs the async agent."""
+    from dana.apps.cli_flags import standard_parser
+
+    standard_parser(
+        "dana-acp",
+        "Dana ACP agent — JSON-RPC over stdio (stdout is reserved for protocol frames)",
+    ).parse_args()
+
     configure_stderr_logging()
     asyncio.run(main_async())
 

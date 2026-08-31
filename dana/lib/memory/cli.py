@@ -352,17 +352,11 @@ def cmd_hooks_uninstall(args: argparse.Namespace) -> int:
 
 def main() -> int:
     """Main CLI entry point."""
-    # Check if dependencies are available
-    if not _DEPS_AVAILABLE:
-        print(
-            f"Error: Memory module dependencies not installed.\nInstall with: pip install dana[memory]\nMissing: {_IMPORT_ERROR}",
-            file=sys.stderr,
-        )
-        return 1
+    from dana.apps.cli_flags import standard_parser
 
-    parser = argparse.ArgumentParser(
-        prog="dana-memory",
-        description="Semantic memory store for Dana agents",
+    parser = standard_parser(
+        "dana-memory",
+        "Semantic memory store for Dana agents",
     )
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -435,6 +429,15 @@ def main() -> int:
     p_hooks_uninstall.set_defaults(func=cmd_hooks_uninstall)
 
     args = parser.parse_args()
+
+    # Check if dependencies are available (after --help/--version have been answered)
+    if not _DEPS_AVAILABLE:
+        print(
+            f"Error: Memory module dependencies not installed.\nInstall with: pip install dana[memory]\nMissing: {_IMPORT_ERROR}",
+            file=sys.stderr,
+        )
+        return 1
+
     return args.func(args)
 
 
