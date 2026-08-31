@@ -57,6 +57,7 @@ def test_init_custom_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 
 
 def test_init_with_skill_filter(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("DANA_CLAUDE_SKILLS", "1")
     monkeypatch.setattr(
         ClaudeCodeSkills,
         "_discover_skills",
@@ -94,6 +95,7 @@ def test_discover_skills_finds_skills(monkeypatch: pytest.MonkeyPatch, tmp_path:
     skill_dir.mkdir()
     (skill_dir / "SKILL.md").write_text("# PPTX\nCreate presentations.")
 
+    monkeypatch.setenv("DANA_CLAUDE_SKILLS", "1")
     monkeypatch.setattr(ClaudeCodeSkills, "_check_claude_available", lambda self: False)
     skills = ClaudeCodeSkills(skills_dir=str(tmp_path), auto_register=False)
 
@@ -101,6 +103,7 @@ def test_discover_skills_finds_skills(monkeypatch: pytest.MonkeyPatch, tmp_path:
 
 
 def test_discover_skills_empty_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.setenv("DANA_CLAUDE_SKILLS", "1")
     monkeypatch.setattr(ClaudeCodeSkills, "_check_claude_available", lambda self: False)
     skills = ClaudeCodeSkills(skills_dir=str(tmp_path), auto_register=False)
 
@@ -109,6 +112,7 @@ def test_discover_skills_empty_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
 
 def test_discover_skills_missing_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     missing_dir = tmp_path / "missing"
+    monkeypatch.setenv("DANA_CLAUDE_SKILLS", "1")
     monkeypatch.setattr(ClaudeCodeSkills, "_check_claude_available", lambda self: False)
     skills = ClaudeCodeSkills(skills_dir=str(missing_dir), auto_register=False)
 
@@ -321,3 +325,78 @@ def test_execute_handles_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     result = instance.execute(task="Do thing")
 
     assert result == {"success": False, "output": "", "error": "bad"}
+
+
+# ---------------------------------------------------------------------------
+# D8: opt-in gate (DANA_CLAUDE_SKILLS=1) — default OFF framework-wide
+# ---------------------------------------------------------------------------
+
+
+def test_default_construction_performs_no_discovery(monkeypatch: pytest.MonkeyPatch):
+    """Without DANA_CLAUDE_SKILLS set, construction must not scan or probe the CLI."""
+    discovery_calls: list[int] = []
+    availability_calls: list[int] = []
+
+    monkeypatch.delenv("DANA_CLAUDE_SKILLS", raising=False)
+    monkeypatch.setattr(
+        ClaudeCodeSkills,
+        "_discover_skills",
+        lambda self: discovery_calls.append(1) or [],
+    )
+    monkeypatch.setattr(
+        ClaudeCodeSkills,
+        "_check_claude_available",
+        lambda self: availability_calls.append(1) or True,
+    )
+
+    skills = ClaudeCodeSkills(auto_register=False)
+
+    assert discovery_calls == []
+    assert availability_calls == []
+    assert skills.enabled is False
+    assert skills.all_skills == []
+    assert skills.skills == []
+
+
+def test_opt_in_env_restores_discovery(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """DANA_CLAUDE_SKILLS=1 restores the previous greedy discovery behavior."""
+    skill_dir = tmp_path / "pptx"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("# PPTX\nCreate presentations.")
+
+    monkeypatch.setenv("DANA_CLAUDE_SKILLS", "1")
+    monkeypatch.setattr(ClaudeCodeSkills, "_check_claude_available", lambda self: True)
+
+    skills = ClaudeCodeSkills(skills_dir=str(tmp_path), auto_register=False)
+
+    assert skills.enabled is True
+    assert skills.all_skills == [{"name": "pptx", "description": "PPTX"}]
+
+
+def test_garbage_env_disables_discovery_with_warning(monkeypatch: pytest.MonkeyPatch):
+    """Any value other than '1' disables discovery and logs a warning."""
+    import dana.core.skills.claude_code_skills as mod
+
+    discovery_calls: list[int] = []
+    warnings: list[str] = []
+
+    monkeypatch.setenv("DANA_CLAUDE_SKILLS", "banana")
+    monkeypatch.setattr(
+        ClaudeCodeSkills,
+        "_discover_skills",
+        lambda self: discovery_calls.append(1) or [],
+    )
+    monkeypatch.setattr(
+        mod,
+        "logger",
+        SimpleNamespace(
+            info=lambda *a, **k: None,
+            warning=lambda msg, *a, **k: warnings.append(str(msg)),
+        ),
+    )
+
+    skills = ClaudeCodeSkills(auto_register=False)
+
+    assert discovery_calls == []
+    assert skills.enabled is False
+    assert any("DANA_CLAUDE_SKILLS" in w for w in warnings)
