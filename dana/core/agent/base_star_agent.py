@@ -453,12 +453,6 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
         Lazily created on first access so the mount point adds zero cost to
         agent construction and no ``__init__`` coupling. Each agent owns its own
         bus (correct session scope; never a global).
-
-        Implementation note: MUST read/write ``self.__dict__`` directly — NOT
-        ``getattr(self, "_event_bus", None)``. ``STARAgent.__getattr__`` returns
-        a "magic method" stub for ANY unknown attribute (natural-language
-        converse), so ``getattr`` would return that stub instead of None and the
-        bus would never be created. ``__dict__`` access bypasses ``__getattr__``.
         """
         bus = self.__dict__.get("_event_bus")
         if not isinstance(bus, EventBus):
@@ -477,11 +471,7 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
 
     @property
     def extensions(self) -> "ExtensionManager":
-        """Per-agent extension manager (lazy, ``self.__dict__`` storage). M4.
-
-        Like ``event_bus``, MUST use ``__dict__`` (not ``getattr``) to avoid
-        ``STARAgent.__getattr__`` returning a magic-method stub.
-        """
+        """Per-agent extension manager (lazy, ``self.__dict__`` storage). M4."""
         from dana.core.ext.extensions import ExtensionManager
 
         mgr = self.__dict__.get("_extensions")

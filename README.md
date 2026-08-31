@@ -85,8 +85,8 @@ from dana.core.agent import STARAgent
 # Create agent
 agent = STARAgent(model="gpt-4.1")
 
-# Process message
-response = await agent.process("What time is it?")
+# Query agent
+response = await agent.aquery(message="What time is it?")
 print(response)
 ```
 
@@ -179,7 +179,7 @@ For detailed architecture, see [docs/system-architecture.md](docs/system-archite
 from dana.core.agent import STARAgent
 
 agent = STARAgent(model="gpt-4.1")
-response = await agent.process("Summarize Python features")
+response = await agent.aquery(message="Summarize Python features")
 print(response)
 ```
 
@@ -200,7 +200,7 @@ my_resource = MyResource()
 
 # Use in agent
 agent = STARAgent(model="gpt-4.1")
-response = await agent.process("Call my_tool with 'hello'")
+response = await agent.aquery(message="Call my_tool with 'hello'")
 ```
 
 ### Streaming Responses
@@ -208,7 +208,11 @@ response = await agent.process("Call my_tool with 'hello'")
 ```python
 agent = STARAgent(model="gpt-4.1")
 
-async for token in agent.stream_response("Write a poem"):
+import asyncio
+
+async for token in agent.aquery_text_stream(
+    message="Write a poem", cancel_event=asyncio.Event()
+):
     print(token, end="", flush=True)
 print()
 ```
@@ -331,11 +335,11 @@ agent.override_system_prompt_template(
     persist=True,
 )
 
-# Process message
-response = await agent.process(message: str) -> str
+# Query agent
+response = await agent.aquery(message: str) -> dict
 
 # Stream response
-async for token in agent.stream_response(message: str):
+async for token in agent.aquery_text_stream(message: str, cancel_event: asyncio.Event):
     # Handle token
 
 # Access conversation history
