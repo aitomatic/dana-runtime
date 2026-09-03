@@ -176,6 +176,16 @@ When you need to call tools, use the function calling API directly — do NOT in
             return self.SYSTEM_PROMPT_TEMPLATE_NATIVE_TOOLS
         return self.SYSTEM_PROMPT_TEMPLATE_JSON
 
+    def override_system_prompt_template(self, agent: Any, template: str, *, persist: bool = False) -> None:
+        """Replace the complete system prompt template for this runtime instance.
+
+        Repository persistence is available on codec runtimes through
+        ``LocalPromptAPI``. Base runtimes keep overrides in memory only.
+        """
+        if persist:
+            raise NotImplementedError(f"{self.__class__.__name__} does not support persistent system prompt templates")
+        agent._system_prompt_template_override = template
+
     def get_identity(self, agent) -> str:
         """Return the agent's identity description.
 
@@ -383,7 +393,20 @@ When you need to call tools, use the function calling API directly — do NOT in
         return None
 
     def _build_native_tools_if_supported(self, agent) -> None:
-        """Build native tool schemas if the LLM provider supports native tool calling."""
+        """Build native tool schemas if the LLM provider supports native tool calling.
+
+        Schemas are cached after first build. They depend only on structural
+        agent members (``_agents``/``_resources``/``_workflows``), the static
+        provider capability, and the init-time ``_use_native_tools`` flag —
+        none change per turn. Rebuilding every ``build_prompt`` call re-runs
+        ``inspect.signature`` on every resource method under the tracer-laden
+        per-turn chain; on long sessions that exhausts the interpreter's
+        recursion budget and surfaces as a RecursionError at
+        ``inspect.signature``. Build once.
+        """
+        if self._native_tools is not None:
+            return
+
         llm = self._resolve_llm()
         if not hasattr(llm, "provider"):
             return

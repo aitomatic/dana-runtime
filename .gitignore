@@ -213,7 +213,16 @@ data/
 plans/
 .repomixignore
 AGENTS.md
+CLAUDE.md
+/sprint/
+/v2/
+# agent tool dirs / local scratch (NOT project source — analogous to .claude/.opencode)
+.agents/
+.codegraph/
+.codex/
+.superpowers/
+memories/
 release-manifest.json
 repomix-output.xml
 
-.DS_Store
+.DS_Store.worktree/

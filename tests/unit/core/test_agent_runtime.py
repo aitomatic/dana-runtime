@@ -1,3 +1,5 @@
+import pytest
+
 from dana.common.llm.types import LLMMessage, LLMResponse
 from dana.core.agent.star_agent import STARAgent
 from dana.core.resource.base_resource import BaseResource
@@ -60,6 +62,85 @@ def test_default_runtime_build_prompt():
     assert isinstance(messages, list)
     assert messages
     assert isinstance(messages[0], LLMMessage)
+
+
+def test_default_runtime_system_prompt_override_reaches_built_messages():
+    class MockLLM:
+        pass
+
+    runtime = DefaultRuntime(llm=MockLLM())
+    agent = STARAgent(
+        agent_type="runtime-test",
+        runtime=runtime,
+        auto_register=False,
+        enable_assistant=False,
+        enable_web_search=False,
+        enable_skills=False,
+        enable_code_execution=False,
+    )
+    timeline = Timeline(agent=agent)
+
+    agent.override_system_prompt_template("runtime override")
+    messages = runtime.build_prompt(agent, timeline)
+
+    assert agent.system_prompt == "runtime override"
+    assert messages[0].content.endswith("runtime override")
+
+
+def test_default_runtime_rejects_persistent_system_prompt_override():
+    runtime = DefaultRuntime()
+    agent = STARAgent(
+        agent_type="runtime-test",
+        runtime=runtime,
+        auto_register=False,
+        enable_assistant=False,
+        enable_web_search=False,
+        enable_skills=False,
+        enable_code_execution=False,
+    )
+
+    with pytest.raises(NotImplementedError, match="does not support persistent"):
+        agent.override_system_prompt_template("persistent override", persist=True)
+
+
+def test_system_prompt_override_wins_over_custom_runtime_template_hook():
+    class CustomRuntime(DefaultRuntime):
+        def get_system_prompt_template(self, native_tools: bool) -> str:
+            return "custom runtime hook"
+
+    runtime = CustomRuntime()
+    agent = STARAgent(
+        agent_type="runtime-test",
+        runtime=runtime,
+        auto_register=False,
+        enable_assistant=False,
+        enable_web_search=False,
+        enable_skills=False,
+        enable_code_execution=False,
+    )
+
+    agent.override_system_prompt_template("explicit override")
+
+    assert agent.system_prompt == "explicit override"
+
+
+def test_shared_default_runtime_keeps_overrides_agent_scoped():
+    runtime = DefaultRuntime()
+    common = {
+        "runtime": runtime,
+        "auto_register": False,
+        "enable_assistant": False,
+        "enable_web_search": False,
+        "enable_skills": False,
+        "enable_code_execution": False,
+    }
+    first = STARAgent(agent_type="first", agent_id="first", **common)
+    second = STARAgent(agent_type="second", agent_id="second", **common)
+
+    first.override_system_prompt_template("first override")
+
+    assert first.system_prompt == "first override"
+    assert second.system_prompt != "first override"
 
 
 def test_default_runtime_parse_response_done_true():
@@ -288,3 +369,68 @@ def test_runtime_registry_select_runtime_classmethod():
     runtime = RuntimeRegistry.select_runtime(model="claude-3", provider="anthropic")
     # Should return AnthropicRuntime for anthropic provider
     assert isinstance(runtime, AnthropicRuntime)
+
+
+def test_native_tools_built_once_and_cached(monkeypatch):
+    """generate_tool_schemas runs once, not on every build_prompt call.
+
+    Re-running inspect.signature on every resource method every turn, under
+    the @observable/tracing call chain, pushes long sessions past the
+    interpreter recursion limit and surfaces as RecursionError at
+    inspect.signature (the librarian console crash). Structural deps don't
+    change per turn → cache after first build.
+    """
+    from types import SimpleNamespace
+
+    import dana.core.tool.tool_schema as tool_schema_mod
+
+    class _Provider:
+        supports_native_tools = True
+
+    class _LLM:
+        provider = _Provider()
+
+    calls = {"n": 0}
+    sentinel = [{"name": "cached_tool"}]
+
+    def _fake_generate(**kwargs):
+        calls["n"] += 1
+        return sentinel
+
+    monkeypatch.setattr(tool_schema_mod, "generate_tool_schemas", _fake_generate)
+
+    runtime = DefaultRuntime(llm=_LLM())
+    agent = SimpleNamespace(_agents=[], _resources=[], _workflows=[])
+
+    runtime._build_native_tools_if_supported(agent)
+    assert calls["n"] == 1
+    assert runtime._native_tools is sentinel
+
+    # Subsequent turns must reuse the cached schemas, not rebuild.
+    runtime._build_native_tools_if_supported(agent)
+    runtime._build_native_tools_if_supported(agent)
+    assert calls["n"] == 1
+    assert runtime._native_tools is sentinel
+
+
+def test_native_tools_not_built_when_provider_unsupported(monkeypatch):
+    """No build and nothing cached when provider lacks native tool support."""
+    from types import SimpleNamespace
+
+    import dana.core.tool.tool_schema as tool_schema_mod
+
+    class _Provider:
+        supports_native_tools = False
+
+    class _LLM:
+        provider = _Provider()
+
+    calls = {"n": 0}
+    monkeypatch.setattr(tool_schema_mod, "generate_tool_schemas", lambda **kw: (calls.__setitem__("n", calls["n"] + 1), [])[1])
+
+    runtime = DefaultRuntime(llm=_LLM())
+    agent = SimpleNamespace(_agents=[], _resources=[], _workflows=[])
+    runtime._build_native_tools_if_supported(agent)
+
+    assert calls["n"] == 0
+    assert runtime._native_tools is None

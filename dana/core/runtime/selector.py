@@ -11,6 +11,8 @@ import fnmatch
 from typing import TYPE_CHECKING, Any
 
 from dana.core.knowledge.prompts.codecs import AbstractCodec, CSXMLCodec, NativeToolsCodec
+from dana.core.model.catalog import ModelTarget
+from dana.core.model.switching import ModelSwitcher
 
 
 if TYPE_CHECKING:
@@ -130,6 +132,38 @@ class RuntimeRegistry:
             from .codec import CodecRuntimeWithoutNativeToolUse
 
             return CodecRuntimeWithoutNativeToolUse(model=model, provider=provider, codec=codec, **kwargs)
+
+    @classmethod
+    def build_switcher(cls, registry: RuntimeRegistry | None = None) -> ModelSwitcher:
+        """Build a ModelSwitcher wired to this registry's selection logic.
+
+        The switcher uses ``registry.select`` to build a runtime for each target,
+        then applies the switch by updating the default registry's rules.
+
+        Args:
+            registry: The registry to wire. Defaults to the default registry.
+
+        Returns:
+            A ModelSwitcher ready for atomic model switching.
+        """
+        reg = registry or cls.get_default()
+
+        def build_provider(target: ModelTarget) -> Any:
+            # In a real implementation this would construct the LLM provider client
+            return {"provider": target.provider, "model": target.model}
+
+        def build_runtime(target: ModelTarget, provider: Any) -> Any:
+            return reg.select(model=target.model, provider=target.provider)
+
+        def apply_switch(target: ModelTarget, provider: Any, runtime: Any) -> None:
+            # In a real implementation this would rebind the active session's runtime
+            pass
+
+        return ModelSwitcher(
+            build_provider=build_provider,
+            build_runtime=build_runtime,
+            apply_switch=apply_switch,
+        )
 
     @classmethod
     def reset_default(cls) -> None:

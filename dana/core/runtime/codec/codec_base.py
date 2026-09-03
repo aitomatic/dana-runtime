@@ -43,7 +43,8 @@ class CodecRuntimeBase(AgentRuntime):
             model=model, temperature=temperature, max_tokens=max_tokens, llm=llm, provider=provider, use_native_tools=use_native_tools
         )
         self._codec = codec
-        self._prompt_api = None
+        self._prompt_api: LocalPromptAPI | None = None
+        self._prompt_apis: dict[int, LocalPromptAPI] = {}
         self._last_native_tools_state: bool | None = None  # Track for cache invalidation
         # Codec runtimes don't use json_mode — reconfigure the shared LLMCaller.
         self._llm_caller._json_mode = False
@@ -58,7 +59,7 @@ class CodecRuntimeBase(AgentRuntime):
             identity_fn=self.get_identity,
             template_fn=self.get_system_prompt_template,
             format_tool_fn=self.format_tool_for_prompt,
-            system_prompt_fn=lambda: self._build_system_prompt(self._agent),
+            system_prompt_fn=self._build_system_prompt,
             context_position="append",
             skip_retrieved_context=True,
         )
@@ -90,17 +91,33 @@ class CodecRuntimeBase(AgentRuntime):
         ...
 
     def _get_prompt_api(self, agent: STARAgent) -> LocalPromptAPI:
-        if self._prompt_api is None:
-            self._prompt_api = LocalPromptAPI(agent=agent, codec=self._codec, provider=self._provider)
+        agent_key = id(agent)
+        if agent_key not in self._prompt_apis:
+            self._prompt_apis[agent_key] = LocalPromptAPI(
+                agent=agent,
+                codec=self._codec,
+                provider=self._provider,
+                repository_factory=agent._repository_factory,
+            )
+        self._prompt_api = self._prompt_apis[agent_key]
         return self._prompt_api
 
     def _build_system_prompt(self, agent: STARAgent) -> str:
         prompt_api = self._get_prompt_api(agent)
         return prompt_api.system_prompt
 
+    def system_prompt(self, agent: STARAgent) -> str:
+        """Return the same codec prompt used by ``build_prompt``."""
+        return self._build_system_prompt(agent)
+
     def invalidate_system_prompt_cache(self) -> None:
-        if self._prompt_api is not None:
-            self._prompt_api._system_prompt = None
+        for prompt_api in self._prompt_apis.values():
+            prompt_api._system_prompt = None
+
+    def override_system_prompt_template(self, agent: STARAgent, template: str, *, persist: bool = False) -> None:
+        """Replace the codec runtime's full system prompt template."""
+        super().override_system_prompt_template(agent, template, persist=False)
+        self._get_prompt_api(agent).override_system_prompt_template(template, persist=persist)
 
     def call_llm(
         self,

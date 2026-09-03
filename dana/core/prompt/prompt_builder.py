@@ -58,7 +58,7 @@ class PromptBuilder:
         identity_fn: Callable[[Any], str],
         template_fn: Callable[[bool], str],
         format_tool_fn: Callable[[Any], str],
-        system_prompt_fn: Callable[[], str] | None = None,
+        system_prompt_fn: Callable[[Any], str] | None = None,
         context_position: str = "prepend",
         skip_retrieved_context: bool = False,
     ) -> None:
@@ -99,7 +99,7 @@ class PromptBuilder:
 
         # Build system prompt — use override fn if provided (codec path)
         if self._system_prompt_fn is not None:
-            system_prompt = self._system_prompt_fn()
+            system_prompt = self._system_prompt_fn(agent)
         else:
             system_prompt = self._build_system_prompt(agent, native_tools)
 
@@ -146,7 +146,8 @@ class PromptBuilder:
 
     def _build_system_prompt(self, agent: Any, native_tools: Any) -> str:
         identity = self._identity_fn(agent)
-        template = self._template_fn(bool(native_tools))
+        template_override = getattr(agent, "_system_prompt_template_override", None)
+        template = template_override if template_override is not None else self._template_fn(bool(native_tools))
 
         values: dict[str, str] = {"identity": identity}
         values["resource_context"] = self._build_resource_context(agent)

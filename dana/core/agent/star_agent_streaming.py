@@ -1,10 +1,11 @@
 """
 STARAgentStreamingMixin — streaming extensions for STARAgent.
 
-Provides aquery_stream(), _run_aquery_stream(), and _think_stream().
-Mixed into STARAgent so all methods retain self access.
+Provides aquery_stream(), _run_aquery_stream(), _think_stream(), and
+aquery_text_stream(). Mixed into STARAgent so all methods retain self access.
 """
 
+import asyncio
 from collections.abc import AsyncIterator
 
 import structlog
@@ -159,6 +160,62 @@ class STARAgentStreamingMixin:
             output_state,
         )
         result_holder["trace_thoughts"] = trace_result
+
+    async def aquery_text_stream(
+        self,
+        *,
+        message: str,
+        cancel_event: asyncio.Event,
+        result_holder: dict | None = None,
+    ) -> AsyncIterator[str]:
+        """Stream text-only response chunks for a D1 text turn.
+
+        Unlike ``_think_stream``, this does NOT buffer text or emit THINKING
+        events. Text deltas are yielded immediately as they arrive. Tool calls
+        are not handled (D1 is text-only). No reflection, timeline compression,
+        or other post-processing runs — this is a pure text stream.
+
+        The caller (e.g. :class:`~dana.core.session.agent_session.AgentSession`)
+        is responsible for adding the user message to the timeline BEFORE calling
+        this method, so ``build_prompt`` includes it.
+
+        After the generator is exhausted, ``result_holder`` (if provided) is
+        populated with::
+
+            {"full_text": str, "protected_payload": bytes | None, "finish_reason": str | None}
+
+        Args:
+            message: The user message text (already added to the timeline).
+            cancel_event: Set by the caller to request cancellation; checked
+                between chunks and raises :class:`asyncio.CancelledError`.
+            result_holder: Optional mutable dict populated with the final result.
+
+        Yields:
+            str: Text response chunks (immediate, not buffered).
+        """
+        llm_messages = self._runtime.build_prompt(self, self._timeline)
+
+        if hasattr(self._runtime, "_llm_caller"):
+            stream_src = self._runtime._llm_caller.call_llm_stream(llm_messages)
+        else:
+            stream_src = self.llm_client.stream(
+                llm_messages,
+                agent_id=self.object_id,
+                agent_type=self.agent_type,
+            )
+
+        full_text_parts: list[str] = []
+        async for chunk in stream_src:
+            if cancel_event.is_set():
+                raise asyncio.CancelledError
+            if chunk.type == "text_delta" and chunk.content:
+                full_text_parts.append(chunk.content)
+                yield chunk.content
+
+        if result_holder is not None:
+            result_holder["full_text"] = "".join(full_text_parts)
+            result_holder["protected_payload"] = None
+            result_holder["finish_reason"] = "stop"
 
     async def aquery_stream(self, **kwargs) -> AsyncIterator[StreamEvent]:
         """Streaming version of aquery with session management.

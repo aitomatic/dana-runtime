@@ -1,5 +1,9 @@
 """Test that autonomy instructions are properly placed in the system prompt template."""
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+from unittest.mock import Mock
+
 from dana.core.agent.star_agent import STARAgent
 from dana.core.knowledge.prompts.codecs import CSXMLCodec, KLXMLCodec
 from dana.core.prompt.prompt_api import TEMPLATE_SYSTEM_PROMPT
@@ -77,9 +81,137 @@ class TestAgentSystemPromptIncludesAutonomy:
         agent = TestAgent()
         system_prompt = agent.system_prompt
 
-        # Check autonomy section is present (DefaultRuntime format)
-        assert "## Output Format" in system_prompt or '"output_format"' in system_prompt
-        assert '"done"' in system_prompt
+        assert "<autonomy>" in system_prompt
+        assert "<output_format>" in system_prompt
+
+    def test_codec_runtime_full_prompt_override_refreshes_actual_llm_prompt(self):
+        agent = STARAgent(
+            agent_type="custom",
+            agent_id="custom-prompt-override",
+            auto_register=False,
+            enable_assistant=False,
+            enable_web_search=False,
+            enable_skills=False,
+            enable_code_execution=False,
+        )
+        runtime = agent._runtime
+        prompt_api = runtime._get_prompt_api(agent)
+        prompt_api._store = Mock()
+
+        assert prompt_api._repository_factory is agent._repository_factory
+
+        agent.override_system_prompt_template("first prompt")
+        assert agent.system_prompt == "first prompt"
+
+        agent.override_system_prompt_template("second prompt")
+        runtime._build_native_tools_if_supported = Mock()
+        runtime._get_runtime_context = Mock(return_value={})
+        messages = runtime.build_prompt(agent, agent._timeline)
+
+        assert agent.system_prompt == "second prompt"
+        assert messages[0].content == "second prompt"
+        prompt_api._store.get_active.assert_not_called()
+        prompt_api._store.create_snapshot.assert_not_called()
+
+    def test_shared_codec_runtime_keeps_overrides_agent_scoped(self):
+        first = STARAgent(
+            agent_type="first",
+            agent_id="first-codec",
+            auto_register=False,
+            enable_assistant=False,
+            enable_web_search=False,
+            enable_skills=False,
+            enable_code_execution=False,
+        )
+        runtime = first._runtime
+        second = STARAgent(
+            agent_type="second",
+            agent_id="second-codec",
+            runtime=runtime,
+            auto_register=False,
+            enable_assistant=False,
+            enable_web_search=False,
+            enable_skills=False,
+            enable_code_execution=False,
+        )
+        first_store = Mock()
+        first_store.get_active.return_value = None
+        second_store = Mock()
+        second_store.get_active.return_value = None
+        runtime._get_prompt_api(first)._store = first_store
+        runtime._get_prompt_api(second)._store = second_store
+
+        first.override_system_prompt_template("first codec override")
+
+        assert first.system_prompt == "first codec override"
+        assert second.system_prompt != "first codec override"
+
+    def test_shared_codec_runtime_builds_concurrent_prompts_for_current_agent(self):
+        first = STARAgent(
+            agent_type="first",
+            agent_id="first-concurrent-codec",
+            auto_register=False,
+            enable_assistant=False,
+            enable_web_search=False,
+            enable_skills=False,
+            enable_code_execution=False,
+        )
+        runtime = first._runtime
+        second = STARAgent(
+            agent_type="second",
+            agent_id="second-concurrent-codec",
+            runtime=runtime,
+            auto_register=False,
+            enable_assistant=False,
+            enable_web_search=False,
+            enable_skills=False,
+            enable_code_execution=False,
+        )
+        runtime._get_prompt_api(first)._store = Mock()
+        runtime._get_prompt_api(second)._store = Mock()
+        first.override_system_prompt_template("first concurrent override")
+        second.override_system_prompt_template("second concurrent override")
+
+        barrier = Barrier(2)
+
+        def wait_for_both_agents() -> dict:
+            barrier.wait()
+            return {}
+
+        runtime._build_native_tools_if_supported = Mock()
+        runtime._build_tool_name_registry = Mock()
+        runtime._get_runtime_context = wait_for_both_agents
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first_future = executor.submit(runtime.build_prompt, first, first._timeline)
+            second_future = executor.submit(runtime.build_prompt, second, second._timeline)
+
+        assert first_future.result()[0].content == "first concurrent override"
+        assert second_future.result()[0].content == "second concurrent override"
+
+    def test_codec_getter_matches_persisted_prompt_used_for_llm_messages(self):
+        agent = STARAgent(
+            agent_type="persisted",
+            agent_id="persisted-codec",
+            auto_register=False,
+            enable_assistant=False,
+            enable_web_search=False,
+            enable_skills=False,
+            enable_code_execution=False,
+        )
+        runtime = agent._runtime
+        prompt_api = runtime._get_prompt_api(agent)
+        snapshot = Mock()
+        snapshot.content = "persisted codec prompt"
+        prompt_api._store = Mock()
+        prompt_api._store.get_active.return_value = snapshot
+        runtime._build_native_tools_if_supported = Mock()
+        runtime._get_runtime_context = Mock(return_value={})
+
+        messages = runtime.build_prompt(agent, agent._timeline)
+
+        assert agent.system_prompt == "persisted codec prompt"
+        assert messages[0].content == "persisted codec prompt"
 
     def test_star_agent_subclass_inherits_autonomy(self):
         """Verify subclasses of STARAgent inherit autonomy instructions."""
@@ -100,6 +232,5 @@ class TestAgentSystemPromptIncludesAutonomy:
         agent = CustomAgent()
         system_prompt = agent.system_prompt
 
-        # Subclass should also have autonomy (DefaultRuntime format)
-        assert "## Output Format" in system_prompt or '"output_format"' in system_prompt
-        assert '"done"' in system_prompt
+        assert "<autonomy>" in system_prompt
+        assert "<output_format>" in system_prompt

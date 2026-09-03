@@ -7,16 +7,23 @@ without implementation details like LLM integration or rich state management.
 
 from abc import abstractmethod
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 import logging
 import threading
+from typing import TYPE_CHECKING, Any
 
 from dana.common.observable import observable
 from dana.common.protocols import DictParams, STARAgentProtocol
 from dana.common.protocols.types import LearningPhase
 from dana.core.agent.base_agent import BaseAgent
+from dana.core.ext.event_bus import Event, EventBus
+from dana.core.ext.events import ACT_END, REFLECT_END, SEE_END, THINK_END
 from dana.core.llm.llm_caller import is_transient_llm_error
 from dana.core.runtime.protocols import StreamEvent, StreamEventType
+
+
+if TYPE_CHECKING:
+    from dana.core.ext.extensions import ExtensionManager
 
 
 logger = logging.getLogger(__name__)
@@ -165,6 +172,46 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
         return trace.get(EXIT_STAR_LOOP_FLAG, False) if trace else True
 
     # ============================================================================
+    # PHASE EVENT EMIT (M2 — STAR loop wire EventBus)
+    # ============================================================================
+
+    def _emit_phase(self, event_type: str, result: DictParams) -> DictParams:
+        """Emit a phase_end event (intercept-capable); apply modify/block. M2.
+
+        - handler ``{"modify": new}``      -> result = new
+        - handler ``{"block": True, ...}`` -> set ``EXIT_STAR_LOOP_FLAG`` at the
+          result's top level so the orchestrator exits before the next phase
+        - handler raise / None             -> pass-through (bus S1 catches raises)
+
+        Returns the (possibly modified) result. Never raises. Does NOT call
+        ``broadcast`` — phase bodies + ``star_agent`` think/act_async still
+        broadcast for instrumentation; this method only adds the 2-way emit.
+        """
+        handler = self.event_bus.emit_sync(Event(event_type, {"result": result}))
+        return self._apply_phase_handler(handler, result)
+
+    async def _emit_phase_async(self, event_type: str, result: DictParams) -> DictParams:
+        """Async counterpart of ``_emit_phase`` (awaits handlers on the same loop)."""
+        handler = await self.event_bus.emit(Event(event_type, {"result": result}))
+        return self._apply_phase_handler(handler, result)
+
+    @staticmethod
+    def _apply_phase_handler(handler: DictParams | None, result: DictParams) -> DictParams:
+        """Shared block/modify interpretation for sync + async emit helpers."""
+        if not isinstance(handler, dict):
+            return result
+        if handler.get("block") is True:
+            out = dict(result) if isinstance(result, dict) else {"payload": result}
+            out[EXIT_STAR_LOOP_FLAG] = True
+            return out
+        modified = handler.get("modify")
+        if isinstance(modified, dict):
+            return modified
+        if modified is not None:
+            logger.warning("phase handler returned non-dict modify; ignored")
+        return result
+
+    # ============================================================================
     # STAR LOOP ORCHESTRATION
     # ============================================================================
 
@@ -188,11 +235,25 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
                 # was exhausted) before we mark the whole session as failed.
                 attempt = 0
                 star_failed = False
+                phase_blocked = False
                 while True:
                     try:
                         trace_percepts = self._see(trace_inputs.get("trace_inputs", {}))
+                        trace_percepts = self._emit_phase(SEE_END, trace_percepts)
+                        if trace_percepts.get(EXIT_STAR_LOOP_FLAG) is True:
+                            trace_outputs = trace_percepts
+                            phase_blocked = True
+                            break
                         trace_thoughts = self._think(trace_percepts.get("trace_percepts", {}))
+                        trace_thoughts = self._emit_phase(THINK_END, trace_thoughts)
+                        if trace_thoughts.get(EXIT_STAR_LOOP_FLAG) is True:
+                            trace_outputs = trace_thoughts
+                            phase_blocked = True
+                            break
                         trace_outputs = self._act(trace_thoughts.get("trace_thoughts", {}))
+                        trace_outputs = self._emit_phase(ACT_END, trace_outputs)
+                        if trace_outputs.get(EXIT_STAR_LOOP_FLAG) is True:
+                            phase_blocked = True
                         break
                     except Exception as e:
                         if is_transient_llm_error(e) and attempt < _STAR_TRANSIENT_RETRIES:
@@ -220,7 +281,7 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
                         star_failed = True
                         break
 
-                if star_failed:
+                if star_failed or phase_blocked:
                     break
 
                 # Trigger acquisitive learning asynchronously at end of each STAR loop
@@ -231,7 +292,8 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
                     # Sync path: use thread (no event loop available)
                     def run_reflect(acq_input):
                         try:
-                            self._reflect(acq_input)
+                            learning = self._reflect(acq_input)
+                            self._emit_phase(REFLECT_END, learning)
                         except Exception as reflect_err:
                             logger.error("Reflection failed: %s", reflect_err, exc_info=True)
 
@@ -268,14 +330,28 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
                 # See _do_query for rationale.
                 attempt = 0
                 star_failed = False
+                phase_blocked = False
                 while True:
                     try:
                         # _see is sync (no async ops needed)
                         trace_percepts = self._see(trace_inputs.get("trace_inputs", {}))
+                        trace_percepts = await self._emit_phase_async(SEE_END, trace_percepts)
+                        if trace_percepts.get(EXIT_STAR_LOOP_FLAG) is True:
+                            trace_outputs = trace_percepts
+                            phase_blocked = True
+                            break
                         # _think_async uses native async LLM call
                         trace_thoughts = await self._think_async(trace_percepts.get("trace_percepts", {}))
+                        trace_thoughts = await self._emit_phase_async(THINK_END, trace_thoughts)
+                        if trace_thoughts.get(EXIT_STAR_LOOP_FLAG) is True:
+                            trace_outputs = trace_thoughts
+                            phase_blocked = True
+                            break
                         # _act_async uses native async tool execution
                         trace_outputs = await self._act_async(trace_thoughts.get("trace_thoughts", {}))
+                        trace_outputs = await self._emit_phase_async(ACT_END, trace_outputs)
+                        if trace_outputs.get(EXIT_STAR_LOOP_FLAG) is True:
+                            phase_blocked = True
                         break
                     except Exception as e:
                         if is_transient_llm_error(e) and attempt < _STAR_TRANSIENT_RETRIES:
@@ -303,7 +379,7 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
                         star_failed = True
                         break
 
-                if star_failed:
+                if star_failed or phase_blocked:
                     break
 
                 # Trigger acquisitive learning asynchronously at end of each STAR loop
@@ -314,7 +390,8 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
                     # Async path: use asyncio.create_task (proper async, not threads)
                     async def _async_reflect(acq_input):
                         try:
-                            self._reflect(acq_input)
+                            learning = self._reflect(acq_input)
+                            await self._emit_phase_async(REFLECT_END, learning)
                         except Exception as reflect_err:
                             logger.error("Async reflection failed: %s", reflect_err, exc_info=True)
 
@@ -364,6 +441,60 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
             )
             return
         yield StreamEvent(event_type=StreamEventType.DONE, data=None, iteration=0)
+
+    # ============================================================================
+    # EXTENSIBILITY (S1)
+    # ============================================================================
+
+    @property
+    def event_bus(self) -> EventBus:
+        """Per-agent intercept-capable event bus.
+
+        Lazily created on first access so the mount point adds zero cost to
+        agent construction and no ``__init__`` coupling. Each agent owns its own
+        bus (correct session scope; never a global).
+        """
+        bus = self.__dict__.get("_event_bus")
+        if not isinstance(bus, EventBus):
+            bus = EventBus()
+            self.__dict__["_event_bus"] = bus
+        return bus
+
+    def on(self, event_type: str, handler: Callable[..., Any]) -> Callable[[], None]:
+        """Subscribe ``handler`` to ``event_type`` on this agent's bus. M4.
+
+        Thin alias for ``self.event_bus.subscribe(event_type, handler)``, exposed
+        as the extension-facing registration API (``setup(agent): agent.on(...)``).
+        Returns the unsubscribe callable.
+        """
+        return self.event_bus.subscribe(event_type, handler)
+
+    @property
+    def extensions(self) -> "ExtensionManager":
+        """Per-agent extension manager (lazy, ``self.__dict__`` storage). M4."""
+        from dana.core.ext.extensions import ExtensionManager
+
+        mgr = self.__dict__.get("_extensions")
+        if not isinstance(mgr, ExtensionManager):
+            mgr = ExtensionManager(self)
+            self.__dict__["_extensions"] = mgr
+        return mgr
+
+    def load_extensions(self) -> Any:
+        """Discover + load drop-in extensions (global always, project if trusted). M4.
+
+        NOT auto-called at construction (hosts call this after creating an agent).
+        Returns a ``LoadReport``.
+        """
+        return self.extensions.load_all()
+
+    def reload_extensions(self) -> Any:
+        """Hot-reload extensions: unsubscribe old, re-discover, re-load. M4.
+
+        MUST be called at idle (not concurrent with a turn). Emits
+        ``session_reload``. Returns a ``LoadReport``.
+        """
+        return self.extensions.reload_all()
 
     # ============================================================================
     # UTILITIES

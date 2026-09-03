@@ -96,7 +96,8 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                 response parsing, and tool execution. Defaults to DefaultRuntime.
             codec: Codec class for tool call encoding/decoding (default: NativeToolsCodec).
             ltmemory_path: Optional path for long-term memory storage (enables cross-session learning)
-            enable_skills: Whether to enable Claude Code skills resource discovery
+            enable_skills: Whether to enable Claude Code skills resource discovery (default True,
+                gated at runtime by DANA_CLAUDE_SKILLS=1 — without the env var no scan happens)
             skills_output_dir: Directory to use for skill output files
             identity_override: Optional identity string that overrides the class docstring.
                 Used by fork subagents to inject skill content as their identity.
@@ -143,6 +144,7 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         self._repository_factory = repository_factory
         self._codec = codec
         self._identity_override = identity_override
+        self._system_prompt_template_override: str | None = None
 
         if runtime is None:
             from dana.core.runtime import RuntimeRegistry
@@ -238,10 +240,14 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
 
         if enable_skills:
             from dana.core.skills import ClaudeCodeSkills
+            from dana.core.skills.claude_code_skills import claude_skills_enabled
 
-            skills = ClaudeCodeSkills(output_dir=skills_output_dir, notifier=self)
-            if skills.enabled:
-                self.with_resources(skills)
+            # D8: skills discovery is opt-in — default agent construction never scans
+            # ~/.claude/skills unless DANA_CLAUDE_SKILLS=1 is set.
+            if claude_skills_enabled():
+                skills = ClaudeCodeSkills(output_dir=skills_output_dir, notifier=self)
+                if skills.enabled:
+                    self.with_resources(skills)
 
         if enable_code_execution:
             from dana.common.resource import CodeExecutionResource
@@ -528,6 +534,17 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             return self._runtime.system_prompt(self)
         return super().system_prompt
 
+    def override_system_prompt_template(self, template: str, *, persist: bool = False) -> None:
+        """Replace the complete system prompt template used for LLM requests.
+
+        Args:
+            template: Full prompt template. Runtime-supported ``{{variables}}``
+                continue to render normally.
+            persist: Save the template when the runtime has a prompt repository.
+                Defaults to an in-memory override scoped to this agent instance.
+        """
+        self._runtime.override_system_prompt_template(self, template, persist=persist)
+
     # ============================================================================
     # PUBLIC API - STATE & CONTEXT MANAGEMENT
     # ============================================================================
@@ -630,36 +647,6 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             session_id=session_id,
             input_handler=input_handler,
         )
-
-    def __getattr__(self, name: str):
-        """
-        Magic function: Convert unknown method calls to natural language and call converse.
-
-        Examples:
-            agent.hi_how_are_you() -> converse("hi how are you")
-            agent.research_coffee_companies() -> converse("research coffee companies")
-            agent.find_exporters_in_dak_lak() -> converse("find exporters in dak lak")
-        """
-
-        def magic_method(*args, **kwargs):
-            # Convert method name to natural language
-            # Replace underscores with spaces and clean up
-            natural_language = name.replace("_", " ").strip()
-
-            # Add any positional arguments as additional context
-            if args:
-                args_str = " ".join(str(arg) for arg in args)
-                natural_language += f" {args_str}"
-
-            # Add any keyword arguments as additional context
-            if kwargs:
-                kwargs_str = " ".join(f"{k}={v}" for k, v in kwargs.items())
-                natural_language += f" {kwargs_str}"
-
-            # Call converse with the natural language message (starts interactive conversation)
-            return self.converse(initial_message=natural_language)
-
-        return magic_method
 
     # ============================================================================
     # TIMELINE COMPRESSION

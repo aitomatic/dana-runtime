@@ -494,11 +494,11 @@ Resource Execution
 ## Streaming Architecture
 
 ```
-Agent.stream_response(messages)
+Agent.aquery_stream(message=…)
     │
-    ├─ Runtime.stream_complete(messages, tools)
+    ├─ STAR loop streaming (_see/_think/_act, StreamEvent per phase)
     │  │
-    │  └─ Provider-specific streaming
+    │  └─ Runtime LLM streaming (llm_caller.call_llm_stream)
     │     (Server-Sent Events or chunked)
     │
     ├─ Token-by-token yield
@@ -563,6 +563,134 @@ Implement provider interface + add to config.json
 - **Environment Secrets**: Never logged, loaded from .env
 - **Tool Filtering**: Only allowed resources accessible
 - **Command Execution**: Bash sandboxing where possible
+
+## Session Journal Architecture (D1: Durable Dana Conversation)
+
+The Session Journal is the **sole durable authority** for Dana agent
+sessions. Every turn — input, streamed chunks, terminal — is appended as a
+typed, immutable `JournalFact` *before* the model is invoked and *before*
+the response is returned. A host restart that calls `session/load` sees the
+full conversation replayed before the call returns.
+
+```
+┌────────────────────┐ JSON-RPC (stdio) ┌──────────────────────────────┐
+│  Host (ACP client) │ ◀──────────────▶ │  DanaACPAgent                │
+│  - dana-console    │                  │  └─ AgentSession (1 per sess)│
+│  - sessionStorage    │                  │     ├─ STARAgent            │
+└────────────────────┘                  │     ├─ JournalRepository ──┐ │
+        ▲                                │     └─ ProtectedStateCodec│ │
+        │ session_update                 └──────────────────────────┼─┘
+        │ (HostEvent stream)                                       │
+┌───────┴─────────────┐   append/read           ┌──────────────────▼───┐
+│ Conversation View   │ ◀─────────────────────  │  Session Journal     │
+│ Host Event View     │   projectors             │  (SQLite / Postgres) │
+│ Trace View          │                          │  - session_journals  │
+└─────────────────────┘                          │  - session_facts     │
+                                                  │  - projection_checkpts│
+                                                  └──────────────────────┘
+```
+
+### Core components
+
+- **`AgentSession`** (`dana/core/session/agent_session.py`) — the
+  host-neutral orchestrator. Owns one agent, one owner/workspace scope, the
+  session journal identity and version, and the active turn. Serializes
+  mutations: only one active turn per session; a conflicting `prompt`
+  raises `SessionBusy`. All turn lifecycle facts are journaled before,
+  during, and after the model call.
+- **`JournalRepository`** protocol (`dana/core/session/journal/protocol.py`)
+  — the backend-agnostic persistence contract. Two reference
+  implementations:
+  - **`SQLiteJournalRepository`** — on-disk SQLite (WAL mode, foreign keys
+    enforced). Default for local and single-host deployments.
+  - **`PostgresJournalRepository`** — PostgreSQL via asyncpg, JSONB-typed
+    payloads, owner-scoped primary/foreign keys. Recommended for shared and
+    multi-tenant deployments.
+- **`DanaACPAgent`** (`dana/apps/acp/agent.py`) — the ACP protocol façade.
+  Translates `initialize`, `session/new`, `session/load`, `session/resume`,
+  `session/prompt`, and `session/cancel` into `AgentSession` operations and
+  streams `HostEvent`s back as ACP `session_update` notifications.
+
+### Data model
+
+- **`OwnerScope`** (`owner_id` + `workspace`) — the immutable tenant
+  principal. Every journal operation is scoped by it; cross-owner access is
+  impossible at the data layer.
+- **`JournalFact`** — the durable, stored form of a journal fact after
+  persistence assigns identity. Each fact carries a `sequence` (1..N within
+  a session), a typed `FactType`, a `correlation_id` (groups a turn), a
+  `causation_id` (links causes), a JSON-safe `payload`, and an envelope-
+  encrypted `protected_payload` for provider replay material.
+- **`FactType`** (D1 text-only conversation set): `SESSION_CREATED`,
+  `SESSION_LOADED`, `SESSION_RESUMED`, `TURN_STARTED`, `USER_CONTENT_FINAL`,
+  `ASSISTANT_CONTENT_CHUNK`, `ASSISTANT_CONTENT_FINAL`, `TURN_COMPLETED`,
+  `TURN_INTERRUPTED`, `TURN_ERROR`, `TURN_CANCELLED`,
+  `LEGACY_TIMELINE_MIGRATED`.
+- **`ProjectionCheckpoint`** — a named cursor + opaque JSON blob saved by a
+  projection. Stored OUT-OF-BAND of journal facts: writing one never changes
+  a fact and never advances the session version.
+
+### Projections (views)
+
+Projections are pure functions over the fact stream; they never mutate the
+journal and always rebuild deterministically from facts + checkpoint.
+
+- **Conversation View** (`ConversationProjector`) — the user/assistant
+  message list. Excludes partial assistant output from interrupted turns
+  (partial output is retained in the Host Event View); surfaces an
+  interruption observation to the next model turn.
+- **Host Event View** (`HostEventProjector`) — the ACP `session_update`
+  stream, replayed in order on `session/load` so the host UI shows the
+  pre-crash conversation immediately on restart.
+- **Trace View** — reasoning/observability projection (planned beyond D1).
+
+### Optimistic concurrency
+
+`append` declares the `expected_version` it observed; if the durable
+version differs, `JournalConflict` is raised and no facts are persisted.
+The SQLite adapter uses `BEGIN IMMEDIATE`; the Postgres adapter uses the
+equivalent row-level lock. This is the contract that lets multiple
+subprocesses share a journal safely.
+
+### Protected state
+
+Provider Replay State (e.g. OpenAI `encrypted_content`, reasoning items)
+required for continuity is **never** placed in the regular `payload`; it is
+envelope-encrypted (AES-GCM + HKDF + AAD) and carried only in
+`protected_payload`. The encryption key is sourced from
+`DANA_SESSION_STATE_KEY` via `EnvProtectedStateKeyProvider`. A payload-
+sanitization layer rejects secret-bearing keys before persistence.
+
+### Migration and rollback
+
+- **Legacy Timeline → Journal** (`migrate_legacy_timeline`) — imports
+  legacy `TimelineEntry` sessions into the journal. Idempotent via a
+  content-addressed SHA-256 stored on a `LEGACY_TIMELINE_MIGRATED` marker
+  fact. Text-only in D1 (`USER_MESSAGE` and `AGENT_RESPONSE` are converted;
+  thoughts, tools, summaries, and ephemeral context are skipped).
+- **Compatibility projection** (`journal_facts_to_timeline_entries`) —
+  projects journal facts back to the legacy Timeline shape behind the
+  `DANA_SESSION_JOURNAL_AUTHORITY=0` rollback flag, so legacy readers keep
+  working after the journal becomes the sole authority.
+- **Crash recovery** (`recover_interrupted_turns`) — detects started-but-
+  unterminated turns and appends a typed `TURN_INTERRUPTED` fact for each.
+  Idempotent; invoked automatically on every `session/load`.
+
+### Operational health
+
+`dana.core.session.health.check_journal_health(repository, scope)` returns a
+**redacted** aggregate report — only counts and booleans, never owner_ids,
+session_ids, payloads, or protected payloads. Covers database connectivity,
+session counts by status, interrupted-turn detection, projection lag
+tracking, and legacy migration marker counts. See
+[`docs/acp-configuration.md`](acp-configuration.md#health-checks) for usage.
+
+### Reference
+
+- Design spec: `plans/` (see *Durable Dana Conversation* / *ACP AgentSession*).
+- Storage, migration, rollback, key rotation runbook:
+  [`docs/session-journal-storage.md`](session-journal-storage.md).
+- ACP host configuration: [`docs/acp-configuration.md`](acp-configuration.md).
 
 ---
 

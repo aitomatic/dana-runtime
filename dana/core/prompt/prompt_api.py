@@ -40,6 +40,9 @@ class PromptAPIProtocol(PublicPromptsProtocol, PrivatePromptsProtocol, Persistab
     def available_tools_prompt(self) -> str: ...
 
     @abstractmethod
+    def override_system_prompt_template(self, template: str, *, persist: bool = False) -> None: ...
+
+    @abstractmethod
     def reset(self) -> None: ...
 
     @abstractmethod
@@ -238,8 +241,11 @@ class LocalPromptAPI(PromptAPIProtocol):
         self._resource_prompt_engineers = {}
         self._workflow_prompt_engineers = {}
         self._env = EnvironmentInfo(agent, self.relative_path)
-        self._system_prompt = None
-        self._template = None
+        self._system_prompt: str | None = None
+        self._template: str | None = None
+        self._system_prompt_template_override: str | None = None
+        self._persist_system_prompt_override = False
+        self._system_prompt_override_persisted = False
 
     def _instantiate_prompt_engineer(
         self, prompt_engineer_cls: type[BasePromptEngineer], component, relative_path: str, **kwargs
@@ -281,10 +287,14 @@ class LocalPromptAPI(PromptAPIProtocol):
     @property
     def system_prompt(self) -> str:
         if self._system_prompt is None:
-            _template = self.load()
-            if _template is None or self._force_generate:
+            override = self._system_prompt_template_override
+            has_override = override is not None
+            _template = override if override is not None else self.load()
+            if has_override or _template is None or self._force_generate:
                 # FILL STATIC VARIABLES BEFORE PERSIST
-                _template = self._template_system_prompt
+                if not has_override:
+                    _template = self._template_system_prompt
+                assert _template is not None
                 for variable in self.static_prompt_variables:
                     if f"{{{{{variable}}}}}" in _template:
                         attr = getattr(self, variable)
@@ -294,9 +304,30 @@ class LocalPromptAPI(PromptAPIProtocol):
                             value = attr
                         _template = _template.replace(f"{{{{{variable}}}}}", str(value))
                 self._template = _template
-                self.persist()
+                if not has_override or (self._persist_system_prompt_override and not self._system_prompt_override_persisted):
+                    self.persist()
+                    if has_override:
+                        self._system_prompt_override_persisted = True
+            assert _template is not None
             self._system_prompt = self.render(_template)
         return self._system_prompt
+
+    def override_system_prompt_template(self, template: str, *, persist: bool = False) -> None:
+        """Replace the complete system prompt template for this prompt API.
+
+        Args:
+            template: Full system prompt template. Supported ``{{variables}}`` are
+                rendered through the normal prompt API path.
+            persist: Save the override in the configured prompt repository. The
+                default keeps the override in memory for the current agent only.
+        """
+        self._system_prompt_template_override = template
+        self._persist_system_prompt_override = persist
+        self._system_prompt_override_persisted = False
+        self._template = None
+        self._system_prompt = None
+        if persist:
+            _ = self.system_prompt
 
     def render(self, template: str) -> str:
         variables = re.findall(r"\{\{(.*?)\}\}", template)

@@ -229,3 +229,39 @@ class TestLocalPromptAPIFactoryUsage:
             assert api._store.storage_config == config
         finally:
             shutil.rmtree(temp_dir)
+
+
+class TestLocalPromptAPITemplateOverride:
+    """Public full-template override behavior."""
+
+    @staticmethod
+    def _make_api() -> tuple[LocalPromptAPI, Mock]:
+        repository = Mock(spec=LocalPromptRepository)
+        factory = Mock(spec=RepositoryFactory)
+        factory.create.return_value = repository
+        api = LocalPromptAPI(agent=MockAgent(), codec=CSXMLCodec, repository_factory=factory)
+        return api, repository
+
+    def test_ephemeral_override_bypasses_repository_and_survives_cache_invalidation(self):
+        api, repository = self._make_api()
+
+        api.override_system_prompt_template("ephemeral prompt", persist=False)
+
+        assert api.system_prompt == "ephemeral prompt"
+        repository.get_active.assert_not_called()
+        repository.create_snapshot.assert_not_called()
+
+        api._system_prompt = None
+        assert api.system_prompt == "ephemeral prompt"
+        repository.get_active.assert_not_called()
+        repository.create_snapshot.assert_not_called()
+
+    def test_persistent_override_creates_and_activates_snapshot(self):
+        api, repository = self._make_api()
+        repository.create_snapshot.return_value.version = "v1"
+
+        api.override_system_prompt_template("persistent prompt", persist=True)
+
+        repository.create_snapshot.assert_called_once()
+        repository.set_active.assert_called_once_with("v1")
+        assert api.system_prompt == "persistent prompt"

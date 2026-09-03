@@ -114,6 +114,10 @@ class AgentProtocol(WARProtocol):
 class STARAgentProtocol(AgentProtocol):
     """Protocol for See-Think-Act-Reflect agents."""
 
+    def override_system_prompt_template(self, template: str, *, persist: bool = False) -> None:
+        """Replace the complete system prompt template used by the agent."""
+        ...
+
     def _see(self, trace_inputs: DictParams) -> DictParams:
         """See the inputs and produce percepts.
         Args:
