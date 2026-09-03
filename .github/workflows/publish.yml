@@ -1,0 +1,96 @@
+# Publish dana-agent to PyPI on v* tags.
+#
+# Trigger chain: merge develop → master makes release-on-merge-to-master.yml
+# push a `v{version}` tag (version read from pyproject.toml); that tag
+# triggers this workflow, which builds sdist+wheel, verifies the tag matches
+# the pyproject version, and uploads via PyPI Trusted Publishing (OIDC) —
+# no API tokens stored as secrets.
+#
+# ONE-TIME MAINTAINER STEP (required before the first real upload):
+# On pypi.org, add a Trusted Publisher for this repo — project "dana-agent",
+# owner aitomatic, repository dana-runtime, workflow publish.yml,
+# environment "pypi". Repeat on test.pypi.org with environment "testpypi"
+# if the dry-run target is used. Until then the upload step fails with a
+# trusted-publisher error (builds and checks still pass).
+#
+# Manual dry-runs: Actions → Publish to PyPI → Run workflow.
+#   - dry_run=true (default): build + twine check only, no upload.
+#   - testpypi=true: upload to test.pypi.org instead of pypi.org.
+
+name: Publish to PyPI
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      testpypi:
+        description: "Upload to test.pypi.org instead of pypi.org"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Build and check artifacts without uploading"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Tag push → production. Manual run → testpypi environment (only used
+    # when actually uploading; dry runs skip the upload step).
+    environment: ${{ github.event_name == 'push' && 'pypi' || 'testpypi' }}
+    permissions:
+      id-token: write # PyPI Trusted Publishing (OIDC)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Read version from pyproject.toml
+        id: version
+        run: |
+          VERSION=$(grep -m1 '^version' pyproject.toml | sed 's/.*"\(.*\)"/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+      - name: Verify tag matches pyproject version
+        if: github.event_name == 'push'
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          EXPECTED="v${{ steps.version.outputs.version }}"
+          if [ "$TAG" != "$EXPECTED" ]; then
+            echo "Tag $TAG does not match pyproject version $EXPECTED"
+            exit 1
+          fi
+          echo "Tag $TAG matches pyproject version $EXPECTED"
+
+      - name: Build sdist and wheel
+        run: |
+          rm -rf dist
+          uv build
+          ls -la dist/
+
+      - name: Check metadata (twine check)
+        run: uvx twine check dist/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dana-agent-${{ steps.version.outputs.version }}
+          path: dist/*
+
+      - name: Publish to PyPI
+        if: github.event_name == 'push' || inputs.testpypi
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: "${{ inputs.testpypi && 'https://test.pypi.org/legacy/' || '' }}"
+
+      - name: Publish skipped (dry run)
+        if: github.event_name != 'push' && !inputs.testpypi
+        run: echo 'Dry run — artifacts built and checked, no upload performed'

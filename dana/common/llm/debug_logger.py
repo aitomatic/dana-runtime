@@ -22,20 +22,55 @@ class LLMDebugLogger:
     """Debug logger for LLM requests and responses."""
 
     def __init__(self):
-        """Initialize the debug logger."""
-        self.log_dir = self._resolve_log_dir()
+        """Initialize the debug logger.
 
-        # Create separate log files for different types
-        if self.log_dir is None:
-            self.request_log = None
-            self.response_log = None
-            self.agent_log = None
-            self.error_log = None
-        else:
-            self.request_log = self.log_dir / "llm_requests.jsonl"
-            self.response_log = self.log_dir / "llm_responses.jsonl"
-            self.agent_log = self.log_dir / "agent_interactions.jsonl"
-            self.error_log = self.log_dir / "errors.jsonl"
+        The log directory is resolved lazily on first use so importing Dana
+        never touches ~/.dana (D8: --help/--version must stay side-effect free).
+        """
+        self._resolved = False
+        self._log_dir: Path | None = None
+        self._request_log: Path | None = None
+        self._response_log: Path | None = None
+        self._agent_log: Path | None = None
+        self._error_log: Path | None = None
+
+    def _ensure_resolved(self) -> None:
+        """Resolve the log directory and log file paths on first use."""
+        if self._resolved:
+            return
+        self._resolved = True
+        self._log_dir = self._resolve_log_dir()
+        if self._log_dir is None:
+            return
+        self._request_log = self._log_dir / "llm_requests.jsonl"
+        self._response_log = self._log_dir / "llm_responses.jsonl"
+        self._agent_log = self._log_dir / "agent_interactions.jsonl"
+        self._error_log = self._log_dir / "errors.jsonl"
+
+    @property
+    def log_dir(self) -> Path | None:
+        self._ensure_resolved()
+        return self._log_dir
+
+    @property
+    def request_log(self) -> Path | None:
+        self._ensure_resolved()
+        return self._request_log
+
+    @property
+    def response_log(self) -> Path | None:
+        self._ensure_resolved()
+        return self._response_log
+
+    @property
+    def agent_log(self) -> Path | None:
+        self._ensure_resolved()
+        return self._agent_log
+
+    @property
+    def error_log(self) -> Path | None:
+        self._ensure_resolved()
+        return self._error_log
 
     def log_request(
         self, provider: str, model: str, messages: list[LLMMessage], agent_id: str | None = None, agent_type: str | None = None, **kwargs

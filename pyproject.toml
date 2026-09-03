@@ -6,7 +6,7 @@
 # =============================================================================
 
 [build-system]
-requires = ["setuptools>=42", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 # =============================================================================
@@ -14,11 +14,18 @@ build-backend = "setuptools.build_meta"
 # =============================================================================
 
 [project]
-name = "dana"
+# PyPI distribution name. The import package stays `dana`, but the distribution
+# is `dana-agent`: the `dana` name on PyPI is taken by an unrelated project
+# (the Dana DSL). See dana/apps/cli_flags.py for the matching version lookup.
+name = "dana-agent"
 version = "0.2.0"
 description = "Dana Agent - Domain-Aware Neurosymbolic Agents"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
+# PEP 639 SPDX expression. Note: setuptools rejects license classifiers
+# ("License :: OSI Approved :: MIT License") alongside SPDX license expressions,
+# so the classifier is intentionally omitted — the expression supersedes it.
+license = "MIT"
 authors = [{ name = "Christopher Nguyen", email = "ctn@aitomatic.com" }]
 maintainers = [
     { name = "Vinh Luong", email = "vinh@aitomatic.com" },
@@ -29,7 +36,7 @@ maintainers = [
 ]
 
 # Core runtime dependencies - minimal set for LLM agent functionality
-# Install with: pip install dana
+# Install with: pip install dana-agent
 dependencies = [
     # Core LLM Integration
     "openai>=1.55.3",
@@ -53,6 +60,11 @@ dependencies = [
     "html2text>=2024.2.26",
     "rich>=14.2.0",
     "langfuse>=4.0.1",
+    # Session Journal persistence (Phase 01 — durable conversation)
+    "aiosqlite>=0.20.0",
+    "asyncpg>=0.30.0",
+    "agent-client-protocol>=0.10,<0.11",
+    "mcp>=1.28,<2",
 ]
 
 # Command-line entry points
@@ -62,50 +74,51 @@ dana-agent-repl = "dana.apps.repl.__main__:main"
 dana-code = "dana.apps.code.__main__:main"
 dana-memory = "dana.lib.memory.cli:main"
 dana-init = "dana.apps.init.__main__:main"
+dana-acp = "dana.apps.acp.__main__:main"
 
 # Optional dependency groups
 [project.optional-dependencies]
 
-# Web scraping with full HTML/XML parsing - Install with: pip install dana[web]
+# Web scraping with full HTML/XML parsing - Install with: pip install dana-agent[web]
 web = [
     "lxml>=5.0.0",
     "readability-lxml>=0.8.1",
 ]
 
-# Local LLM providers (Ollama, LlamaStack) - Install with: pip install dana[local]
+# Local LLM providers (Ollama, LlamaStack) - Install with: pip install dana-agent[local]
 # llama-stack requires Python >=3.12; gated by marker so [local] resolves on 3.11 (ollama-only).
 local = [
     "llama-stack>=0.3.0; python_version>='3.12'",
     "ollama>=0.6.0",
 ]
 
-# Data processing and visualization - Install with: pip install dana[data]
+# Data processing and visualization - Install with: pip install dana-agent[data]
 data = [
     "pandas>=2.2.0,<2.3.0",
     "matplotlib>=3.10.6",
 ]
 
-# Semantic memory with vector search - Install with: pip install dana[memory]
+# Semantic memory with vector search - Install with: pip install dana-agent[memory]
 memory = [
     "lancedb>=0.20.0",
     "sentence-transformers>=3.0.0",
 ]
 
-# Knowledge graph support - Install with: pip install dana[knowledge]
+# Knowledge graph support - Install with: pip install dana-agent[knowledge]
 knowledge = [
     "rdflib>=7.5.0",
     "rank-bm25>=0.2.2",
 ]
 
-# Observability and tracing - Install with: pip install dana[observability]
+# Observability and tracing - Install with: pip install dana-agent[observability]
 observability = [
     "langfuse>=3.5.1",
     "langsmith>=0.8,<0.9",  # Alternative tracing backend (exclusive with langfuse)
 ]
 
-# Full installation with all optional features - Install with: pip install dana[full]
+# Full installation with all optional features - Install with: pip install dana-agent[full]
 full = [
-    "dana[web,local,data,memory,knowledge,observability]",
+    "dana-agent[web,local,data,memory,knowledge,observability]",
 ]
 
 dev = [
@@ -246,6 +259,8 @@ known-third-party = [
     "lxml",
     "readability",
     "html2text",
+    "aiosqlite",
+    "asyncpg",
 ]
 section-order = [
     "future",
@@ -280,6 +295,7 @@ disallow_untyped_defs = true
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+asyncio_default_fixture_loop_scope = "function"
 markers = [
     "windows_console: marks tests that require Windows console features (deselect with '-m \"not windows_console\"')",
     "live: marks tests that use live LLM calls (deselect with '-m \"not live\"')",
@@ -289,4 +305,10 @@ markers = [
 [dependency-groups]
 dev = [
     "langfuse>=3.5.1",
+    # Test toolchain must live here (not only in the `dana[dev]` extra) so that
+    # `uv sync` installs it: otherwise `uv run pytest` silently falls through
+    # to a foreign interpreter on PATH (e.g. a pyenv shim) with a stale `mcp`.
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.13.0",
 ]

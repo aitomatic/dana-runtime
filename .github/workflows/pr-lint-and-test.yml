@@ -1,5 +1,11 @@
 # Lint + test on pull requests to protected branches
 # Skips live and deep tests — those require API keys and run locally
+#
+# Two lanes:
+#   * PRs to develop + manual dispatch  → fast lane, no postgres service,
+#     postgres parametrizations deselected (-k "not postgres")
+#   * PRs to master                     → full lane, real postgres:16 service,
+#     session-journal contract exercised against both backends
 
 name: PR Lint & Test
 
@@ -10,6 +16,8 @@ on:
 
 jobs:
   lint-and-test:
+    # Fast lane: everything except PRs into master
+    if: github.event_name != 'pull_request' || github.base_ref != 'master'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -22,6 +30,9 @@ jobs:
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+          # Pin uv to the matrix python — otherwise uv resolves its own
+          # interpreter and the "(3.12)" job name lies about what ran.
+          python-version: ${{ matrix.python-version }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -34,8 +45,59 @@ jobs:
       - name: Lint
         run: uv run ruff check dana/
 
-      - name: Run tests (no live, no deep)
+      - name: Run tests (no live, no deep, no postgres)
         env:
           DANA_MOCK_LLM: "true"
           DANA_USE_REAL_LLM: "false"
+        # No postgres service on this lane — deselect the [postgres]
+        # parametrizations so they skip-by-selection instead of failing
+        # their CI=true-without-DSN contract check.
+        run: uv run pytest tests/ -m "not live and not deep" -k "not postgres" -v --maxfail=10 --tb=short --durations=10
+
+  lint-and-test-postgres:
+    # Full lane: only PRs into master get the real-database contract
+    if: github.event_name == 'pull_request' && github.base_ref == 'master'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Lint
+        run: uv run ruff check dana/
+
+      - name: Run tests (no live, no deep, with postgres contract)
+        env:
+          DANA_MOCK_LLM: "true"
+          DANA_USE_REAL_LLM: "false"
+          DANA_TEST_POSTGRES_DSN: postgresql://postgres:postgres@localhost:5432/postgres
         run: uv run pytest tests/ -m "not live and not deep" -v --maxfail=10 --tb=short --durations=10

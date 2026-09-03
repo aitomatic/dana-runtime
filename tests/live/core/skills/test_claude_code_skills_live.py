@@ -20,6 +20,12 @@ import pytest
 from dana.core.skills import ClaudeCodeSkills
 
 
+@pytest.fixture(autouse=True)
+def _opt_in_to_skills_discovery(monkeypatch: pytest.MonkeyPatch):
+    """D8: discovery is opt-in — live tests exercise real discovery."""
+    monkeypatch.setenv("DANA_CLAUDE_SKILLS", "1")
+
+
 @pytest.mark.live
 class TestClaudeCodeSkillsLive:
     """Live tests that actually invoke Claude Code."""

@@ -20,6 +20,43 @@
 
 ## Development Phases
 
+### Phase 01: Durable Dana Conversation (COMPLETE ✅)
+**Timeframe:** 2026-07 | **Status:** 100% Complete | **Tracked as:** D1
+
+The Session Journal is now the sole durable authority for Dana agent
+sessions. Every turn — input, streamed chunks, terminal — is appended as a
+typed, immutable `JournalFact` before the model is invoked. A host restart
+that calls `session/load` replays the full conversation before returning.
+
+**Objectives:**
+- [x] Session Journal with append-only facts (`OwnerScope`, `FactType`, `JournalFact`)
+- [x] SQLite and PostgreSQL adapters with optimistic concurrency control
+- [x] Conversation and Host Event projectors
+- [x] `AgentSession` with serialized text turns and streaming
+- [x] Crash recovery (Interrupted Turn detection)
+- [x] Legacy Timeline migration (idempotent, content-addressed)
+- [x] ACP stdio agent (`initialize`, `session/new`, `session/load`,
+      `session/prompt`, `session/cancel`)
+- [x] Console restart continuation (sessionStorage session ID)
+- [x] Operational health checks (DB connectivity, projection lag,
+      interrupted-turn detection, migration parity) with full payload
+      redaction
+- [x] `DANA_SESSION_JOURNAL_AUTHORITY` rollback feature flag
+
+**Deliverables:**
+- `dana/core/session/` — journal protocol + SQLite/Postgres adapters,
+  `AgentSession`, projectors, legacy migration, protected-state codec,
+  health checks.
+- `dana/apps/acp/` — ACP stdio agent (DanaACPAgent) and translation.
+- Docs: [`docs/acp-configuration.md`](acp-configuration.md),
+  [`docs/session-journal-storage.md`](session-journal-storage.md),
+  expanded [`docs/system-architecture.md`](system-architecture.md).
+- Full test suite green; parameterized SQLite/Postgres contract suite.
+
+**Status:** ✅ Complete (2026-07-17)
+
+---
+
 ### Phase 1: Foundation (COMPLETE ✅)
 **Timeframe:** Q1 2026 | **Status:** 100% Complete
 
@@ -397,6 +434,7 @@ Q4 (Oct-Dec)  ░░░░░░░░░░░░ PHASE 4 PLANNED 🔜
 | Date | Change | Author |
 |------|--------|--------|
 | 2026-03-21 | Initial roadmap creation | Docs Team |
+| 2026-07-17 | Mark Phase 01 (D1 Durable Dana Conversation) complete | Eng |
 
 ## Review Schedule
 

@@ -277,10 +277,10 @@ class Learner:
 
     def _get_session_id(self) -> str | None:
         """Get session_id from agent."""
-        if hasattr(self._agent, "_session_id") and "magic" not in str(self._agent._session_id):
+        if hasattr(self._agent, "_session_id"):
             return self._agent._session_id
         _event_log = getattr(self._agent, "_event_log", None)
-        if _event_log is None or "magic" in str(_event_log):
+        if _event_log is None:
             return None
         return _event_log._current_session_id
 
@@ -308,10 +308,10 @@ class DefaultLearner(LearnerProtocol):
 
     def _get_session_id(self) -> str | None:
         """Get session_id from agent."""
-        if hasattr(self._agent, "_session_id") and "magic" not in str(self._agent._session_id):
+        if hasattr(self._agent, "_session_id"):
             return self._agent._session_id
         _event_log = getattr(self._agent, "_event_log", None)
-        if _event_log is None or "magic" in str(_event_log):
+        if _event_log is None:
             return None
         return _event_log._current_session_id
 

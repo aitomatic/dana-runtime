@@ -336,8 +336,8 @@ from unittest.mock import AsyncMock
 async def test_agent_processing():
     """Test agent message processing."""
     agent = STARAgent(model="test")
-    result = await agent.process("Hello")
-    assert isinstance(result, str)
+    result = await agent.aquery(message="Hello")
+    assert isinstance(result, dict)
 
 @pytest.mark.asyncio
 async def test_resource_with_mock():
@@ -409,9 +409,9 @@ async def fetch_data(self, url: str) -> str:
         response = await client.get(url)
         return response.text
 
-async def process_messages(self, messages: list[str]):
+async def handle_messages(self, messages: list[str]):
     """Process multiple messages concurrently."""
-    tasks = [self.process(msg) for msg in messages]
+    tasks = [self.handle(msg) for msg in messages]
     return await asyncio.gather(*tasks)
 ```
 

@@ -30,11 +30,11 @@ help: ## Show available commands
 
 test: ## Run all tests (excludes live/deep/windows_console)
 	@echo "🤖 Running dana_agent tests..."
-	DANA_MOCK_LLM=true DANA_USE_REAL_LLM=false $(UV_CMD) run pytest tests/ -v --maxfail=10
+	DANA_MOCK_LLM=true DANA_USE_REAL_LLM=false $(UV_CMD) run pytest tests/ -v --maxfail=10 --continue-on-collection-errors
 
 test-unit: ## Run only unit tests
 	@echo "🧪 Running unit tests..."
-	DANA_MOCK_LLM=true $(UV_CMD) run pytest tests/ -m unit -v
+	DANA_MOCK_LLM=true $(UV_CMD) run pytest tests/ -m unit -v --continue-on-collection-errors
 
 test-integration: ## Run only integration tests
 	@echo "🔗 Running integration tests..."

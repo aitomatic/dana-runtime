@@ -1,9 +1,15 @@
 """
 ClaudeCodeSkills - Execute tasks using Claude Code skills via subprocess.
 
-This resource discovers available skills from ~/.claude/skills/ and exposes
-them to the agent's LLM for informed decision-making. Skills are ontological
-elements that can be composed to create domain-specific agents.
+This resource discovers available skills from a skills directory (default
+~/.claude/skills/) and exposes them to the agent's LLM for informed
+decision-making. Skills are ontological elements that can be composed to
+create domain-specific agents.
+
+Discovery is OPT-IN (default OFF): constructing this resource (or an agent
+that registers it) never touches ~/.claude/skills unless the environment
+variable DANA_CLAUDE_SKILLS=1 is set. Any other value disables discovery
+and logs a warning.
 
 Part of Dana's Cognitive Ontology vision.
 """
@@ -31,14 +37,33 @@ if TYPE_CHECKING:
 logger = get_logger()
 
 
+def claude_skills_enabled() -> bool:
+    """Return True only when DANA_CLAUDE_SKILLS=1 opts in to skills discovery.
+
+    Single framework-wide knob (default OFF). Garbage values disable discovery
+    and log a warning rather than guessing intent.
+    """
+    value = os.environ.get("DANA_CLAUDE_SKILLS", "")
+    if value == "1":
+        return True
+    if value:
+        logger.warning(f"DANA_CLAUDE_SKILLS={value!r} is not '1'; Claude Code skills disabled")
+    return False
+
+
 class ClaudeCodeSkills(BaseResource):
     """Execute tasks using Claude Code skills via subprocess.
 
-    This resource discovers available skills from ~/.claude/skills/ and
-    exposes them to the agent's LLM for informed decision-making.
+    This resource discovers available skills from a skills directory (default
+    ~/.claude/skills/) and exposes them to the agent's LLM for informed
+    decision-making.
+
+    Discovery is OPT-IN (default OFF): ~/.claude/skills is never scanned unless
+    the environment variable DANA_CLAUDE_SKILLS=1 is set. Any other value
+    disables discovery (with a warning).
 
     Skills are ontological elements - composable capabilities that can be:
-    - Discovered automatically (greedy default)
+    - Discovered when opted in via DANA_CLAUDE_SKILLS=1 (all found skills)
     - Filtered for specialized agents
     - Combined to create domain-specific agents
 
@@ -46,13 +71,13 @@ class ClaudeCodeSkills(BaseResource):
     current conversation must be passed explicitly via the context parameter.
 
     Usage:
-        # Greedy default - all discovered skills
+        # Opt-in via env: export DANA_CLAUDE_SKILLS=1 — all discovered skills
         skills = ClaudeCodeSkills()
 
-        # Filtered - document skills only
+        # Filtered - document skills only (still requires DANA_CLAUDE_SKILLS=1)
         skills = ClaudeCodeSkills(skills=["pptx", "docx", "pdf"])
 
-        # Custom skills directory
+        # Custom skills directory (still requires DANA_CLAUDE_SKILLS=1)
         skills = ClaudeCodeSkills(skills_dir="~/my-skills")
     """
 
@@ -71,8 +96,8 @@ class ClaudeCodeSkills(BaseResource):
     ):
         """
         Args:
-            skills: List of skill names to expose. None = all discovered (greedy).
-                Example: ["pptx", "xlsx"] for document specialist agent.
+            skills: List of skill names to expose. None = all discovered (when opted in
+                via DANA_CLAUDE_SKILLS=1). Example: ["pptx", "xlsx"] for document specialist agent.
             skills_dir: Directory to discover skills from (default: ~/.claude/skills)
             output_dir: Default directory for skill output files
             timeout: Execution timeout in seconds (default: 300)
@@ -95,14 +120,21 @@ class ClaudeCodeSkills(BaseResource):
         self._output_dir = output_dir
         self._timeout = timeout
         self._disable_session_persistence = disable_session_persistence
-        self._available = self._check_claude_available()
 
-        if self._available:
-            self._log_thought("init", "Claude Code CLI is available")
+        # Opt-in gate (D8): default OFF — no CLI availability probe and no scan of
+        # skills_dir (default ~/.claude/skills) unless DANA_CLAUDE_SKILLS=1 is set.
+        self._available = False
+        self._all_skills: list[dict] = []
+        if claude_skills_enabled():
+            self._available = self._check_claude_available()
+            if self._available:
+                self._log_thought("init", "Claude Code CLI is available")
+            else:
+                self._log_thought("init", "Claude Code CLI is NOT available - skills will be disabled")
+            self._all_skills = self._discover_skills()
         else:
-            self._log_thought("init", "Claude Code CLI is NOT available - skills will be disabled")
+            self._log_thought("init", "Skills discovery disabled - set DANA_CLAUDE_SKILLS=1 to enable")
 
-        self._all_skills = self._discover_skills()
         self._skills = self._filter_skills(skills) if skills else self._all_skills
 
         skill_names = [s["name"] for s in self._skills]

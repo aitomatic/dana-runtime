@@ -11,6 +11,7 @@ from dana.core.skills import ClaudeCodeSkills
 
 
 def _mock_skills(monkeypatch: pytest.MonkeyPatch, skills: list[dict]):
+    monkeypatch.setenv("DANA_CLAUDE_SKILLS", "1")
     monkeypatch.setattr(ClaudeCodeSkills, "_check_claude_available", lambda self: True)
     monkeypatch.setattr(ClaudeCodeSkills, "_discover_skills", lambda self: skills)
 
@@ -36,9 +37,7 @@ def test_star_agent_custom_output_dir(monkeypatch: pytest.MonkeyPatch):
     with patch("dana.core.agent.star_agent.LLM"):
         agent = STARAgent(agent_type="test", auto_register=False, skills_output_dir="./custom-output")
 
-    skills_resource = next(
-        resource for resource in agent.available_resources if resource.resource_type == "claude-skills"
-    )
+    skills_resource = next(resource for resource in agent.available_resources if resource.resource_type == "claude-skills")
     assert skills_resource._output_dir == "./custom-output"
 
 

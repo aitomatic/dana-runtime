@@ -1,9 +1,22 @@
-"""Dana Code Application - Wires DanaCodingAgent with RichCLIRenderer."""
+"""Dana Code Application.
 
+D7 (Sprint 3): the CLI is a host adapter over the host-neutral
+:class:`~dana.core.session.agent_session.AgentSession` STAR core (Option B —
+in-process, NOT routed through ACP). It constructs an ``AgentSession`` backed
+by the Session Journal, drives async turns via ``session.prompt()``, and
+renders the resulting ``HostEvent`` stream through ``RichCLIRenderer``.
+
+Rollback: ``DANA_CODE_AGENTSESSION_ENABLED=0`` reverts to the legacy
+``DanaCodingAgent`` + renderer-as-Notifiable path, unchanged.
+"""
+
+import asyncio
+import contextlib
 import importlib.metadata
 import logging
 import os
 import sys
+from typing import Any
 
 from dotenv import find_dotenv, load_dotenv
 import structlog
@@ -21,7 +34,6 @@ def _load_env():
 _load_env()
 
 from dana.cli.rich_cli_renderer import RichCLIRenderer
-from dana.core.agent.builtin_agents.dana_coding_agent import DanaCodingAgent
 
 
 try:
@@ -37,8 +49,24 @@ except ImportError:
     Style = None  # type: ignore
 
 
+def _agentsession_enabled() -> bool:
+    """Whether the AgentSession path is active (default on).
+
+    ``DANA_CODE_AGENTSESSION_ENABLED=0`` selects the legacy DanaCodingAgent path.
+    """
+    return os.environ.get("DANA_CODE_AGENTSESSION_ENABLED", "1") != "0"
+
+
 class DanaCodeApp:
-    """Dana Code - Interactive coding agent with rich CLI."""
+    """Dana Code - Interactive coding agent with rich CLI.
+
+    Two execution paths, selected at startup by ``DANA_CODE_AGENTSESSION_ENABLED``:
+
+    - **AgentSession path (default):** the CLI is a host adapter over
+      ``AgentSession``; turns are async and render via the HostEvent bridge.
+    - **Legacy path:** ``DanaCodingAgent`` driven synchronously through the
+      renderer's ``Notifiable`` interface (pre-D7 behavior).
+    """
 
     def __init__(self):
         """Initialize the Dana Code application."""
@@ -53,9 +81,18 @@ class DanaCodeApp:
             wrapper_class=structlog.make_filtering_bound_logger(logging.WARNING),
         )
 
+        # Legacy path state
         self.agent = None
+        # AgentSession path state
+        self.agent_session = None
+        self._repo = None  # keep the journal repository alive for the session
+        # D7.3: permission policy state (AgentSession path)
+        self._grant_store = None
+        self._permission_adapter = None
+        self._grant_db = None
+
         self.renderer = None
-        self.session = None
+        self._prompt_session = None
 
         if PROMPT_TOOLKIT_AVAILABLE and FileHistory and PromptSession:
             from pathlib import Path
@@ -65,13 +102,13 @@ class DanaCodeApp:
             history_file = history_dir / "dana_code_history.txt"
 
             try:
-                self.session = PromptSession(
+                self._prompt_session = PromptSession(
                     history=FileHistory(str(history_file)),
                     style=self._get_style(),
                 )
             except Exception as e:
                 if "NoConsoleScreenBufferError" in str(e) or "console" in str(e).lower():
-                    self.session = None
+                    self._prompt_session = None
                 else:
                     raise
 
@@ -85,8 +122,383 @@ class DanaCodeApp:
             )
         return None
 
-    def _initialize_agent(self):
-        """Initialize DanaCodingAgent with RichCLIRenderer."""
+    # ------------------------------------------------------------------
+    # Entry point
+    # ------------------------------------------------------------------
+
+    def run(self):
+        """Run the interactive loop.
+
+        Selects the AgentSession path (default) or the legacy DanaCodingAgent
+        path based on ``DANA_CODE_AGENTSESSION_ENABLED``.
+        """
+        if _agentsession_enabled():
+            asyncio.run(self._run_agentsession())
+        else:
+            self._run_legacy()
+
+    # ------------------------------------------------------------------
+    # AgentSession path (D7 — Option B, in-process)
+    # ------------------------------------------------------------------
+
+    async def _run_agentsession(self) -> None:
+        """Async REPL over AgentSession; renders the HostEvent stream."""
+        await self._initialize_session()
+
+        try:
+            while True:
+                try:
+                    user_input = await self._aread_input()
+
+                    if not user_input.strip():
+                        continue
+
+                    if user_input.strip().lower() in ["exit", "quit", "bye", "/exit"]:
+                        print("\nGoodbye!")
+                        break
+
+                    if user_input.strip().startswith("/"):
+                        if await self._handle_command_async(user_input.strip()):
+                            continue
+                        else:
+                            break
+
+                    await self._converse_async(user_input)
+
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    # Ctrl-C between turns (at the input prompt) → clear and
+                    # resume with a fresh prompt. Mid-turn Ctrl-C is absorbed
+                    # inside ``_converse_async`` (cooperative cancel). A second
+                    # SIGINT is force-raised by asyncio.run's Runner → exit.
+                    continue
+                except EOFError:
+                    print("\nGoodbye!")
+                    break
+                except Exception as e:
+                    print(f"\nError: {e}")
+                    print("Type /help for commands or /exit to quit.")
+        finally:
+            await self._close_repo()
+
+    async def _close_repo(self) -> None:
+        """Close the journal repository so aiosqlite releases its connection.
+
+        Without this, ``asyncio.run`` shutdown can hang on the abandoned
+        aiosqlite worker thread (the "Event loop is closed" errors are the
+        symptom). Called from ``_run_agentsession``'s ``finally``. Also closes
+        the in-memory permission grant db (D7.3) so it does not leak a worker
+        thread on exit.
+        """
+        if self._repo is not None:
+            with contextlib.suppress(Exception):
+                await self._repo.close()
+            self._repo = None
+        if self._grant_db is not None:
+            with contextlib.suppress(Exception):
+                await self._grant_db.close()
+            self._grant_db = None
+        # D7.5 (AC #4): release MCP transports/leases so configured stdio servers
+        # do not leak subprocesses on REPL exit.
+        if self.agent_session is not None:
+            with contextlib.suppress(Exception):
+                await self.agent_session.dispose_mcp()
+            # D7.6: detach the TOOL_CALL permission hook so it does not outlive
+            # the session (best-effort).
+            with contextlib.suppress(Exception):
+                self.agent_session._unregister_policy_hook()
+
+    async def _initialize_session(self) -> None:
+        """Construct an AgentSession backed by the Session Journal.
+
+        Mirrors how ``DanaACPAgent`` builds a session (journal path, owner
+        scope, SESSION_CREATED fact, agent factory). ``AgentSession`` is the
+        only module reached into here — no STAR core types (ADR-001).
+        """
+        from datetime import UTC, datetime
+        from uuid import uuid4
+
+        from dana.core.session.agent_session import AgentSession
+        from dana.core.session.journal.models import SessionRecord
+        from dana.core.session.journal.sqlite import SQLiteJournalRepository
+        from dana.core.session.models import FactType, JournalFact, OwnerScope
+
+        llm_provider = os.environ.get("DANA_LLM_PROVIDER", "openai")
+        model = os.environ.get("DANA_MODEL", "gpt-5")
+
+        journal_path = os.path.expanduser(os.environ.get("DANA_CODE_JOURNAL", os.environ.get("DANA_ACP_JOURNAL", "~/.dana/journal.db")))
+        os.makedirs(os.path.dirname(journal_path) or ".", exist_ok=True)
+        repo = await SQLiteJournalRepository.open(journal_path)
+        self._repo = repo
+
+        owner_id = os.environ.get("USER", "local")
+        cwd = os.getcwd()
+        scope = OwnerScope(owner_id=owner_id, workspace=cwd)
+        session_id = str(uuid4())
+
+        record = SessionRecord.new(session_id, scope)
+        init_facts = [
+            JournalFact(
+                fact_id=str(uuid4()),
+                owner_scope=scope,
+                session_id=session_id,
+                sequence=1,
+                fact_type=FactType.SESSION_CREATED,
+                timestamp=datetime.now(UTC),
+                correlation_id=str(uuid4()),
+                causation_id=None,
+                schema_version=1,
+                payload={},
+            ),
+        ]
+        await repo.create_session(record, init_facts)
+
+        session = AgentSession(
+            owner_scope=scope,
+            session_id=session_id,
+            repository=repo,
+        )
+        self.agent_session = session
+
+        # D7.3: wire the permission policy (evaluator + grant store) — parity
+        # with DanaACPAgent.new_session. Gate by DANA_CODE_PERMISSION_PREFLIGHT.
+        self._grant_store = None
+        self._permission_adapter = None
+        from dana.config.code_capabilities import permission_preflight_enabled
+
+        if permission_preflight_enabled():
+            import aiosqlite
+
+            from dana.apps.code.permissions import CLIPermissionAdapter
+            from dana.core.policy.evaluator import PolicyEvaluator
+            from dana.core.policy.hard_policy import create_default_hard_policy
+            from dana.core.policy.modes import PermissionMode
+            from dana.core.policy.store_schema import POLICY_SQLITE_DDL
+            from dana.core.policy.store_sqlite import SQLiteGrantStore
+
+            grant_db = await aiosqlite.connect(":memory:")
+            grant_db.row_factory = aiosqlite.Row
+            for stmt in POLICY_SQLITE_DDL:
+                await grant_db.execute(stmt)
+            await grant_db.commit()
+            self._grant_db = grant_db
+            grant_store = SQLiteGrantStore(grant_db)
+            evaluator = PolicyEvaluator(create_default_hard_policy(), grant_store, PermissionMode.DEFAULT)
+            session.set_policy_evaluator(evaluator)
+            self._grant_store = grant_store
+            self._permission_adapter = CLIPermissionAdapter(
+                evaluator,
+                grant_store,
+                scope,
+                catalog_getter=lambda: self.agent_session.tool_catalog if self.agent_session is not None else None,
+            )
+
+        self.renderer = RichCLIRenderer(verbose=True, show_tool_calls=True)
+        self._print_banner(llm_provider, model)
+
+        # D7.6 follow-up: wire the interactive NEEDS_PROMPT prompt into the
+        # live TOOL_CALL hook (CLI-only). On NEEDS_PROMPT the hook calls this
+        # callback, which pauses the renderer's Live display, prompts the user
+        # via the CLIPermissionAdapter (sync input() off-thread), then resumes.
+        # allow -> the tool proceeds; deny -> blocked + journaled. ACP has no
+        # callback (request_permission is its resolution surface).
+        if self._permission_adapter is not None and self.agent_session is not None:
+            adapter = self._permission_adapter
+
+            async def _permission_prompt(op: Any) -> Any:
+                if self.renderer is not None:
+                    self.renderer.pause_live()
+                try:
+                    return await adapter.prompt_and_persist(op)
+                finally:
+                    if self.renderer is not None:
+                        self.renderer.resume_live()
+
+            self.agent_session.set_permission_prompt_callback(_permission_prompt)
+
+    async def _aread_input(self) -> str:
+        """Read one line of input asynchronously.
+
+        Uses prompt_toolkit's ``prompt_async`` when available; otherwise falls
+        back to blocking ``input()`` off-thread.
+        """
+        if PROMPT_TOOLKIT_AVAILABLE and self._prompt_session:
+            return await self._prompt_session.prompt_async("❯ ")
+        return await asyncio.to_thread(input, "❯ ")
+
+    # ------------------------------------------------------------------
+    # D6: Multimodal input parsing (AC #5)
+    # ------------------------------------------------------------------
+
+    _IMAGE_EXTS = frozenset({"png", "jpg", "jpeg", "gif", "webp", "bmp"})
+    # Providers known to accept multimodal content (mirrors ACP
+    # ``_validate_multimodal_capability``). Used for the ADR-009 pre-turn
+    # capability check.
+    _MULTIMODAL_PROVIDERS = frozenset({"anthropic", "openai", "google", "bedrock", "vertex"})
+
+    def _build_prompt_blocks(self, message: str) -> tuple[Any, list[dict] | None]:
+        """Parse ``@/path`` attachments from ``message`` into content blocks.
+
+        Mirrors ACP's multimodal turn construction: a normalized block list is
+        built (text + image/file_resource), the provider capability is checked
+        (ADR-009), then ``normalized_blocks_to_text_blocks`` produces the
+        ``(TextBlock list, content_blocks payload)`` for ``session.prompt``.
+
+        Convention: a whitespace-delimited token starting with ``@`` whose
+        remainder is an existing file path becomes an attachment. Image
+        extensions become image blocks; other files become file-resource blocks.
+        Non-existent ``@`` paths are left as literal text (no false positives).
+
+        Gated by ``DANA_CODE_MULTIMODAL_ENABLED``: when disabled (or no
+        attachments found), returns a plain text block with ``content_blocks=None``
+        (text-only turn, unchanged behaviour).
+        """
+        from dana.config.code_capabilities import multimodal_enabled
+        from dana.core.content.blocks import normalized_blocks_to_text_blocks
+        from dana.core.content.validation import validate_provider_capability
+        from dana.core.session.agent_session import TextBlock
+
+        # Text-only fast path: flag off, or no @-token present.
+        if not multimodal_enabled() or "@" not in message:
+            return [TextBlock(text=message)], None
+
+        import mimetypes
+        import re
+
+        normalized: list[dict] = []
+        text_parts: list[str] = []
+        pos = 0
+        has_attachment = False
+        for m in re.finditer(r"@(\S+)", message):
+            text_parts.append(message[pos : m.start()])
+            token = m.group(1)
+            path = os.path.expanduser(token)
+            if not os.path.isabs(path):
+                path = os.path.join(os.getcwd(), path)
+            if not os.path.isfile(path):
+                # not a real file → keep the literal "@token" as text
+                text_parts.append(m.group(0))
+                pos = m.end()
+                continue
+            has_attachment = True
+            media_type, _ = mimetypes.guess_type(path)
+            ext = os.path.splitext(path)[1].lstrip(".").lower()
+            if ext in self._IMAGE_EXTS:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+                normalized.append({"type": "image", "media_type": media_type or "image/octet-stream", "data": data})
+                text_parts.append(f"[Image: {media_type or ext}]")
+            else:
+                normalized.append({"type": "file_resource", "uri": path, "media_type": media_type or "application/octet-stream"})
+                text_parts.append(f"[Resource: {os.path.basename(path)}]")
+            pos = m.end()
+        text_parts.append(message[pos:])  # trailing text
+
+        if not has_attachment:
+            return [TextBlock(text=message)], None
+
+        text_block = {"type": "text", "text": "".join(text_parts).strip()}
+        blocks = [text_block, *normalized]
+
+        # ADR-009: validate provider capability before the turn (mirrors ACP).
+        provider = self.agent_session.current_provider if self.agent_session is not None else None
+        if provider is not None:
+            supports = provider in self._MULTIMODAL_PROVIDERS
+            validate_provider_capability(
+                blocks,
+                provider,
+                supports_images=supports,
+                supports_embedded_resources=supports,
+                supports_file_resources=supports,
+            )
+
+        text_blocks, content_blocks_payload = normalized_blocks_to_text_blocks(blocks)
+        return text_blocks, content_blocks_payload or None
+
+    async def _converse_async(self, message: str) -> None:
+        """Run one turn through AgentSession, rendering the HostEvent stream.
+
+        ``AgentSession.prompt()`` serializes turns: a conflicting prompt raises
+        ``SessionBusy`` (caught here). The renderer consumes each HostEvent via
+        the D7.2 bridge (``handle_host_event``). D6: ``@/path`` attachments in
+        the message are parsed into content blocks (AC #5), mirroring ACP's
+        ``_acp_prompt_to_normalized_blocks`` -> ``normalized_blocks_to_text_blocks``
+        flow. Gated by ``DANA_CODE_MULTIMODAL_ENABLED``.
+        """
+        from dana.core.session.agent_session import SessionBusy
+
+        assert self.agent_session is not None
+        assert self.renderer is not None
+
+        text_blocks, content_blocks = self._build_prompt_blocks(message)
+        gen = self.agent_session.prompt(text_blocks, content_blocks=content_blocks)
+        try:
+            async for event in gen:
+                self.renderer.handle_host_event(event)
+        except SessionBusy:
+            print("\n⏳ A turn is already in progress. Please wait for it to finish.\n")
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # Ctrl-C mid-turn → cooperative cancel (ADR-005). prompt() catches
+            # the cancellation internally and terminalizes the turn as
+            # TURN_CANCELLED — a truthful terminal fact rendered by D7.2. If the
+            # cancellation propagated here, set the cancel event and drain any
+            # remaining events so the terminal is rendered, then RESUME the
+            # REPL (absorb the cancel — do not re-raise / exit). Closing the
+            # generator ensures its ``async with`` lock releases so the next
+            # turn is never stuck-busy.
+            with contextlib.suppress(RuntimeError, Exception):
+                await self.agent_session.cancel()
+            with contextlib.suppress(Exception):
+                async for event in gen:
+                    self.renderer.handle_host_event(event)
+            with contextlib.suppress(Exception):
+                await gen.aclose()
+            print("\n⏹ Turn interrupted.\n")
+
+    # ------------------------------------------------------------------
+    # Legacy path (DANA_CODE_AGENTSESSION_ENABLED=0)
+    # ------------------------------------------------------------------
+
+    def _run_legacy(self) -> None:
+        """Pre-D7 synchronous REPL over DanaCodingAgent (rollback path)."""
+        self._initialize_legacy_agent()
+
+        while True:
+            try:
+                if PROMPT_TOOLKIT_AVAILABLE and self._prompt_session:
+                    user_input = self._prompt_session.prompt("❯ ")
+                else:
+                    user_input = input("❯ ")
+
+                if not user_input.strip():
+                    continue
+
+                if user_input.strip().lower() in ["exit", "quit", "bye", "/exit"]:
+                    print("\nGoodbye!")
+                    break
+
+                if user_input.strip().startswith("/"):
+                    if self._handle_command_legacy(user_input.strip()):
+                        continue
+                    else:
+                        break
+
+                self._converse_legacy(user_input)
+
+            except KeyboardInterrupt:
+                print("\n\nGoodbye!")
+                break
+            except EOFError:
+                print("\nGoodbye!")
+                break
+            except Exception as e:
+                print(f"\nError: {e}")
+                print("Type /help for commands or /exit to quit.")
+
+    def _initialize_legacy_agent(self):
+        """Initialize DanaCodingAgent with RichCLIRenderer (rollback path)."""
+        # Lazy import: STAR core is reached into ONLY on the legacy rollback path.
+        from dana.core.agent.builtin_agents.dana_coding_agent import DanaCodingAgent
+
         llm_provider = os.environ.get("DANA_LLM_PROVIDER", "openai")
         model = os.environ.get("DANA_MODEL", "gpt-5")
 
@@ -102,106 +514,8 @@ class DanaCodeApp:
 
         self._print_banner(llm_provider, model)
 
-    def _print_banner(self, provider: str, model: str) -> None:
-        """Print a Rich-formatted startup banner."""
-        from rich.console import Console
-        from rich.text import Text
-
-        try:
-            version = importlib.metadata.version("dana-agent")
-        except importlib.metadata.PackageNotFoundError:
-            version = "dev"
-
-        cwd = os.getcwd().replace(os.path.expanduser("~"), "~")
-
-        console = Console()
-        banner = Text()
-        banner.append(f"\n  Dana Code v{version}\n", style="bold")
-        banner.append(f"  {provider} · {model}\n", style="dim")
-        banner.append(f"  {cwd}\n", style="dim")
-        console.print(banner)
-
-    def run(self):
-        """Run the interactive loop."""
-        self._initialize_agent()
-
-        while True:
-            try:
-                if PROMPT_TOOLKIT_AVAILABLE and self.session:
-                    user_input = self.session.prompt("❯ ")
-                else:
-                    user_input = input("❯ ")
-
-                if not user_input.strip():
-                    continue
-
-                if user_input.strip().lower() in ["exit", "quit", "bye", "/exit"]:
-                    print("\nGoodbye!")
-                    break
-
-                if user_input.strip().startswith("/"):
-                    if self._handle_command(user_input.strip()):
-                        continue
-                    else:
-                        break
-
-                self._converse(user_input)
-
-            except KeyboardInterrupt:
-                print("\n\nGoodbye!")
-                break
-            except EOFError:
-                print("\n\nGoodbye!")
-                break
-            except Exception as e:
-                print(f"\nError: {e}")
-                print("Type /help for commands or /exit to quit.")
-
-    def _handle_command(self, command: str) -> bool:
-        """Handle slash commands. Returns True to continue, False to exit."""
-        cmd = command[1:].lower().strip()
-        assert self.agent is not None
-        assert self.renderer is not None
-
-        if cmd == "help":
-            print("""
-Commands:
-  /help     - Show this help
-  /compact  - Toggle verbose output
-  /status   - Show agent and model info
-  /reset    - Clear conversation history
-  /exit     - Exit
-""")
-            return True
-
-        elif cmd == "compact":
-            self.renderer.verbose = not self.renderer.verbose
-            mode = "verbose" if self.renderer.verbose else "compact"
-            print(f"\nOutput mode: {mode}\n")
-            return True
-
-        elif cmd == "status":
-            state = self.agent.get_state()
-            print(f"\nAgent: {state.get('object_id', 'unknown')}")
-            print(f"Type: {state.get('agent_type', 'unknown')}")
-            print(f"Provider: {self.agent._llm_config.get('provider', 'unknown')}")
-            print(f"Model: {self.agent._llm_config.get('model', 'unknown')}")
-            print(f"Timeline entries: {state.get('timeline_entries', 0)}")
-            print()
-            return True
-
-        elif cmd == "reset":
-            self.agent._timeline.timeline.clear()
-            print("\nConversation history reset.\n")
-            return True
-
-        else:
-            print(f"\nUnknown command: {command}")
-            print("Type /help for available commands.\n")
-            return True
-
-    def _converse(self, message: str):
-        """Send a message to the agent and display the response."""
+    def _converse_legacy(self, message: str):
+        """Send a message to the legacy agent and display the response."""
         assert self.agent is not None
         assert self.renderer is not None
 
@@ -223,3 +537,87 @@ Commands:
 
         except Exception as e:
             print(f"\nError: {e}\n")
+
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
+
+    def _print_banner(self, provider: str, model: str) -> None:
+        """Print a Rich-formatted startup banner."""
+        from rich.console import Console
+        from rich.text import Text
+
+        try:
+            version = importlib.metadata.version("dana-agent")
+        except importlib.metadata.PackageNotFoundError:
+            version = "dev"
+
+        cwd = os.getcwd().replace(os.path.expanduser("~"), "~")
+
+        console = Console()
+        banner = Text()
+        banner.append(f"\n  Dana Code v{version}\n", style="bold")
+        banner.append(f"  {provider} · {model}\n", style="dim")
+        banner.append(f"  {cwd}\n", style="dim")
+        console.print(banner)
+
+    async def _handle_command_async(self, command: str) -> bool:
+        """AgentSession-path slash commands (delegates to dana.apps.code.commands).
+
+        Returns True to continue, False to exit.
+        """
+        from dana.apps.code import commands as cmds
+
+        cmd = command[1:].lower().strip()
+        assert self.renderer is not None
+
+        if cmd == "help":
+            print(cmds.HELP_TEXT)
+            return True
+        if cmd == "compact":
+            print(cmds.compact_toggle(self))
+            return True
+        if cmd == "status":
+            print(cmds.status_lines(self))
+            return True
+        if cmd == "permissions":
+            print(await cmds.list_permissions_async(self))
+            return True
+        if cmd == "reset":
+            print(await cmds.reset_session(self))
+            return True
+        if cmd == "model" or cmd.startswith("model "):
+            print(await cmds.switch_model(self, cmd))
+            return True
+        print(f"\nUnknown command: {command}")
+        print("Type /help for available commands.\n")
+        return True
+
+    def _handle_command_legacy(self, command: str) -> bool:
+        """Legacy-path slash commands (sync subset; /model + /permissions are
+        AgentSession-only)."""
+        from dana.apps.code import commands as cmds
+
+        cmd = command[1:].lower().strip()
+        assert self.renderer is not None
+
+        if cmd == "help":
+            print(cmds.HELP_TEXT)
+            return True
+        if cmd == "compact":
+            print(cmds.compact_toggle(self))
+            return True
+        if cmd == "status":
+            print(cmds.status_lines(self))
+            return True
+        if cmd == "reset":
+            assert self.agent is not None
+            self.agent._timeline.timeline.clear()
+            print("\nConversation history reset.\n")
+            return True
+        if cmd in ("model", "permissions") or cmd.startswith("model "):
+            print("\n/model and /permissions are available on the AgentSession path only.\n")
+            return True
+        print(f"\nUnknown command: {command}")
+        print("Type /help for available commands.\n")
+        return True

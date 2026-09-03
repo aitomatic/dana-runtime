@@ -259,7 +259,10 @@ class TestSTARAgent:
         assert agent.agent_type == "test_agent"
         assert hasattr(agent, "_timeline")
         assert hasattr(agent, "_state")
-        assert hasattr(agent, "_prompt_engineer")
+        # D8: ``_prompt_engineer`` never existed as a real attribute (only the
+        # removed magic ``__getattr__`` made hasattr() lie). Prompt building
+        # now lives on the runtime.
+        assert hasattr(agent, "_runtime")
 
     def test_agent_initialization_with_class_constants(self):
         """Test agent initialization using class constants."""
