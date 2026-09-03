@@ -18,7 +18,7 @@ build-backend = "setuptools.build_meta"
 # is `dana-agent`: the `dana` name on PyPI is taken by an unrelated project
 # (the Dana DSL). See dana/apps/cli_flags.py for the matching version lookup.
 name = "dana-agent"
-version = "0.2.0"
+version = "0.2.1"
 description = "Dana Agent - Domain-Aware Neurosymbolic Agents"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
