@@ -7,7 +7,9 @@ Every test runs against BOTH backends:
 * ``postgres`` — a real PostgreSQL instance reachable via the
   ``DANA_TEST_POSTGRES_DSN`` environment variable. When the DSN is absent the
   postgres cases skip, UNLESS ``CI=true`` is set, in which case they fail —
-  the real-database contract must be exercised in CI.
+  the real-database contract is exercised on the master-PR CI lane
+  (see ``pr-lint-and-test.yml``); the develop/PR fast lane deselects the
+  postgres parametrizations via ``-k "not postgres"``.
 
 The two adapters are required to implement EQUIVALENT domain semantics; this
 module is the single source of truth for that equivalence. Backend-specific
