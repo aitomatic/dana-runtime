@@ -15,6 +15,23 @@ jobs:
       matrix:
         python-version: ["3.12"]
 
+    # The session-journal contract tests REQUIRE a real Postgres in CI
+    # (CI=true makes the [postgres] parametrizations fail, not skip,
+    # when DANA_TEST_POSTGRES_DSN is unset — see
+    # tests/integration/test_session_journal_contract.py).
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
 
@@ -22,6 +39,9 @@ jobs:
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+          # Pin uv to the matrix python — otherwise uv resolves its own
+          # interpreter and the "(3.12)" job name lies about what ran.
+          python-version: ${{ matrix.python-version }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -38,4 +58,5 @@ jobs:
         env:
           DANA_MOCK_LLM: "true"
           DANA_USE_REAL_LLM: "false"
+          DANA_TEST_POSTGRES_DSN: postgresql://postgres:postgres@localhost:5432/postgres
         run: uv run pytest tests/ -m "not live and not deep" -v --maxfail=10 --tb=short --durations=10
