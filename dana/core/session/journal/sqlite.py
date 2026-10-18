@@ -407,6 +407,15 @@ class SQLiteJournalRepository:
     # ------------------------------------------------------------------
 
     async def save_projection_checkpoint(self, scope: OwnerScope, session_id: str, checkpoint: ProjectionCheckpoint) -> None:
+        """Upsert a projection checkpoint, refusing to move a checkpoint backwards.
+
+        The write is a no-op when the stored checkpoint has advanced *past* the
+        incoming ``last_sequence`` (a stale writer that resumed from an older
+        cursor), so a slower process can never overwrite a projection that is
+        further ahead. An equal cursor still overwrites: the latest writer for
+        the same cursor wins. The conflict target is the OwnerScope-scoped
+        primary key, so owner isolation is unchanged.
+        """
         now = _now()
         ts = checkpoint.updated_at if checkpoint.updated_at is not None else now
         await self._db.execute("BEGIN IMMEDIATE")
@@ -420,6 +429,7 @@ class SQLiteJournalRepository:
                     last_sequence = excluded.last_sequence,
                     updated_at    = excluded.updated_at,
                     data          = excluded.data
+                WHERE excluded.last_sequence >= projection_checkpoints.last_sequence
                 """,
                 (
                     scope.owner_id,

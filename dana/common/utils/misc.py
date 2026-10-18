@@ -134,6 +134,16 @@ class Misc:
         """
         Find all methods decorated with @tool_use.
 
+        Discovery must not evaluate unrelated attributes. Components expose
+        public ``@property`` members that construct real clients or render
+        prompts (``BaseWAR.llm_client`` builds a provider, description properties
+        render prompt templates). Static lookup checks for the decorator marker
+        without invoking those properties.
+
+        After checking the raw function (unwrapping classmethod/staticmethod),
+        normal attribute lookup preserves Python's binding semantics for both
+        class methods and callables installed directly on an instance.
+
         Args:
             resource_instance: The instance to inspect for tool_use decorated methods
 
@@ -148,19 +158,22 @@ class Misc:
             if name.startswith("_"):
                 continue
 
-            # Get the attribute - wrap in try/except to handle property getters
-            # that may raise exceptions (e.g., llm_client requiring API keys)
             try:
-                attr = getattr(resource_instance, name, None)
-            except Exception:
-                # Skip attributes that raise exceptions when accessed
+                raw = inspect.getattr_static(resource_instance, name)
+            except AttributeError:
+                # Attribute exists only dynamically (e.g. mock attributes):
+                # there is no static member to inspect, and evaluating the
+                # dynamic accessor is exactly what must not happen here.
                 continue
 
-            # Check if it's callable and has __dict__ (methods have this)
-            if callable(attr) and hasattr(attr, "__dict__"):
-                # Check if method has @tool_use decorator (IS_TOOL_USE attribute)
-                if attr.__dict__.get(IS_TOOL_USE, False):
-                    tool_methods.append((name, attr))
+            target = raw.__func__ if isinstance(raw, (classmethod, staticmethod)) else raw
+            # Properties and other non-callable descriptors are skipped here
+            # without being invoked.
+            if not callable(target) or not getattr(target, "__dict__", {}).get(IS_TOOL_USE, False):
+                continue
+
+            bound = getattr(resource_instance, name)
+            tool_methods.append((name, bound))
 
         return tool_methods
 

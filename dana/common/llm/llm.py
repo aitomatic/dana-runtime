@@ -21,7 +21,7 @@ except ModuleNotFoundError:
 
 from ..config import config_manager
 from .providers.factory import create_provider
-from .types import LLMMessage, LLMProvider, LLMResponse, ProviderError
+from .types import LLMError, LLMMessage, LLMProvider, LLMResponse, LLMTimeoutError, ProviderError
 
 
 logger = structlog.get_logger()
@@ -37,6 +37,12 @@ from .debug_logger import get_debug_logger
 
 
 debug_logger = get_debug_logger()
+
+# Sync facade ceiling. The provider SDK itself applies DEFAULT_TIMEOUT_SECONDS
+# (360s) per HTTP attempt. The persistent sync loop has no other upper bound, so
+# a wedged connection would otherwise block the calling thread forever. Env var
+# ``DANA_LLM_SYNC_TIMEOUT_SECONDS`` overrides; 0 disables the ceiling.
+DEFAULT_SYNC_CALL_TIMEOUT_SECONDS = 600
 
 # Module-level event loop for sync operations
 # This avoids "Event loop is closed" errors when async HTTP clients (httpx/anthropic/openai)
@@ -58,6 +64,22 @@ def _get_or_create_event_loop() -> asyncio.AbstractEventLoop:
     return _sync_event_loop
 
 
+def _sync_call_timeout_seconds() -> float:
+    """Resolve the sync-facade ceiling from env; invalid values fall back."""
+    raw = os.getenv("DANA_LLM_SYNC_TIMEOUT_SECONDS")
+    if raw is None or not raw.strip():
+        return float(DEFAULT_SYNC_CALL_TIMEOUT_SECONDS)
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "ignoring invalid DANA_LLM_SYNC_TIMEOUT_SECONDS",
+            value=raw,
+            fallback=DEFAULT_SYNC_CALL_TIMEOUT_SECONDS,
+        )
+        return float(DEFAULT_SYNC_CALL_TIMEOUT_SECONDS)
+
+
 def _cleanup_event_loop():
     """Clean up the persistent event loop on exit."""
     global _sync_event_loop
@@ -73,6 +95,15 @@ def _cleanup_event_loop():
             _sync_event_loop.close()
         except Exception:
             pass  # Ignore errors during cleanup
+
+
+def _log_close_failure(task: asyncio.Task) -> None:
+    """Retrieve a scheduled provider-close result so failures are visible, not warnings."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("llm_provider_close_failed", error_type=type(exc).__name__)
 
 
 # Register cleanup handler
@@ -135,6 +166,19 @@ class LLM:
             provider: Provider name ('openai', 'anthropic', 'ollama') or provider instance
             model: Model name to use (defaults to provider's default)
         """
+        self._close_tasks: set[asyncio.Task[None]] = set()
+        #: Whether the pool behind :attr:`provider` belongs to somebody else, in
+        #: which case a host that holds this facade must not close it.
+        #:
+        #: ``False`` means this facade is responsible for the pool it currently
+        #: points at, so ``close``/``aclose`` release it. The marker always
+        #: describes the pool the facade points at *now*, and it is re-written at
+        #: both points where that pool changes: :meth:`switch_provider` (the
+        #: replacement pool was created here, so it is this facade's) and a host
+        #: that installs the facade into its own lifecycle with a different
+        #: ownership (``STARAgent._install_llm_client``: an injected instance is
+        #: borrowed, an adopted or name-built client is the host's).
+        self.provider_borrowed = False
         if isinstance(provider, str):
             # Create provider by name
             self.provider = create_provider(provider, model=model)
@@ -277,6 +321,14 @@ class LLM:
             # Debug logging - log the error
             debug_logger.log_error(error=e, context="chat_response", request_id=request_id, provider=self.provider_name, model=self.model)
 
+            # Typed pass-through: LLMError subclasses (ProviderError, PromptTooLongError,
+            # LLMTimeoutError, CompactCircuitOpenError, ConfigurationError, ...) carry
+            # control-flow meaning for the caller layer — retry classification, reactive
+            # compaction, failover. Re-wrapping them as a generic ProviderError destroys
+            # the type and silently disables all three. Unknown exceptions still get the
+            # documented ProviderError contract.
+            if isinstance(e, LLMError):
+                raise
             raise ProviderError(f"Chat failed with {self.provider_name}: {e}") from e
 
     @observable
@@ -308,7 +360,17 @@ class LLM:
         # Reuse a persistent event loop to avoid "Event loop is closed" errors
         # when async HTTP clients (httpx) try to close connections after asyncio.run() closes the loop
         loop = _get_or_create_event_loop()
-        return loop.run_until_complete(self.chat_response(messages, **kwargs))
+        # Caller-supplied per-attempt budget (LLMCaller) wins; otherwise the facade's
+        # own ceiling applies. Either way the sync thread cannot be blocked forever.
+        ceiling = kwargs.get("timeout") or _sync_call_timeout_seconds()
+        if ceiling <= 0:
+            return loop.run_until_complete(self.chat_response(messages, **kwargs))
+        try:
+            return loop.run_until_complete(asyncio.wait_for(self.chat_response(messages, **kwargs), timeout=ceiling))
+        except TimeoutError as e:
+            # Thread-safe ceiling: asyncio.wait_for cancels the pending task on the
+            # owning loop, which is what propagates cancellation into the SDK request.
+            raise LLMTimeoutError(f"{self.provider_name}: sync chat exceeded {ceiling}s ceiling") from e
 
     async def ask(self, question: str, system_prompt: str | None = None, **kwargs) -> str:
         """
@@ -371,23 +433,140 @@ class LLM:
                 agent_label = f" [{kwargs['agent_type']}({short_id})]"
 
             logger.error("Stream failed", provider=self.provider_name, error=str(e), agent=agent_label)
+            # Typed pass-through — see chat_response. A stream that fails after the
+            # first yielded chunk must surface the provider's own type so the caller
+            # can distinguish "no output yet, safe to retry" from "output already
+            # delivered, must not re-request".
+            if isinstance(e, LLMError):
+                raise
             raise ProviderError(f"Stream failed with {self.provider_name}: {e}") from e
 
     def switch_provider(self, provider: str, model: str | None = None):
         """
         Switch to a different LLM provider.
 
+        The retired provider owns an SDK/HTTP client that must not outlive its
+        selection — otherwise every switch leaks a connection pool (and the
+        abandoned client may still be mid-request on another task's loop). The
+        old client is closed best-effort on the loop that can drive it; the new
+        provider is installed regardless, so a failing close cannot block the
+        switch.
+
+        A *borrowed* pool is the one exception: a host that installed this facade
+        with ``provider_borrowed = True`` told it that somebody else — the caller
+        who injected the instance — owns that pool's lifetime, so retiring it
+        would end a pool still in use elsewhere. Ownership of the replacement is
+        unaffected: this facade created it, so it is this facade's to close.
+
         Args:
             provider: Provider name ('openai', 'anthropic', 'ollama', etc.)
             model: Model to use (defaults to provider's default)
         """
+        previous = self.provider
+        previous_borrowed = self.provider_borrowed
         self.provider = create_provider(provider, model=model)
         self.provider_name = provider
+        # The replacement pool is created by *this* facade, so ownership moves to
+        # the facade even when the wrapper was originally built around a borrowed
+        # instance. Without this, a wrapper installed as borrowed by a host would
+        # keep reporting the old, caller-owned pool's status and the new pool would
+        # never be released at teardown.
+        self.provider_borrowed = False
         self.model = getattr(self.provider, "model", "unknown")
         self.provider.supports_vision = self._resolve_capability("vision")
         self.provider.supports_video = self._resolve_capability("video")
         self.provider.supports_audio = self._resolve_capability("audio")
+        if not previous_borrowed:
+            self._close_provider(previous)
         logger.info("Switched LLM provider", provider=provider, model=self.model)
+
+    async def aclose(self) -> None:
+        """Close this LLM's provider client on the current (owning) event loop.
+
+        Call from session teardown for the loop that constructed the client —
+        clients are loop-affine, so closing a client from a different loop can
+        raise. Prefer this over :meth:`close` inside async code.
+        """
+        try:
+            await self.provider.aclose()
+        finally:
+            await self.await_pending_cleanup()
+
+    async def await_pending_cleanup(self) -> None:
+        """Wait for cleanup this facade already scheduled on the running loop.
+
+        This is the barrier :meth:`close` cannot be: with a loop already running,
+        ``close`` only *schedules* the close, so a later async teardown is the only
+        place that can turn "cleanup started" into "cleanup finished".
+
+        Awaiting is not closing: it never touches :attr:`provider`, so a host may
+        call it on a facade whose pool it does not own (a borrowed client) to make
+        sure cleanup that facade merely carries — for example the close scheduled for
+        a pool the host itself retired — has actually finished before teardown
+        returns.
+        """
+        pending = tuple(self._close_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    def take_over_pending_cleanup(self, *retired) -> None:
+        """Adopt cleanup that ``retired`` facades already scheduled on this loop.
+
+        Each facade schedules an in-flight close on its *own* task set, and only
+        :meth:`aclose` awaits it. A host that retires facade A in favour of facade B
+        holds only B at shutdown, so A's pending cleanup would be orphaned and
+        cancelled by loop shutdown. Moving the tasks onto the facade the host still
+        holds keeps teardown a completion barrier for every pool it retired, without
+        closing anything that is still live.
+        """
+        for facade in retired:
+            if facade is None or facade is self:
+                continue
+            incoming = getattr(facade, "_close_tasks", None)
+            if not incoming:
+                continue
+            for task in tuple(incoming):
+                incoming.discard(task)
+                task.add_done_callback(self._close_tasks.discard)
+                self._close_tasks.add(task)
+
+    def close(self) -> None:
+        """Synchronously close this LLM's provider client.
+
+        For sync callers: uses the persistent sync loop when no loop is running,
+        otherwise schedules the close on the running loop. Best-effort — a
+        teardown failure is logged, never raised, so it cannot mask a turn result.
+        """
+        self._close_provider(self.provider)
+
+    def _close_provider(self, provider: LLMProvider | None) -> None:
+        """Best-effort close of a provider client, loop-affine aware."""
+        if provider is None:
+            return
+        try:
+            running: asyncio.AbstractEventLoop | None
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+
+            if running is not None:
+                # Inside async code: schedule and attach a done-callback so the
+                # exception is retrieved instead of surfacing as "never awaited".
+                task = running.create_task(provider.aclose())
+                self._close_tasks.add(task)
+                task.add_done_callback(self._close_tasks.discard)
+                task.add_done_callback(_log_close_failure)
+                return
+
+            loop = _get_or_create_event_loop()
+            loop.run_until_complete(provider.aclose())
+        except Exception as e:
+            logger.warning(
+                "llm_provider_close_failed",
+                provider=getattr(provider, "name", provider.__class__.__name__),
+                error_type=type(e).__name__,
+            )
 
     @staticmethod
     async def ask_question(question: str, provider: str | None = None, model: str | None = None, **kwargs) -> str:

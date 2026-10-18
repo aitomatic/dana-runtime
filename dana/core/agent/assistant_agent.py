@@ -226,7 +226,13 @@ Example good responses:
         # Pass through notifiables so the fresh instance can emit thought/action notifications
         if hasattr(self, "_notifiables") and self._notifiables:
             fresh.with_notifiable(*self._notifiables)
-        return fresh._do_query(**kwargs)
+        try:
+            return fresh._do_query(**kwargs)
+        finally:
+            # The fresh instance built its own runtime (offload pool) and owns its
+            # LLM client; releasing them here keeps per-query construction from
+            # leaking a client/pool per task.
+            fresh.close()
 
     async def aquery(self, **kwargs) -> str:
         """Async version of query - returns only the response string."""
@@ -235,7 +241,10 @@ Example good responses:
         # Pass through notifiables so the fresh instance can emit thought/action notifications
         if hasattr(self, "_notifiables") and self._notifiables:
             fresh.with_notifiable(*self._notifiables)
-        return await fresh._do_aquery(**kwargs)
+        try:
+            return await fresh._do_aquery(**kwargs)
+        finally:
+            await fresh.aclose()
 
     def _extract_response(self, result) -> str:
         """Extract just the response string from query result."""

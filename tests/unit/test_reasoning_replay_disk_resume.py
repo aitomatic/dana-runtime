@@ -38,12 +38,17 @@ FINGERPRINT = "azure:gpt-5:f3b74bde"
 
 def _make_provider(fingerprint=FINGERPRINT):
     """Same shape used in the in-process tests."""
-    p = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
+
+    class ReplayProvider(OpenAICompatibleProvider):
+        @property
+        def fingerprint(self):
+            return fingerprint
+
+    p = ReplayProvider.__new__(ReplayProvider)
     p.model = "gpt-5"
     p.client = MagicMock()
     p._use_responses_api = True
     p._include_unsupported = False
-    type(p).fingerprint = property(lambda self, fp=fingerprint: fp)
     return p
 
 

@@ -41,6 +41,13 @@ def main():
 
         traceback.print_exc()
         return 1
+    finally:
+        # Process boundary, not per-session: the tracing backend is
+        # process-wide and `/reset` rebuilds sessions mid-run. Bounded, so a
+        # slow or offline exporter cannot hold the REPL open.
+        from dana.common.observable import shutdown_observability
+
+        shutdown_observability()
 
 
 if __name__ == "__main__":

@@ -143,7 +143,11 @@ class TestAzureTimelineReplay:
             chunks: list[LLMStreamChunk] = []
             text_parts: list[str] = []
 
-            async def _collect():
+            async def _collect(
+                llm_messages=llm_messages,
+                chunks=chunks,
+                text_parts=text_parts,
+            ):
                 async for chunk in agent._runtime._llm_caller.call_llm_stream(llm_messages):
                     chunks.append(chunk)
                     if chunk.type == "text_delta" and chunk.content:

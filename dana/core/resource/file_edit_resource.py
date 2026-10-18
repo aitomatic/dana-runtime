@@ -4,9 +4,11 @@ Provides edit() tool mirroring Claude Code's exact string replacement signature.
 """
 
 from pathlib import Path
+import threading
 
 from dana.common.protocols.war import named_tool
 from dana.core.resource.base_resource import BaseResource
+from dana.core.tool.offload import run_blocking
 
 
 class FileEditResource(BaseResource):
@@ -23,6 +25,23 @@ class FileEditResource(BaseResource):
         super().__init__(resource_id=resource_id, **kwargs)
         self._base_path = Path(base_path) if base_path else Path.cwd()
         self._base_path.mkdir(parents=True, exist_ok=True)
+        # Per-path ordering for read-modify-write edits. Two concurrent Edit calls
+        # naming the same file must not interleave (one would clobber the other);
+        # edits of different files stay concurrent. A plain thread lock (not an
+        # asyncio.Lock) is used because the critical section runs on the offload
+        # worker threads, and because it must survive loop changes without binding.
+        self._path_locks: dict[str, threading.Lock] = {}
+        self._path_locks_guard = threading.Lock()
+
+    def _path_lock(self, resolved_path: Path) -> threading.Lock:
+        """The lock serializing read-modify-write edits to one resolved path."""
+        key = str(resolved_path)
+        with self._path_locks_guard:
+            lock = self._path_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._path_locks[key] = lock
+            return lock
 
     def _normalize_whitespace(self, text: str) -> str:
         """Normalize whitespace for fuzzy matching.
@@ -270,14 +289,50 @@ class FileEditResource(BaseResource):
         """
         resolved_path = self._resolve_path(file_path)
 
+        if old_string == new_string:
+            return "<tool_use_error>No changes to make: old_string and new_string are exactly the same.</tool_use_error>"
+
+        # The whole check-match-replace-write sequence runs as ONE offloaded unit
+        # under a per-path lock: it is blocking filesystem I/O, and running it under
+        # the lock is exactly what keeps two concurrent edits of the same file from
+        # interleaving (a lost update). Edits of different files hold different locks
+        # and stay concurrent. Nothing loop-bound is captured or returned.
+        return await run_blocking(
+            self._edit_blocking,
+            resolved_path,
+            old_string,
+            new_string,
+            replace_all,
+            fuzzy_match,
+        )
+
+    def _edit_blocking(
+        self,
+        resolved_path: Path,
+        old_string: str,
+        new_string: str,
+        replace_all: bool,
+        fuzzy_match: bool,
+    ) -> str:
+        """Blocking core of :meth:`edit` (runs on the offload pool under the path lock)."""
+        lock = self._path_lock(resolved_path)
+        with lock:
+            return self._edit_locked(resolved_path, old_string, new_string, replace_all, fuzzy_match)
+
+    def _edit_locked(
+        self,
+        resolved_path: Path,
+        old_string: str,
+        new_string: str,
+        replace_all: bool,
+        fuzzy_match: bool,
+    ) -> str:
+        """Read-modify-write of one file. Caller holds the per-path lock."""
         if not resolved_path.exists():
             return "<tool_use_error>File does not exist.</tool_use_error>"
 
         if not resolved_path.is_file():
             return f"Error: Path is not a file: {resolved_path}"
-
-        if old_string == new_string:
-            return "<tool_use_error>No changes to make: old_string and new_string are exactly the same.</tool_use_error>"
 
         try:
             content = resolved_path.read_text(encoding="utf-8")
@@ -384,21 +439,31 @@ class FileEditResource(BaseResource):
             Success message with file path, or error if file already exists.
         """
         resolved_path = self._resolve_path(file_path)
+        # Existence check + create is a conflicting effect: do it as one offloaded
+        # unit under the same per-path lock used by edit(), so a concurrent Edit or
+        # Write of this path cannot interleave with the check-then-create window
+        # (which would otherwise allow an overwrite through the "does not overwrite"
+        # guard).
+        return await run_blocking(self._write_blocking, resolved_path, content)
 
-        # Check if file already exists
-        if resolved_path.exists():
-            return f"Error: File already exists: {resolved_path}. Cannot overwrite existing files. Use Edit tool to make modifications."
+    def _write_blocking(self, resolved_path: Path, content: str) -> str:
+        """Blocking core of :meth:`write` (runs on the offload pool under the path lock)."""
+        lock = self._path_lock(resolved_path)
+        with lock:
+            # Check if file already exists (inside the lock: no TOCTOU window)
+            if resolved_path.exists():
+                return f"Error: File already exists: {resolved_path}. Cannot overwrite existing files. Use Edit tool to make modifications."
 
-        try:
-            # Create parent directories if they don't exist
-            resolved_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                # Create parent directories if they don't exist
+                resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # Write content
-            resolved_path.write_text(content, encoding="utf-8")
+                # Write content
+                resolved_path.write_text(content, encoding="utf-8")
 
-            return f"Successfully wrote {len(content)} characters to {resolved_path}"
+                return f"Successfully wrote {len(content)} characters to {resolved_path}"
 
-        except PermissionError:
-            return f"Error: Permission denied: {resolved_path}"
-        except Exception as e:
-            return f"Error writing file: {e}"
+            except PermissionError:
+                return f"Error: Permission denied: {resolved_path}"
+            except Exception as e:
+                return f"Error writing file: {e}"

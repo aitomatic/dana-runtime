@@ -12,26 +12,26 @@ from __future__ import annotations
 
 import pytest
 
+
 # Mark all tests in this directory as harness tests (excluded from CI by default)
 pytestmark = pytest.mark.harness
 
-from dana.core.resource.base_resource import BaseResource
-from dana.core.workflow.base_workflow import BaseWorkflow
 
-from .fault_injection import FaultInjector, FaultConfig, FaultScenarios
+from .fault_injection import FaultInjector, FaultScenarios
 from .harness_agent import HarnessAgent
-from .mocks.llm_client import MockLLMClient, LLMResponseScenario, SmallLLMScenarios
+from .mocks.llm_client import MockLLMClient, SmallLLMScenarios
 from .mocks.resources import (
-    MockResource,
     AsyncMockResource,
-    FailingResource,
-    MockWorkflow,
     AsyncMockWorkflow,
+    FailingResource,
     FailingWorkflow,
+    MockResource,
+    MockWorkflow,
 )
 
 
 # ==================== Core Fixtures ====================
+
 
 @pytest.fixture
 def mock_llm():
@@ -72,6 +72,7 @@ def harness_agent_with_faults(mock_llm, fault_injector):
 
 # ==================== Resource Fixtures ====================
 
+
 @pytest.fixture
 def mock_resource():
     """Simple mock resource for testing."""
@@ -103,6 +104,7 @@ def failing_resource():
 
 # ==================== Workflow Fixtures ====================
 
+
 @pytest.fixture
 def mock_workflow():
     """Simple mock workflow for testing."""
@@ -132,6 +134,7 @@ def failing_workflow():
 
 # ==================== Agent with Resources Fixtures ====================
 
+
 @pytest.fixture
 def harness_agent_with_resource(mock_llm, mock_resource):
     """Harness agent with a mock resource attached."""
@@ -157,6 +160,7 @@ def harness_agent_with_workflow(mock_llm, mock_workflow):
 
 
 # ==================== LLM Response Scenario Fixtures ====================
+
 
 @pytest.fixture
 def empty_response():
@@ -195,6 +199,7 @@ def small_llm_scenarios():
 
 # ==================== Fault Scenario Fixtures ====================
 
+
 @pytest.fixture
 def think_phase_fault():
     """Fault configuration for _think phase exception."""
@@ -220,6 +225,7 @@ def slow_think_fault():
 
 
 # ==================== Composite Fixtures ====================
+
 
 @pytest.fixture
 def agent_with_failing_resource(mock_llm, failing_resource):
@@ -248,13 +254,16 @@ def agent_with_async_resources(mock_llm, async_mock_resource, async_mock_workflo
 
 # ==================== Parametrized Fixtures ====================
 
-@pytest.fixture(params=[
-    "empty",
-    "malformed_closing",
-    "wrong_tag",
-    "json_in_xml",
-    "partial",
-])
+
+@pytest.fixture(
+    params=[
+        "empty",
+        "malformed_closing",
+        "wrong_tag",
+        "json_in_xml",
+        "partial",
+    ]
+)
 def problematic_response(request):
     """Parametrized fixture for various problematic LLM responses."""
     scenarios = {
@@ -275,6 +284,7 @@ def fault_phase(request):
 
 # ==================== Multi-turn Conversation Fixtures ====================
 
+
 @pytest.fixture
 def multi_turn_scenario(mock_llm):
     """
@@ -283,21 +293,23 @@ def multi_turn_scenario(mock_llm):
     Returns a mock LLM with queued responses for a multi-turn interaction.
     """
     # Turn 1: Tool call
-    mock_llm.queue_response(MockLLMClient.well_formed_tool_call(
-        target_id="mock-resource",
-        method="query",
-        message="first query",
-    ))
+    mock_llm.queue_response(
+        MockLLMClient.well_formed_tool_call(
+            target_id="mock-resource",
+            method="query",
+            message="first query",
+        )
+    )
     # Turn 2: Another tool call
-    mock_llm.queue_response(MockLLMClient.well_formed_tool_call(
-        target_id="mock-resource",
-        method="query",
-        message="second query",
-    ))
+    mock_llm.queue_response(
+        MockLLMClient.well_formed_tool_call(
+            target_id="mock-resource",
+            method="query",
+            message="second query",
+        )
+    )
     # Turn 3: Final response (no tool calls)
-    mock_llm.queue_response(MockLLMClient.simple_response(
-        "Based on my research, here is the answer."
-    ))
+    mock_llm.queue_response(MockLLMClient.simple_response("Based on my research, here is the answer."))
     return mock_llm
 
 
@@ -325,9 +337,11 @@ def max_iterations_scenario(mock_llm):
     """
     # Queue 15 tool call responses (more than MAX_ITERATIONS=10)
     for i in range(15):
-        mock_llm.queue_response(MockLLMClient.well_formed_tool_call(
-            target_id="mock-resource",
-            method="query",
-            message=f"iteration {i}",
-        ))
+        mock_llm.queue_response(
+            MockLLMClient.well_formed_tool_call(
+                target_id="mock-resource",
+                method="query",
+                message=f"iteration {i}",
+            )
+        )
     return mock_llm

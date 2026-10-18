@@ -11,6 +11,7 @@ import re
 
 from dana.common.protocols.war import named_tool
 from dana.core.resource.base_resource import BaseResource
+from dana.core.tool.offload import run_blocking
 
 
 class GREPMode(StrEnum):
@@ -198,7 +199,9 @@ class SearchResource(BaseResource):
         if not resolved_path.exists():
             return f"Error: Path does not exist: {resolved_path}"
 
-        # Compile regex
+        # Compile regex on the loop (pure CPU, microseconds) and run the recursive
+        # walk + per-file read + scan as one offloaded unit. Nothing loop-bound is
+        # captured: only paths and strings cross the thread boundary.
         flags = 0
         if case_insensitive:
             flags |= re.IGNORECASE
@@ -210,6 +213,38 @@ class SearchResource(BaseResource):
         except re.error as e:
             return f"Error: Invalid regex pattern: {e}"
 
+        return await run_blocking(
+            self._grep_python_native_blocking,
+            resolved_path,
+            regex,
+            pattern,
+            output_mode,
+            file_type,
+            glob,
+            show_line_numbers,
+            context_after,
+            context_before,
+            context,
+            head_limit,
+            offset,
+        )
+
+    def _grep_python_native_blocking(
+        self,
+        resolved_path: Path,
+        regex: re.Pattern[str],
+        pattern: str,
+        output_mode: str,
+        file_type: str | None,
+        glob: str | None,
+        show_line_numbers: bool,
+        context_after: int | None,
+        context_before: int | None,
+        context: int | None,
+        head_limit: int | None,
+        offset: int | None,
+    ) -> str:
+        """Blocking core of :meth:`_grep_python_native` (runs on the offload pool)."""
         # Collect files to search
         files_to_search: list[Path] = []
         if resolved_path.is_file():
@@ -599,7 +634,11 @@ class SearchResource(BaseResource):
             Matching file paths sorted by modification time (newest first).
         """
         resolved_path = self._resolve_path(path)
+        # Directory walk + per-match stat: blocking filesystem work, offloaded.
+        return await run_blocking(self._glob_blocking, resolved_path, pattern)
 
+    def _glob_blocking(self, resolved_path: Path, pattern: str) -> str:
+        """Blocking core of :meth:`glob` (runs on the offload pool)."""
         if not resolved_path.exists():
             return f"Error: Path does not exist: {resolved_path}"
 

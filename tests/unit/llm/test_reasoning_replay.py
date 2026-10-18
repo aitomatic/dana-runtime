@@ -32,13 +32,16 @@ _REASONING_ITEM = {
 def _make_provider(model="gpt-5", fingerprint="azure:gpt-5:abcd1234"):
     from dana.common.llm.providers.openai_compatible_base import OpenAICompatibleProvider
 
-    p = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
+    class ReplayProvider(OpenAICompatibleProvider):
+        @property
+        def fingerprint(self):
+            return fingerprint
+
+    p = ReplayProvider.__new__(ReplayProvider)
     p.model = model
     p.client = MagicMock()
     p._use_responses_api = True
     p._include_unsupported = False
-    # Stub fingerprint so tests don't need real Azure/OpenAI setup
-    type(p).fingerprint = property(lambda self, fp=fingerprint: fp)
     return p
 
 
@@ -291,6 +294,33 @@ class TestTimelineToLLMMessagesPropagation:
         assert len(assistant_msgs) == 1
         assert "thinking 1" in str(assistant_msgs[0].content)
         assert "answer 1" in str(assistant_msgs[0].content)
+
+
+@pytest.mark.parametrize("separate_latest_user", [False, True])
+def test_plain_timeline_tool_reasoning_reaches_provider_wire(separate_latest_user):
+    fingerprint = "azure:gpt-5:abcd1234"
+    provider = _make_provider(fingerprint=fingerprint)
+    timeline = Timeline()
+    timeline.add_entry(TimelineEntry(entry_type=TimelineEntryType.USER_MESSAGE, content="read the file"))
+    timeline.add_entry(
+        TimelineEntry(
+            entry_type=TimelineEntryType.TOOL_CALL,
+            content="",
+            tool_calls=[{"id": "call_read", "name": "read_file", "arguments": {"path": "a"}}],
+            metadata={"reasoning_items": [_REASONING_ITEM], "fingerprint": fingerprint, "response_id": "resp_tool"},
+        )
+    )
+    timeline.add_entry(TimelineEntry(entry_type=TimelineEntryType.RESOURCE_RESULT, content="file contents", tool_call_id="call_read"))
+    timeline.add_entry(TimelineEntry(entry_type=TimelineEntryType.USER_MESSAGE, content="continue", is_latest_user_message=True))
+    _, prepared = provider.prepare_messages(timeline.to_llm_messages(separate_latest_user=separate_latest_user))
+    wire = provider._convert_to_responses_input(prepared)
+    reasoning_index = wire.index(_REASONING_ITEM)
+    call_index = next(index for index, item in enumerate(wire) if item.get("type") == "function_call")
+    output_index = next(index for index, item in enumerate(wire) if item.get("type") == "function_call_output")
+    assert reasoning_index < call_index < output_index
+    assert wire[call_index]["call_id"] == wire[output_index]["call_id"] == "call_read"
+    assert "file contents" in wire[output_index]["output"]
+    assert wire[-1] == {"role": "user", "content": "continue"}
 
 
 class TestEndToEndPrepareMessagesAndConvert:

@@ -580,6 +580,32 @@ class TestSubAgentResponseToolRole:
 class TestCompressedTimelineLoadFromEntries:
     """Test load_from_entries method."""
 
+    @pytest.mark.parametrize("separate_native_messages", [False, True])
+    def test_native_snapshot_preserves_compacted_provider_request(self, separate_native_messages):
+        timeline = CompressedTimeline(
+            max_tokens_until_compression=10000,
+            max_recent_entries_to_keep=3,
+            cutoff_when_token_reach=100,
+        )
+        for index in range(12):
+            timeline.add_entry(TimelineEntry(entry_type=TimelineEntryType.USER_MESSAGE, content=f"Old decision {index}"))
+        timeline.compress_old_entries("Preserve the unresolved artifact.")
+        for index in range(5):
+            timeline.add_entry(TimelineEntry(entry_type=TimelineEntryType.USER_MESSAGE, content=f"New decision {index}"))
+        timeline.compress_old_entries("Latest decisions and the unresolved artifact.")
+        expected = timeline.to_llm_messages()
+        native = [message.to_dict() for message in timeline._native_messages]
+
+        reopened = CompressedTimeline()
+        if separate_native_messages:
+            reopened.load_from_entries([entry.to_dict() for entry in timeline.timeline], native_messages=native)
+        else:
+            reopened.load_from_entries(native)
+
+        assert reopened.to_llm_messages() == expected
+        assert expected[0].content == "[SUMMARY] Latest decisions and the unresolved artifact."
+        assert not any(message.content == "[SUMMARY] Preserve the unresolved artifact." for message in reopened.to_llm_messages())
+
     def test_load_from_entries_with_compressed_context(self):
         """Test loading entries with compressed context stops at that entry."""
         timeline = CompressedTimeline()
@@ -622,6 +648,112 @@ class TestCompressedTimelineLoadFromEntries:
 
         assert len(timeline.timeline) == 3
         assert not timeline.has_compressed_context()
+
+
+class TestCompressedTimelineLoadReplacement:
+    """Loading replaces the model-facing projection; nothing stale survives."""
+
+    def test_load_replaces_previous_native_context(self):
+        """A reload must not leave the previous projection reachable to the model."""
+        timeline = CompressedTimeline()
+        timeline.add_entry(TimelineEntry(entry_type=TimelineEntryType.USER_MESSAGE, content="stale-question"))
+        timeline.add_entry(TimelineEntry(entry_type=TimelineEntryType.AGENT_RESPONSE, content="stale-answer"))
+        assert [m.content for m in timeline.to_llm_messages()] == ["stale-question", "stale-answer"]
+
+        timeline.load_from_entries([TimelineEntry(entry_type=TimelineEntryType.USER_MESSAGE, content="fresh-only")])
+
+        assert [e.content for e in timeline.timeline] == ["fresh-only"]
+        assert [m.content for m in timeline.native_messages] == ["fresh-only"]
+        assert [m.content for m in timeline.to_llm_messages()] == ["fresh-only"]
+
+    def test_load_with_no_entries_clears_everything(self):
+        timeline = CompressedTimeline()
+        timeline.add_entry(TimelineEntry(entry_type=TimelineEntryType.USER_MESSAGE, content="old"))
+
+        timeline.load_from_entries([])
+
+        assert timeline.timeline == []
+        assert timeline.native_messages == []
+        assert timeline.to_llm_messages() == []
+
+    def test_supplied_native_messages_are_cut_at_the_compression_marker(self):
+        """The supplied native list is the same journal projection as ``entries``.
+
+        Keeping pre-marker messages would hand the provider the compression
+        summary AND the history the summary replaced.
+        """
+        stamp = datetime.now().isoformat()
+        marker = {
+            COMPRESSED_CONTEXT_KEY: "Summary of older messages",
+            COMPRESSION_TIMESTAMP_KEY: stamp,
+            COMPRESSED_ENTRIES_COUNT_KEY: 2,
+        }
+        entries = [
+            TimelineEntry(entry_type=TimelineEntryType.USER_MESSAGE, content="compressed-away-1"),
+            TimelineEntry(entry_type=TimelineEntryType.USER_MESSAGE, content="compressed-away-2"),
+            TimelineEntry(entry_type=TimelineEntryType.USER_MESSAGE, content="oldest-kept", metadata=dict(marker)),
+            TimelineEntry(entry_type=TimelineEntryType.AGENT_RESPONSE, content="kept-answer"),
+        ]
+        native_messages = [
+            {"role": "user", "content": "compressed-away-1", "timestamp": stamp},
+            {"role": "user", "content": "compressed-away-2", "timestamp": stamp},
+            {"role": "user", "content": "oldest-kept", "timestamp": stamp, "metadata": dict(marker)},
+            {"role": "assistant", "content": "kept-answer", "timestamp": stamp},
+        ]
+
+        timeline = CompressedTimeline()
+        timeline.load_from_entries(entries, native_messages=native_messages)
+
+        assert [e.content for e in timeline.timeline] == ["oldest-kept", "kept-answer"]
+        assert [m.content for m in timeline.native_messages] == ["oldest-kept", "kept-answer"]
+        # Provider context: summary + retained tail, never the compressed-away turns.
+        contents = [m.content for m in timeline.to_llm_messages()]
+        assert "compressed-away-1" not in contents
+        assert "compressed-away-2" not in contents
+
+    def test_native_format_load_cuts_at_the_marker(self):
+        stamp = datetime.now().isoformat()
+        marker = {COMPRESSED_CONTEXT_KEY: "Summary", COMPRESSION_TIMESTAMP_KEY: stamp}
+        native_messages = [
+            {"role": "user", "content": "compressed-away", "timestamp": stamp},
+            {"role": "user", "content": "oldest-kept", "timestamp": stamp, "metadata": marker},
+        ]
+
+        timeline = CompressedTimeline()
+        timeline.load_from_entries(native_messages)
+
+        assert [m.content for m in timeline.native_messages] == ["oldest-kept"]
+        assert [e.content for e in timeline.timeline] == ["oldest-kept"]
+
+    def test_load_from_entries_clears_foreign_compaction_target(self):
+        """A target adopted for another session must not receive this session's save."""
+        agent = Mock()
+        agent._session_id = "session-B"
+        timeline = CompressedTimeline(agent=None)
+        timeline._agent = agent
+        timeline._active_compact_session_id = "session-A__compact__20260420T120000_000000"
+        timeline._active_compact_compression_at = datetime(2026, 4, 20, 12, 0, 0)
+        timeline._last_compression_at = datetime(2026, 4, 20, 12, 0, 0)
+
+        timeline.load_from_entries([TimelineEntry(entry_type=TimelineEntryType.USER_MESSAGE, content="b-1")])
+
+        assert timeline._active_compact_session_id is None
+        assert timeline._active_compact_compression_at is None
+        assert timeline._last_compression_at is None
+
+    def test_load_from_entries_keeps_same_session_compaction_target(self):
+        """Same-session bookkeeping is preserved so the compact roll still works."""
+        agent = Mock()
+        agent._session_id = "session-A"
+        timeline = CompressedTimeline(agent=None)
+        timeline._agent = agent
+        timeline._active_compact_session_id = "session-A__compact__20260420T120000_000000"
+        timeline._active_compact_compression_at = datetime(2026, 4, 20, 12, 0, 0)
+
+        timeline.load_from_entries([TimelineEntry(entry_type=TimelineEntryType.USER_MESSAGE, content="a-1")])
+
+        assert timeline._active_compact_session_id == "session-A__compact__20260420T120000_000000"
+        assert timeline._active_compact_compression_at == datetime(2026, 4, 20, 12, 0, 0)
 
 
 class TestSummaryExtraction:

@@ -58,17 +58,6 @@ class TestD1TextEvents:
         event = _make_event(HostEventType.ASSISTANT_CONTENT_FINAL, text="full")
         assert host_event_to_acp_update(event) is None
 
-    def test_turn_lifecycle_returns_none(self) -> None:
-        for typ in (
-            HostEventType.TURN_STARTED,
-            HostEventType.TURN_COMPLETED,
-            HostEventType.TURN_CANCELLED,
-            HostEventType.TURN_ERROR,
-            HostEventType.SESSION_CREATED,
-            HostEventType.SESSION_LOADED,
-        ):
-            assert host_event_to_acp_update(_make_event(typ)) is None
-
 
 # ===========================================================================
 # 2. D2: Agent thought

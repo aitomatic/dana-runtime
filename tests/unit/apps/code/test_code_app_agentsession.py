@@ -87,6 +87,8 @@ async def test_initialize_session_constructs_agent_session(monkeypatch, tmp_path
     # Renderer wired up.
     assert app.renderer is not None
 
+    await app._close_repo()
+
 
 def test_no_star_core_imports_outside_legacy_path():
     """AC #3: `from dana.core.agent` may appear ONLY in the legacy rollback path."""

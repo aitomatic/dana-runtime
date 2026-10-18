@@ -16,12 +16,12 @@ from pathlib import Path
 
 import pytest
 
-from dana.core.timeline.timeline import TimelineEntry, TimelineEntryType
 from dana.core.reminder.rules.builtin import (
     TodoNeverCalledReminder,
     TodoUpdateReminder,
     _entry_has_tool_call,
 )
+from dana.core.timeline.timeline import TimelineEntry, TimelineEntryType
 
 
 TIMELINE_PATH = Path(__file__).resolve().parent / "fixtures" / "timeline_with_looping_todo_and_incorrect_system_reminder.json"
@@ -139,9 +139,9 @@ class TestLoopingTodoTimeline:
                 continue
             for tc in entry.get("tool_calls", []):
                 if "todo_write" in tc.get("function", ""):
-                    assert (
-                        entry["content"] == ""
-                    ), "Native tool call entries should have empty content — this is what caused the reminder detection to fail"
+                    assert entry["content"] == "", (
+                        "Native tool call entries should have empty content — this is what caused the reminder detection to fail"
+                    )
 
 
 # ---------------------------------------------------------------------------

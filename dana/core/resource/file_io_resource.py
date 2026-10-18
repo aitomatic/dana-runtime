@@ -8,6 +8,7 @@ from pathlib import Path
 
 from dana.common.protocols.war import named_tool
 from dana.core.resource.base_resource import BaseResource
+from dana.core.tool.offload import run_blocking
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
@@ -110,30 +111,39 @@ class FileIOResource(BaseResource):
         """
         resolved_path = self._resolve_path(file_path)
 
-        if not resolved_path.exists():
-            return f"Error: File does not exist: {resolved_path}"
-
-        if not resolved_path.is_file():
-            return f"Error: Path is not a file: {resolved_path}"
+        # Path probing is filesystem I/O (stat): keep it off the event loop. The
+        # result is a plain string so nothing loop-bound crosses the thread boundary.
+        probe_error = await run_blocking(self._probe_path, resolved_path)
+        if probe_error is not None:
+            return probe_error
 
         suffix = resolved_path.suffix.lower()
 
         if suffix in IMAGE_EXTENSIONS:
             if self._supports_vision:
-                return self._read_image(resolved_path, suffix)
+                return await run_blocking(self._read_image, resolved_path, suffix)
             else:
                 return await self._read_image_extracted(resolved_path)
         elif suffix in AUDIO_EXTENSIONS:
-            return self._read_media(resolved_path, suffix, AUDIO_MEDIA_TYPES, "audio", self._supports_audio)
+            return await run_blocking(self._read_media, resolved_path, suffix, AUDIO_MEDIA_TYPES, "audio", self._supports_audio)
         elif suffix in VIDEO_EXTENSIONS:
-            return self._read_media(resolved_path, suffix, VIDEO_MEDIA_TYPES, "video", self._supports_video)
+            return await run_blocking(self._read_media, resolved_path, suffix, VIDEO_MEDIA_TYPES, "video", self._supports_video)
         elif suffix == PDF_EXTENSION:
             if self._supports_vision:
-                return self._read_pdf(resolved_path, pages)
+                return await run_blocking(self._read_pdf, resolved_path, pages)
             else:
                 return await self._read_pdf_extracted(resolved_path, pages)
         else:
-            return self._read_text(resolved_path, offset, limit)
+            return await run_blocking(self._read_text, resolved_path, offset, limit)
+
+    @staticmethod
+    def _probe_path(resolved_path: Path) -> str | None:
+        """Validate a resolved path on the offload pool. Returns an error string or None."""
+        if not resolved_path.exists():
+            return f"Error: File does not exist: {resolved_path}"
+        if not resolved_path.is_file():
+            return f"Error: Path is not a file: {resolved_path}"
+        return None
 
     def _read_text(self, resolved_path: Path, offset: int | None, limit: int | None) -> str:
         """Read a text file with line numbers (cat -n format)."""
@@ -284,6 +294,7 @@ class FileIOResource(BaseResource):
 
         fd, tmp_name = tempfile.mkstemp(suffix=".pdf", prefix=f"{path.stem}_p{start}-{end}_")
         import os
+
         os.close(fd)
         tmp_pdf = Path(tmp_name)
         tmp_pdf.write_bytes(pdf_bytes)

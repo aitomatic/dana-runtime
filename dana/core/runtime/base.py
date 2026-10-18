@@ -108,9 +108,21 @@ When you need to call tools, use the function calling API directly — do NOT in
         self._provider = provider
         self._agent = None
         self._native_tools = None
+        #: Agent whose members produced the cached native schemas. The bound
+        #: dispatch registry has its own coherent owner/revision cache entry.
+        self._native_tools_agent = None
         self._use_native_tools = use_native_tools
-        # Registry mapping custom tool names (from @named_tool) to (object, method_name)
-        self._tool_name_registry: dict[str, tuple[Any, str]] = {}
+        # Catalog revision: bumped whenever model-facing tool metadata changes
+        # (tool discovery, MCP wiring, native-tool build). The ToolExecutor reads
+        # it through a getter to invalidate cached schema/registry metadata only
+        # when discovery actually changed, instead of rebuilding every turn.
+        self._tool_catalog_revision = 0
+        #: Publish owner, build revision, and bound registry as one cache entry.
+        self._tool_name_registry_cache: tuple[Any, int, dict[str, tuple[Any, str]]] = (None, -1, {})
+        #: Provider whose capability the cached native-schema decision came from.
+        #: ``LLM.switch_provider`` replaces the pool inside the same wrapper, so
+        #: wrapper identity alone cannot tell a capability change from a no-op.
+        self._native_tools_provider = None
         # PromptBuilder is wired with method references so subclass hook overrides
         # (e.g. AnthropicRuntime.get_system_prompt_template) are picked up automatically.
         self._prompt_builder = PromptBuilder(
@@ -132,22 +144,83 @@ When you need to call tools, use the function calling API directly — do NOT in
             max_tokens=max_tokens,
             native_tools_getter=lambda: self._native_tools,
             agent_getter=lambda: self._agent,
+            # Session-owned cancellation event (set by the host on the active
+            # agent, cleared after the terminal fact). Read through a getter so a
+            # replaced agent is observed without re-wiring the caller.
+            cancel_event_getter=lambda: getattr(self._agent, "_session_cancel_event", None),
         )
         # ToolExecutor handles all tool dispatch (sync + async).
-        # Lambdas ensure it always sees the current registry and agent.
+        # The registry getter receives the *invoking* agent, resolved through the
+        # call rather than through runtime-wide state: on a shared runtime an
+        # overlapping dispatch for another agent may have replaced "the agent
+        # currently driving" at any await, so dispatch must never read it back.
         self._tool_executor = ToolExecutor(
-            tool_name_registry_getter=lambda: self._tool_name_registry,
+            agent_tool_name_registry_getter=self._tool_name_registry_for,
+            catalog_revision_getter=lambda: self._tool_catalog_revision,
         )
 
     # -------------------------------------------------------------------------
     # Properties
     # -------------------------------------------------------------------------
 
+    def tool_catalog_revision(self) -> int:
+        """The current tool-catalog revision (see ``_invalidate_tool_catalog``)."""
+        return self._tool_catalog_revision
+
+    def _invalidate_tool_catalog(self) -> int:
+        """Mark model-facing tool metadata as changed; returns the new revision."""
+        self._tool_catalog_revision += 1
+        return self._tool_catalog_revision
+
+    def reset(self) -> None:
+        """Invalidate cached model-facing metadata after a structural mutation.
+
+        Called by ``STARAgent.with_resources``/``with_agents``/``with_workflows``
+        (guarded by ``hasattr``), so the next prompt rebuilds:
+
+        * native tool schemas (``_native_tools``),
+        * the ``@named_tool`` registry,
+
+        and bumps the catalog revision so the :class:`ToolExecutor` drops its
+        cached signature/validation/schema metadata and the session's catalog
+        cache key changes. Idempotent and cheap: it only marks caches stale; the
+        rebuild happens lazily on the next ``build_prompt``/dispatch.
+        """
+        self._native_tools = None
+        self._native_tools_agent = None
+        self._native_tools_provider = None
+        # Keep mappings held by active dispatches intact. Key and value are
+        # invalidated together, including when another thread reads the cache.
+        self._tool_name_registry_cache = (None, -1, {})
+        self._invalidate_tool_catalog()
+
+    def _native_tools_cached_for(self, agent, provider) -> bool:
+        """Whether cached tool metadata was built for this agent and provider.
+
+        A runtime may be injected into several agents. The cached native schemas
+        and ``@named_tool`` registry hold the *bound* resource/workflow/subagent
+        objects of whichever agent built them, and those objects are what
+        dispatch executes, so the cache is only valid while the same agent is
+        driving. Provider identity is checked alongside it because
+        ``LLM.switch_provider`` swaps the pool inside one wrapper, which can
+        change native-tool support without changing the wrapper.
+        """
+        return self._native_tools_agent is agent and self._native_tools_provider is provider
+
+    def _tool_name_registry_for(self, agent) -> dict[str, tuple[Any, str]]:
+        """Resolve the invoking agent's bound tools from one coherent snapshot."""
+        owner, revision, registry = self._tool_name_registry_cache
+        if agent is None or (owner is agent and revision == self._tool_catalog_revision):
+            return registry
+        return self._build_tool_name_registry(agent)
+
     @property
     def llm(self) -> LLM | None:
         return self._llm
 
     def set_llm(self, llm: LLM) -> None:
+        if self._llm is not llm:
+            self.reset()
         self._llm = llm
         self._llm_caller.set_llm(llm)
 
@@ -196,10 +269,11 @@ When you need to call tools, use the function calling API directly — do NOT in
     def get_runtime_context_fields(self) -> list[str]:
         """Return which context fields to include.
 
-        Override to customize what context is injected.
-        Default: ["timestamp", "timezone", "location", "user"]
+        Override to customize what context is injected. Location is opt-in:
+        applications can supply it by overriding ``_get_runtime_context``.
+        Default prompt construction performs no geolocation request.
         """
-        return ["timestamp", "timezone", "location", "user"]
+        return ["timestamp", "timezone", "user"]
 
     def format_tool_for_prompt(self, signature) -> str:
         """Format a tool signature for the prompt.
@@ -395,24 +469,36 @@ When you need to call tools, use the function calling API directly — do NOT in
     def _build_native_tools_if_supported(self, agent) -> None:
         """Build native tool schemas if the LLM provider supports native tool calling.
 
-        Schemas are cached after first build. They depend only on structural
-        agent members (``_agents``/``_resources``/``_workflows``), the static
-        provider capability, and the init-time ``_use_native_tools`` flag —
-        none change per turn. Rebuilding every ``build_prompt`` call re-runs
-        ``inspect.signature`` on every resource method under the tracer-laden
-        per-turn chain; on long sessions that exhausts the interpreter's
-        recursion budget and surfaces as a RecursionError at
-        ``inspect.signature``. Build once.
+        Schemas are cached while the same agent and provider keep driving this
+        runtime. They hold the agent's *bound* resources/workflows/subagents and
+        are generated from its structural members, so a runtime injected into a
+        second agent must not keep serving the first agent's schemas: a shared
+        runtime is a supported injection mode, and reusing another agent's cached
+        list makes the model see — and dispatch through — the wrong objects.
+        ``LLM.switch_provider`` replaces the pool inside one wrapper, which can
+        change native-tool support without changing wrapper identity, so the
+        provider object is part of the cache key as well.
+
+        Caching itself is load-bearing: rebuilding every ``build_prompt`` call
+        re-runs ``inspect.signature`` on every resource method under the
+        tracer-laden per-turn chain; on long sessions that exhausts the
+        interpreter's recursion budget and surfaces as a RecursionError at
+        ``inspect.signature``. Build once per (agent, provider).
         """
-        if self._native_tools is not None:
-            return
-
         llm = self._resolve_llm()
-        if not hasattr(llm, "provider"):
+        provider = getattr(llm, "provider", None)
+
+        if self._native_tools is not None and self._native_tools_cached_for(agent, provider):
             return
 
-        provider_supports = getattr(llm.provider, "supports_native_tools", False)
-        if not provider_supports:
+        if self._native_tools is not None:
+            # Cached for another agent/provider: drop the stale bound schemas and
+            # let every consumer (executor metadata, session catalog key) see the
+            # change instead of serving the previous agent's tools.
+            self._native_tools = None
+            self._invalidate_tool_catalog()
+
+        if provider is None or not getattr(provider, "supports_native_tools", False):
             return
 
         if self._use_native_tools is False:
@@ -426,32 +512,57 @@ When you need to call tools, use the function calling API directly — do NOT in
             resources=getattr(agent, "_resources", []),
             workflows=getattr(agent, "_workflows", []),
         )
+        self._native_tools_agent = agent
+        self._native_tools_provider = provider
+        # Model-facing tool metadata changed: invalidate the executor's cache.
+        self._invalidate_tool_catalog()
 
-    def _build_tool_name_registry(self, agent) -> None:
+    def _build_tool_name_registry(self, agent) -> dict[str, tuple[Any, str]]:
         """Build mapping from custom tool names to (object, method_name).
 
         This registry enables execution of tools decorated with @named_tool
         by mapping their custom names back to the actual objects and methods.
+
+        The mapping is derived from the agent's structural members
+        (``_resources``/``_workflows``/``_agents``) and stores those members
+        themselves, so it is rebuilt whenever they change (``reset`` bumps the
+        catalog revision) *or* whenever a different agent drives this runtime —
+        a shared runtime must never dispatch a tool to the other agent's bound
+        object. Repeated turns of the same agent reuse it: re-running
+        ``inspect.signature`` on every resource method for every prompt is pure
+        waste, and on long sessions it exhausts the interpreter's recursion
+        budget (surfacing as a RecursionError at ``inspect.signature``).
+
+        Owner, build revision, and completed mapping are published together.
+        Readers capture that entry once, so another agent's publication cannot
+        change the mapping whose owner they already checked.
         """
-        self._tool_name_registry.clear()
+        revision = self._tool_catalog_revision
+        owner, built_revision, registry = self._tool_name_registry_cache
+        if built_revision == revision and owner is agent:
+            return registry
+        registry = {}
 
         # Register resources
         for resource in getattr(agent, "_resources", []):
             for method_name, method in Misc.extract_tool_use_methods(resource):
                 sig = Misc.parse_method_signature(method, object_id=getattr(resource, "object_id", None))
                 if sig.tool_name:
-                    self._tool_name_registry[sig.tool_name] = (resource, method_name)
+                    registry[sig.tool_name] = (resource, method_name)
 
         # Register workflows
         for workflow in getattr(agent, "_workflows", []):
             if hasattr(workflow, "execute"):
                 sig = Misc.parse_method_signature(workflow.execute, object_id=getattr(workflow, "object_id", None))
                 if sig.tool_name:
-                    self._tool_name_registry[sig.tool_name] = (workflow, "execute")
+                    registry[sig.tool_name] = (workflow, "execute")
 
         # Register sub-agents (they expose query method)
         for sub_agent in getattr(agent, "_agents", []):
             if hasattr(sub_agent, "query"):
                 sig = Misc.parse_method_signature(sub_agent.query, object_id=getattr(sub_agent, "agent_type", None))
                 if sig.tool_name:
-                    self._tool_name_registry[sig.tool_name] = (sub_agent, "query")
+                    registry[sig.tool_name] = (sub_agent, "query")
+
+        self._tool_name_registry_cache = (agent, revision, registry)
+        return registry

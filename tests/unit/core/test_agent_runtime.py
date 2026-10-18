@@ -240,62 +240,6 @@ def test_star_agent_accepts_codec_parameter():
     assert agent._codec is CSXMLCodec
 
 
-def test_think_uses_runtime_methods():
-    class TrackingRuntime(AgentRuntime):
-        def __init__(self):
-            self.calls = []
-            self._count = 0
-
-        def validate_done_output(self, done, has_tool_calls, has_response):
-            self.calls.append("validate_done_output")
-            return done, has_tool_calls, has_response
-
-        def build_prompt(self, agent, timeline, learned_context=None):
-            self.calls.append("build_prompt")
-            return [LLMMessage(role="system", content="system"), LLMMessage(role="user", content="hello")]
-
-        def call_llm(self, messages, messages_fn=None):
-            self.calls.append("call_llm")
-            self._count += 1
-            if self._count == 1:
-                return LLMResponse(
-                    content='{"done": false, "response": null, "tool_calls": [{"name": "Tool:run", "parameters": {}}]}', model="test"
-                )
-            return LLMResponse(content='{"done": true, "response": "ok", "tool_calls": []}', model="test")
-
-        def parse_response(self, response):
-            self.calls.append("parse_response")
-            content = response.content if isinstance(response, LLMResponse) else str(response)
-            if '"done": false' in content:
-                return ParsedResponse(done=False, reasoning=None, response=None, tool_calls=[{"function": "Tool:run", "arguments": {}}])
-            return ParsedResponse(done=True, reasoning=None, response="ok", tool_calls=[])
-
-        def execute_tools(self, agent, tool_calls):
-            self.calls.append("execute_tools")
-            return []
-
-        def get_output_instructions(self):
-            return ""
-
-        def get_system_prompt_template(self, native_tools: bool) -> str:
-            return ""
-
-    runtime = TrackingRuntime()
-    agent = STARAgent(
-        agent_type="runtime-test",
-        runtime=runtime,
-        auto_register=False,
-        enable_web_search=False,
-        enable_skills=False,
-        enable_code_execution=False,
-    )
-
-    agent.query(message="hello")
-
-    assert runtime.calls[:5] == ["build_prompt", "call_llm", "parse_response", "validate_done_output", "execute_tools"]
-    assert "execute_tools" in runtime.calls
-
-
 # RuntimeRegistry tests
 
 

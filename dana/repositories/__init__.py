@@ -11,11 +11,21 @@ __all__ = [
     "RepositoryFactory",
     "RepositoryType",
     "TimelineRepositoryDefaultsMixin",
+    "LangfusePromptRepository",
 ]
 
-try:
-    from .langfuse_repository import LangfusePromptRepository
 
-    __all__.append("LangfusePromptRepository")
-except ModuleNotFoundError:
-    LangfusePromptRepository = None
+def __getattr__(name: str):
+    """Resolve `LangfusePromptRepository` on first use (PEP 562).
+
+    Importing its module costs the Langfuse SDK, and this package is on the
+    `import dana` path. The class itself imports without the SDK installed; only
+    building a client raises `ImportError`, so it is always available here (it
+    used to be `None` when the SDK was missing).
+    """
+    if name == "LangfusePromptRepository":
+        from .langfuse_repository import LangfusePromptRepository
+
+        globals()[name] = LangfusePromptRepository
+        return LangfusePromptRepository
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

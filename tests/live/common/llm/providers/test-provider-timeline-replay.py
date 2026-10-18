@@ -112,10 +112,7 @@ class TestProviderTimelineReplay:
             parsed = agent._runtime.parse_response(raw)
             assert parsed is not None, f"call #{call_count}: parse_response returned None"
 
-            print(
-                f"    response: model={raw.model}, len={len(raw.content)}, "
-                f"done={parsed.done}, tool_calls={len(parsed.tool_calls or [])}"
-            )
+            print(f"    response: model={raw.model}, len={len(raw.content)}, done={parsed.done}, tool_calls={len(parsed.tool_calls or [])}")
 
         assert call_count > 0, "No LLM calls were made during replay"
         print(f"\n=== Replay complete: {call_count} LLM calls across {len(all_entries)} entries ===")

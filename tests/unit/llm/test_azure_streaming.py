@@ -1,6 +1,6 @@
 """Tests for Azure provider streaming inheritance."""
 
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 from dana.common.llm.providers.openai_compatible_base import OpenAICompatibleProvider
 

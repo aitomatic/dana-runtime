@@ -77,9 +77,9 @@ class TestReadSinceNativeMessages:
         user_entries = [e for e in entries if e.entry_type == TimelineEntryType.USER_MESSAGE]
         user_msgs = [m for m in msgs if m.role == "user"]
 
-        assert len(user_msgs) == len(
-            user_entries
-        ), f"Expected {len(user_entries)} user messages, got {len(user_msgs)}. USER_MESSAGE entries may be mapped to wrong role."
+        assert len(user_msgs) == len(user_entries), (
+            f"Expected {len(user_entries)} user messages, got {len(user_msgs)}. USER_MESSAGE entries may be mapped to wrong role."
+        )
 
     def test_tool_result_has_tool_call_id(self):
         """Tool results must preserve tool_call_id for LLM API compatibility."""
@@ -111,17 +111,17 @@ class TestReadSinceNativeMessages:
         timeline.timeline = entries
         timeline._native_messages = [timeline._timeline_entry_to_native_message(e) for e in entries]
 
-        assert len(timeline._native_messages) == len(
-            saved_native
-        ), f"Count mismatch: rebuilt={len(timeline._native_messages)}, saved={len(saved_native)}"
+        assert len(timeline._native_messages) == len(saved_native), (
+            f"Count mismatch: rebuilt={len(timeline._native_messages)}, saved={len(saved_native)}"
+        )
 
-        for i, (rebuilt, saved) in enumerate(zip(timeline._native_messages, saved_native)):
+        for i, (rebuilt, saved) in enumerate(zip(timeline._native_messages, saved_native, strict=True)):
             assert rebuilt.role == saved["role"], f"Message [{i}] role mismatch: rebuilt={rebuilt.role}, saved={saved['role']}"
             saved_tc_id = saved.get("tool_call_id")
             if saved_tc_id:
-                assert (
-                    rebuilt.tool_call_id == saved_tc_id
-                ), f"Message [{i}] tool_call_id mismatch: rebuilt={rebuilt.tool_call_id}, saved={saved_tc_id}"
+                assert rebuilt.tool_call_id == saved_tc_id, (
+                    f"Message [{i}] tool_call_id mismatch: rebuilt={rebuilt.tool_call_id}, saved={saved_tc_id}"
+                )
 
     def test_add_user_message_after_load(self):
         """

@@ -152,3 +152,48 @@ class TestFactoryDispatch:
         out = await resource.task_output(task_id=sid)
         assert out.startswith("Status: failed")
         assert "boom" in out
+
+    @pytest.mark.asyncio
+    async def test_cancelled_task_reports_terminal_status_and_can_resume(self):
+        entered = asyncio.Event()
+        session_ready = asyncio.get_running_loop().create_future()
+
+        class PausingSubAgent(FakeSubAgent):
+            def resume(self, session_id):
+                super().resume(session_id)
+                if not session_ready.done():
+                    session_ready.set_result(session_id)
+
+            async def aquery(self, message=None, session_id=None, **kwargs):
+                if message == "pause":
+                    entered.set()
+                    await asyncio.Event().wait()
+                return await super().aquery(message, session_id, **kwargs)
+
+        resource = TaskResource(
+            resource_id="task",
+            agents={"pausing": functools.partial(PausingSubAgent, agent_id="pausing")},
+        )
+        task = asyncio.create_task(resource.task(description="pause", prompt="pause", subagent_type="pausing"))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            session_id = await session_ready
+            assert await resource.task_output(session_id) == "Status: running"
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert await resource.task_output(session_id) == "Status: cancelled"
+
+            result = await resource.task(
+                description="continue",
+                prompt="continue",
+                subagent_type="pausing",
+                resume=session_id,
+            )
+            assert result == f"handled: continue\n\n[session_id: {session_id}]"
+            assert await resource.task_output(session_id) == "Status: completed\n\nhandled: continue"
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)

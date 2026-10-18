@@ -303,6 +303,7 @@ If both `LANGSMITH_TRACING` and `LANGFUSE_ENABLED` are set, LangSmith wins. Inst
 **Optional:**
 - `DANA_MOCK_LLM` - Enable mock LLM for testing
 - `DANA_DEBUG` - Enable debug logging
+- `DANA_LLM_DEBUG_LOGGING=true` - Opt into metadata-only LLM diagnostics. Disabled by default; each of the four JSONL files retains at most 4 MiB plus one rotated backup. Prompts, responses, tool arguments, exception messages, credentials, and provider replay material are never logged. `enable_debug_logging()` and `disable_debug_logging()` control the same logger at runtime.
 - `DANA_CONFIG_PATH` - Custom config location
 
 ## Running the Project

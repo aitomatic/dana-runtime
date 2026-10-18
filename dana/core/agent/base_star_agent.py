@@ -6,10 +6,8 @@ without implementation details like LLM integration or rich state management.
 """
 
 from abc import abstractmethod
-import asyncio
 from collections.abc import AsyncIterator, Callable
 import logging
-import threading
 from typing import TYPE_CHECKING, Any
 
 from dana.common.observable import observable
@@ -30,13 +28,6 @@ logger = logging.getLogger(__name__)
 
 
 EXIT_STAR_LOOP_FLAG = "EXIT_STAR_LOOP_FLAG"
-
-# STAR loop retry budget for transient LLM errors (per iteration).
-# This sits ON TOP of LLMCaller's own retry — it covers cases where the network
-# recovers between iterations or the failure surfaces outside the LLM call itself.
-# Kept small to avoid pathological wait times when stacked with LLMCaller retries.
-_STAR_TRANSIENT_RETRIES = 1
-_STAR_TRANSIENT_BASE_DELAY = 1.0
 
 
 class BaseSTARAgent(BaseAgent, STARAgentProtocol):
@@ -224,16 +215,11 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
 
         @observable(name=f"Dana {self.agent_type}-agent-query")
         def _do_query(trace_inputs: DictParams) -> DictParams:
-            import time
-
             trace_outputs: DictParams = {}
 
             for iteration in range(self.MAX_ITERATIONS):
-                # Inner loop retries the See/Think/Act cycle on transient LLM errors.
-                # LLMCaller already retries inside its own scope; this is a second-line
-                # defense for transient failures that escape (or whose retry budget
-                # was exhausted) before we mark the whole session as failed.
-                attempt = 0
+                # Only LLMCaller retries requests. Replaying the STAR cycle
+                # could duplicate observations and completed tool effects.
                 star_failed = False
                 phase_blocked = False
                 while True:
@@ -256,20 +242,6 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
                             phase_blocked = True
                         break
                     except Exception as e:
-                        if is_transient_llm_error(e) and attempt < _STAR_TRANSIENT_RETRIES:
-                            delay = _STAR_TRANSIENT_BASE_DELAY * (2**attempt)
-                            logger.warning(
-                                "STAR iteration transient error, retrying (iteration=%d, attempt=%d/%d, delay=%.1fs): %s",
-                                iteration,
-                                attempt + 1,
-                                _STAR_TRANSIENT_RETRIES,
-                                delay,
-                                e,
-                                exc_info=True,
-                            )
-                            time.sleep(delay)
-                            attempt += 1
-                            continue
                         logger.error(
                             "Error in query (iteration=%d, transient=%s): %s",
                             iteration,
@@ -284,20 +256,16 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
                 if star_failed or phase_blocked:
                     break
 
-                # Trigger acquisitive learning asynchronously at end of each STAR loop
+                # Reflection belongs to this turn and finishes before reuse.
                 if not self._do_exit_star_loop(trace_outputs.get("trace_outputs", {})):
                     acquisitive_input = trace_outputs.get("trace_outputs", {}).copy()
                     acquisitive_input["phase"] = LearningPhase.ACQUISITIVE
 
-                    # Sync path: use thread (no event loop available)
-                    def run_reflect(acq_input):
-                        try:
-                            learning = self._reflect(acq_input)
-                            self._emit_phase(REFLECT_END, learning)
-                        except Exception as reflect_err:
-                            logger.error("Reflection failed: %s", reflect_err, exc_info=True)
-
-                    threading.Thread(target=run_reflect, args=(acquisitive_input,), daemon=True).start()
+                    try:
+                        learning = self._reflect(acquisitive_input)
+                        self._emit_phase(REFLECT_END, learning)
+                    except Exception as reflect_err:
+                        logger.error("Reflection failed: %s", reflect_err, exc_info=True)
 
                 if self._do_exit_star_loop(trace_outputs.get("trace_outputs", {})):
                     break
@@ -326,9 +294,7 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
             trace_outputs: DictParams = {}
 
             for iteration in range(self.MAX_ITERATIONS):
-                # Inner loop retries the See/Think/Act cycle on transient LLM errors.
-                # See _do_query for rationale.
-                attempt = 0
+                # Request retries belong to LLMCaller, never the effect loop.
                 star_failed = False
                 phase_blocked = False
                 while True:
@@ -354,20 +320,6 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
                             phase_blocked = True
                         break
                     except Exception as e:
-                        if is_transient_llm_error(e) and attempt < _STAR_TRANSIENT_RETRIES:
-                            delay = _STAR_TRANSIENT_BASE_DELAY * (2**attempt)
-                            logger.warning(
-                                "STAR iteration transient error, retrying (iteration=%d, attempt=%d/%d, delay=%.1fs): %s",
-                                iteration,
-                                attempt + 1,
-                                _STAR_TRANSIENT_RETRIES,
-                                delay,
-                                e,
-                                exc_info=True,
-                            )
-                            await asyncio.sleep(delay)
-                            attempt += 1
-                            continue
                         logger.error(
                             "Error in aquery (iteration=%d, transient=%s): %s",
                             iteration,
@@ -382,20 +334,16 @@ class BaseSTARAgent(BaseAgent, STARAgentProtocol):
                 if star_failed or phase_blocked:
                     break
 
-                # Trigger acquisitive learning asynchronously at end of each STAR loop
+                # Reflection belongs to this turn and finishes before reuse.
                 if not self._do_exit_star_loop(trace_outputs.get("trace_outputs", {})):
                     acquisitive_input = trace_outputs.get("trace_outputs", {}).copy()
                     acquisitive_input["phase"] = LearningPhase.ACQUISITIVE
 
-                    # Async path: use asyncio.create_task (proper async, not threads)
-                    async def _async_reflect(acq_input):
-                        try:
-                            learning = self._reflect(acq_input)
-                            await self._emit_phase_async(REFLECT_END, learning)
-                        except Exception as reflect_err:
-                            logger.error("Async reflection failed: %s", reflect_err, exc_info=True)
-
-                    asyncio.create_task(_async_reflect(acquisitive_input))
+                    try:
+                        learning = self._reflect(acquisitive_input)
+                        await self._emit_phase_async(REFLECT_END, learning)
+                    except Exception as reflect_err:
+                        logger.error("Async reflection failed: %s", reflect_err, exc_info=True)
 
                 if self._do_exit_star_loop(trace_outputs.get("trace_outputs", {})):
                     break

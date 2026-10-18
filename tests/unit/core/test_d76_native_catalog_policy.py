@@ -6,9 +6,9 @@ Tests the three D7.6 pieces:
   2. build_policy_operation(catalog=) + create_default_hard_policy classify
      correctly (normal proceeds; destructive-on-protected-path blocked;
      unknown blocked).
-  3. AgentSession._on_tool_call (the TOOL_CALL EventBus hook) returns
-     {"block": True} ONLY on PolicyDecision.DENY; ALLOW/NEEDS_PROMPT proceed;
-     None-catalog pass-through (no P0 regression).
+  3. AgentSession._on_tool_call enforces denied or unresolved interactive
+     decisions. Effect-based session tests cover missing-consent and missing-
+     catalog safety through the actual executor.
   4. Per-turn pinned catalog version (AC #1).
 """
 
@@ -225,15 +225,6 @@ class TestToolCallPolicyHook:
         assert out is None
 
     @pytest.mark.asyncio
-    async def test_needs_prompt_proceeds(self):
-        from dana.core.policy.evaluator import PolicyDecision
-
-        catalog = build_native_tool_catalog([_native_schema(n) for n in KNOWN_TOOLS])
-        session = _make_session_with_catalog(catalog, evaluator=_PolicyEvalMock(PolicyDecision.NEEDS_PROMPT))
-        out = await session._on_tool_call(_tool_call_event("Edit"))
-        assert out is None  # NEEDS_PROMPT -> proceed (interactive prompt is a host follow-up)
-
-    @pytest.mark.asyncio
     async def test_needs_prompt_callback_allow_proceeds(self):
         # D7.6 follow-up: a host prompt callback that allows -> proceed.
         from types import SimpleNamespace
@@ -269,15 +260,6 @@ class TestToolCallPolicyHook:
         session.set_permission_prompt_callback(_deny)
         out = await session._on_tool_call(_tool_call_event("Edit"))
         assert out == {"block": True, "reason": "denied: denied once (user)"}
-
-    @pytest.mark.asyncio
-    async def test_no_catalog_pass_through(self):
-        # preflight-on + catalog-off (None) must NOT deny everything (P0 guard).
-        from dana.core.policy.evaluator import PolicyDecision
-
-        session = _make_session_with_catalog(None, evaluator=_PolicyEvalMock(PolicyDecision.DENY))
-        out = await session._on_tool_call(_tool_call_event("Read"))
-        assert out is None  # no catalog -> cannot classify -> pass-through
 
     @pytest.mark.asyncio
     async def test_no_evaluator_pass_through(self):

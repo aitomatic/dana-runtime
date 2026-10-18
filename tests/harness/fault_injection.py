@@ -6,10 +6,11 @@ Allows injecting faults at specific STAR phases with configurable probability.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass, field
 import random
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
 
 @dataclass
@@ -127,12 +128,14 @@ class FaultInjector:
 
         # Record the fault
         fault.trigger()
-        self.fault_history.append({
-            "phase": phase,
-            "fault_type": fault.fault_type,
-            "timestamp": time.time(),
-            "context_keys": list(context.keys()) if context else [],
-        })
+        self.fault_history.append(
+            {
+                "phase": phase,
+                "fault_type": fault.fault_type,
+                "timestamp": time.time(),
+                "context_keys": list(context.keys()) if context else [],
+            }
+        )
 
         # Execute the fault
         if fault.fault_type == "exception":
@@ -158,25 +161,30 @@ class FaultInjector:
         Usage:
             agent._see = injector.wrap_method(agent._see, "see")
         """
+
         def wrapped(*args, **kwargs):
             # Extract context from first positional arg if it's a dict
             context = args[0] if args and isinstance(args[0], dict) else None
             self.inject(phase, context)
             return method(*args, **kwargs)
+
         return wrapped
 
     def wrap_async_method(self, method: Callable, phase: str) -> Callable:
         """
         Wrap an async method to inject faults before execution.
         """
+
         async def wrapped(*args, **kwargs):
             context = args[0] if args and isinstance(args[0], dict) else None
             self.inject(phase, context)
             return await method(*args, **kwargs)
+
         return wrapped
 
 
 # ==================== Preset Fault Scenarios ====================
+
 
 class FaultScenarios:
     """Preset fault injection scenarios for common test cases."""

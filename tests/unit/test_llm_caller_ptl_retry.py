@@ -63,7 +63,7 @@ def _make_caller(llm, agent):
     return caller
 
 
-def test_ptl_single_failure_then_success_triggers_one_reactive_compact():
+def test_ptl_single_failure_then_success_triggers_one_reactive_compact(monkeypatch):
     ok = LLMResponse(content="ok", model="m", usage=None)
     llm = _FakeLLM([PromptTooLongError("too long"), ok])
     tl = _FakeTimeline()
@@ -73,14 +73,14 @@ def test_ptl_single_failure_then_success_triggers_one_reactive_compact():
     # Skip backoff sleeps to speed up.
     import time as _time
 
-    _time.sleep = lambda s: None  # type: ignore[assignment]
+    monkeypatch.setattr(_time, "sleep", lambda s: None)
 
     resp = caller._invoke_llm_sync(llm, [])
     assert resp.content == "ok"
     assert tl.reactive_calls == [1]
 
 
-def test_ptl_three_failures_raise_circuit_open():
+def test_ptl_three_failures_raise_circuit_open(monkeypatch):
     llm = _FakeLLM([PromptTooLongError("x")] * 3 + [LLMResponse(content="", model="m")])
     tl = _FakeTimeline()
     agent = _FakeAgent(tl)
@@ -88,7 +88,7 @@ def test_ptl_three_failures_raise_circuit_open():
 
     import time as _time
 
-    _time.sleep = lambda s: None  # type: ignore[assignment]
+    monkeypatch.setattr(_time, "sleep", lambda s: None)
 
     with pytest.raises(CompactCircuitOpenError):
         caller._invoke_llm_sync(llm, [])
@@ -120,7 +120,7 @@ def test_ptl_config_flag_off_bubbles_unchanged():
     assert tl.reactive_calls == []
 
 
-def test_async_ptl_recovery():
+def test_async_ptl_recovery(monkeypatch):
     ok = LLMResponse(content="ok", model="m")
     llm = _FakeLLM([PromptTooLongError("x"), ok])
     tl = _FakeTimeline()
@@ -131,7 +131,7 @@ def test_async_ptl_recovery():
     async def _nosleep(s):
         return None
 
-    asyncio.sleep = _nosleep  # type: ignore[assignment]
+    monkeypatch.setattr(asyncio, "sleep", _nosleep)
 
     resp = asyncio.run(caller._invoke_llm_async(llm, []))
     assert resp.content == "ok"
@@ -185,7 +185,7 @@ class _CompactingTimeline(_FakeTimeline):
         self._state["msg_count"] = max(1, self._state["msg_count"] - 2)
 
 
-def test_ptl_retry_rebuilds_messages_via_factory():
+def test_ptl_retry_rebuilds_messages_via_factory(monkeypatch):
     """After reactive_compact, messages_fn must be invoked so retry uses
     the compacted payload (CRITICAL-1)."""
     ok = LLMResponse(content="ok", model="m", usage=None)
@@ -201,7 +201,7 @@ def test_ptl_retry_rebuilds_messages_via_factory():
 
     import time as _time
 
-    _time.sleep = lambda s: None  # type: ignore[assignment]
+    monkeypatch.setattr(_time, "sleep", lambda s: None)
 
     initial = _rebuild()
     resp = caller._invoke_llm_sync(llm, initial, messages_fn=_rebuild)
@@ -211,7 +211,7 @@ def test_ptl_retry_rebuilds_messages_via_factory():
     assert llm.seen_lengths == [5, 3]
 
 
-def test_ptl_retry_without_factory_keeps_stale_messages():
+def test_ptl_retry_without_factory_keeps_stale_messages(monkeypatch):
     """When messages_fn is None, legacy behavior preserved — messages stay stale
     across retries. Kept as a guardrail so callers who opt out are explicit."""
     llm = _MessageSizeAwareLLM(max_len=3, ok_response=LLMResponse(content="never", model="m"))
@@ -222,7 +222,7 @@ def test_ptl_retry_without_factory_keeps_stale_messages():
 
     import time as _time
 
-    _time.sleep = lambda s: None  # type: ignore[assignment]
+    monkeypatch.setattr(_time, "sleep", lambda s: None)
 
     with pytest.raises(CompactCircuitOpenError):
         caller._invoke_llm_sync(llm, [object()] * 5)
@@ -230,7 +230,7 @@ def test_ptl_retry_without_factory_keeps_stale_messages():
     assert llm.seen_lengths == [5, 5, 5]
 
 
-def test_async_ptl_retry_rebuilds_messages_via_factory():
+def test_async_ptl_retry_rebuilds_messages_via_factory(monkeypatch):
     """Async counterpart of the rebuild assertion (CRITICAL-1)."""
     ok = LLMResponse(content="ok", model="m")
     llm = _MessageSizeAwareLLM(max_len=3, ok_response=ok)
@@ -245,7 +245,7 @@ def test_async_ptl_retry_rebuilds_messages_via_factory():
     async def _nosleep(s):
         return None
 
-    asyncio.sleep = _nosleep  # type: ignore[assignment]
+    monkeypatch.setattr(asyncio, "sleep", _nosleep)
 
     initial = _rebuild()
     resp = asyncio.run(caller._invoke_llm_async(llm, initial, messages_fn=_rebuild))
@@ -254,7 +254,7 @@ def test_async_ptl_retry_rebuilds_messages_via_factory():
     assert llm.seen_lengths == [5, 3]
 
 
-def test_ptl_retry_tolerates_messages_fn_raise():
+def test_ptl_retry_tolerates_messages_fn_raise(monkeypatch):
     """If messages_fn raises, retry proceeds with the current (stale) list
     rather than crashing."""
     ok = LLMResponse(content="ok", model="m", usage=None)
@@ -266,7 +266,7 @@ def test_ptl_retry_tolerates_messages_fn_raise():
 
     import time as _time
 
-    _time.sleep = lambda s: None  # type: ignore[assignment]
+    monkeypatch.setattr(_time, "sleep", lambda s: None)
 
     # Use a tight cap so rebuild failure → stale retry → all 3 attempts fail.
     llm2 = _MessageSizeAwareLLM(max_len=1, ok_response=ok)

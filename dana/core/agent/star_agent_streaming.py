@@ -7,6 +7,7 @@ aquery_text_stream(). Mixed into STARAgent so all methods retain self access.
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 
 import structlog
 
@@ -32,6 +33,9 @@ class STARAgentStreamingMixin:
         - MAX_ITERATIONS
     """
 
+    # AgentSession retains this mixin's coherent working timeline on success.
+    _stream_updates_timeline = True
+
     async def _think_stream(
         self,
         trace_percepts: DictParams,
@@ -39,9 +43,15 @@ class STARAgentStreamingMixin:
     ) -> AsyncIterator[StreamEvent]:
         """Streaming think phase. Yields StreamEvents while the LLM responds.
 
-        Handles typed LLMStreamChunk objects: text_delta, tool_use, thinking.
+        Handles typed LLMStreamChunk objects: text_delta, tool_use, thinking,
+        and the optional terminal "response" carrier.
+
         Builds a synthetic LLMResponse with both text and tool_calls so
-        parse_response works for native tool calling agents.
+        parse_response works for native tool calling agents. When the provider
+        emits a terminal "response" carrier, its non-delta fields (reasoning
+        items, response id, usage, finish reason) are preserved through
+        parse_response into _record_think_results; providers without one keep
+        their existing delta-derived behavior.
 
         Args:
             trace_percepts: Percepts from the SEE phase (timeline must be present).
@@ -53,7 +63,7 @@ class STARAgentStreamingMixin:
         """
         import json
 
-        from dana.common.llm.types import LLMResponse
+        from dana.common.llm.types import LLMResponse, ProviderError
 
         trace_percepts = trace_percepts or {}
         if self._do_exit_star_loop(trace_percepts) or not trace_percepts:
@@ -77,39 +87,69 @@ class STARAgentStreamingMixin:
                 agent_type=self.agent_type,
             )
 
-        # Collect chunks by type.
-        # Text is emitted as THINKING during streaming because we can't know
-        # if tool_calls will follow.  After the stream ends we reclassify:
-        #   tool_calls present  → text was thinking (already emitted correctly)
-        #   no tool_calls       → text is response, emit a single TEXT_DELTA
+        # Assistant narration is provisional until the turn commits. Only
+        # provider reasoning is a THINKING event; tools may follow visible text.
         text_chunks: list[str] = []
         tool_calls_from_stream: list[dict] = []
         thinking_chunks: list[str] = []
+        terminal_response: LLMResponse | None = None
 
-        async for chunk in stream_src:
-            if chunk.type == "text_delta":
-                text_chunks.append(chunk.content)
-                # Emit as THINKING; reclassified after stream completes
-                yield StreamEvent(event_type=StreamEventType.THINKING, data=chunk.content, iteration=iteration)
-            elif chunk.type == "tool_use":
-                tool_calls_from_stream.append(chunk.tool_call)
-                yield StreamEvent(event_type=StreamEventType.TOOL_CALL_START, data=[chunk.tool_call], iteration=iteration)
-            elif chunk.type == "thinking":
-                thinking_chunks.append(chunk.content)
-                yield StreamEvent(event_type=StreamEventType.THINKING, data=chunk.content, iteration=iteration)
+        async with aclosing(stream_src):
+            async for chunk in stream_src:
+                if chunk.type == "text_delta":
+                    text_chunks.append(chunk.content)
+                    yield StreamEvent(event_type=StreamEventType.TEXT_DELTA, data=chunk.content, iteration=iteration)
+                elif chunk.type == "tool_use":
+                    tool_calls_from_stream.append(chunk.tool_call)
+                    yield StreamEvent(event_type=StreamEventType.TOOL_CALL_START, data=[chunk.tool_call], iteration=iteration)
+                elif chunk.type == "thinking":
+                    thinking_chunks.append(chunk.content)
+                    yield StreamEvent(event_type=StreamEventType.THINKING, data=chunk.content, iteration=iteration)
+                elif chunk.type == "response" and chunk.response is not None:
+                    terminal_response = chunk.response
+                    yield StreamEvent(
+                        event_type=StreamEventType.PROVIDER_RESPONSE,
+                        data={
+                            "iteration": iteration,
+                            "model": terminal_response.model,
+                            "finish_reason": terminal_response.finish_reason,
+                            "usage": terminal_response.usage,
+                            "reasoning_tokens": terminal_response.reasoning_tokens,
+                            "response_id": terminal_response.response_id,
+                        },
+                        iteration=iteration,
+                    )
 
         buffered_text = "".join(text_chunks)
 
-        # Reclassify: if no tool calls, the text is the actual response
-        if not tool_calls_from_stream and buffered_text:
-            yield StreamEvent(event_type=StreamEventType.TEXT_DELTA, data=buffered_text, iteration=iteration)
+        # Some providers supply content only in their completion carrier.
+        if not buffered_text and terminal_response is not None and terminal_response.content:
+            yield StreamEvent(event_type=StreamEventType.TEXT_DELTA, data=terminal_response.content, iteration=iteration)
 
-        # Build synthetic LLMResponse with BOTH text and tool calls
-        synthetic_response = LLMResponse(
-            content=buffered_text,
-            model="streamed",
-            finish_reason="stop" if not tool_calls_from_stream else "tool_use",
-            tool_calls=[
+        if terminal_response is not None and (terminal_response.finish_reason or "").lower() in {
+            "length",
+            "max_tokens",
+            "incomplete",
+            "content_filter",
+            "safety",
+            "recitation",
+            "prohibited_content",
+        }:
+            # Provisional text remains visible, but a truncated/refused answer
+            # must not become a committed final answer or execute partial tools.
+            # Deterministic provider outcomes are permanent, never retried.
+            raise ProviderError(
+                f"Provider did not complete the answer: {terminal_response.finish_reason}",
+                terminal_response=terminal_response,
+            )
+
+        # Build synthetic LLMResponse with BOTH text and tool calls.
+        # Stream deltas stay authoritative for content and tool calls (they are
+        # what the host already saw); the terminal carrier only fills fields the
+        # deltas cannot express. Legacy providers that emit no carrier leave every
+        # value at its pre-existing delta-derived default.
+        streamed_tool_calls = (
+            [
                 type(
                     "ToolCall",
                     (),
@@ -128,8 +168,20 @@ class STARAgentStreamingMixin:
                 for tc in tool_calls_from_stream
             ]
             if tool_calls_from_stream
-            else None,
-            reasoning_content="".join(thinking_chunks) if thinking_chunks else None,
+            else None
+        )
+        resolved_tool_calls = streamed_tool_calls or (terminal_response.tool_calls if terminal_response else None)
+
+        synthetic_response = LLMResponse(
+            content=buffered_text or (terminal_response.content if terminal_response else ""),
+            model=(terminal_response.model if terminal_response else None) or "streamed",
+            usage=terminal_response.usage if terminal_response else None,
+            finish_reason=terminal_response.finish_reason if terminal_response else None,
+            tool_calls=resolved_tool_calls,
+            reasoning_content="".join(thinking_chunks) or (terminal_response.reasoning_content if terminal_response else None),
+            reasoning_tokens=terminal_response.reasoning_tokens if terminal_response else None,
+            reasoning_items=terminal_response.reasoning_items if terminal_response else None,
+            response_id=terminal_response.response_id if terminal_response else None,
         )
 
         parsed = self._runtime.parse_response(synthetic_response)
@@ -158,6 +210,8 @@ class STARAgentStreamingMixin:
             done,
             todo_list,
             output_state,
+            reasoning_items=parsed.reasoning_items,
+            response_id=parsed.response_id,
         )
         result_holder["trace_thoughts"] = trace_result
 
@@ -205,17 +259,24 @@ class STARAgentStreamingMixin:
             )
 
         full_text_parts: list[str] = []
-        async for chunk in stream_src:
-            if cancel_event.is_set():
-                raise asyncio.CancelledError
-            if chunk.type == "text_delta" and chunk.content:
-                full_text_parts.append(chunk.content)
-                yield chunk.content
+        async with aclosing(stream_src) as chunks:
+            async for chunk in chunks:
+                if cancel_event.is_set():
+                    raise asyncio.CancelledError
+                if chunk.type == "text_delta" and chunk.content:
+                    full_text_parts.append(chunk.content)
+                    yield chunk.content
+                elif chunk.type == "response" and chunk.response is not None and result_holder is not None:
+                    response = chunk.response
+                    result_holder["finish_reason"] = response.finish_reason
+                    result_holder["usage"] = response.usage
+                    result_holder["response_id"] = response.response_id
+                    result_holder["reasoning_tokens"] = response.reasoning_tokens
 
         if result_holder is not None:
             result_holder["full_text"] = "".join(full_text_parts)
             result_holder["protected_payload"] = None
-            result_holder["finish_reason"] = "stop"
+            result_holder.setdefault("finish_reason", None)
 
     async def aquery_stream(self, **kwargs) -> AsyncIterator[StreamEvent]:
         """Streaming version of aquery with session management.
@@ -244,12 +305,18 @@ class STARAgentStreamingMixin:
             self._event_log._current_session_id = session_id
 
         try:
-            async for event in self._run_aquery_stream(kwargs):
-                yield event
+            async with aclosing(self._run_aquery_stream(kwargs)) as events:
+                async for event in events:
+                    yield event
         finally:
+            # Observation events have no journal counterpart, so the event log is
+            # written even for a journal-managed session (when a host wired an
+            # observer at all — the session host wires none).
             if hasattr(self, "_event_log") and self._event_log is not None:
                 self._event_log.save(session_id)
-            if hasattr(self, "_timeline") and self._timeline is not None:
+            # The derived legacy timeline snapshot is only written when this agent
+            # owns durable history (see STARAgent._legacy_timeline_persistence_enabled).
+            if self._legacy_timeline_persistence_enabled() and hasattr(self, "_timeline") and self._timeline is not None:
                 self._timeline.save(session_id)
 
     async def _run_aquery_stream(self, kwargs: DictParams) -> AsyncIterator[StreamEvent]:
@@ -257,7 +324,7 @@ class STARAgentStreamingMixin:
 
         Yields StreamEvent objects from the STAR loop iterations.
         """
-        import asyncio
+        from contextlib import aclosing
 
         trace_inputs: DictParams = {"trace_inputs": kwargs}
         trace_outputs: DictParams = {}
@@ -269,11 +336,9 @@ class STARAgentStreamingMixin:
 
                 # THINK phase — stream text deltas
                 result_holder: dict = {}
-                async for event in self._think_stream(
-                    trace_percepts.get("trace_percepts", {}),
-                    result_holder,
-                ):
-                    yield event
+                async with aclosing(self._think_stream(trace_percepts.get("trace_percepts", {}), result_holder)) as events:
+                    async for event in events:
+                        yield event
 
                 # result_holder now contains {"trace_thoughts": ...}
                 trace_thoughts_wrapper = result_holder.get("trace_thoughts", {"trace_thoughts": {}})
@@ -294,18 +359,12 @@ class STARAgentStreamingMixin:
                         iteration=iteration,
                     )
 
-                # Trigger acquisitive learning asynchronously
+                # Reflection mutates agent state. Finish it in this turn rather
+                # than leaking work into the next turn or beyond cancellation.
                 if not self._do_exit_star_loop(trace_outputs.get("trace_outputs", {})):
                     acquisitive_input = trace_outputs.get("trace_outputs", {}).copy()
                     acquisitive_input["phase"] = LearningPhase.ACQUISITIVE
-
-                    async def _async_reflect(acq_input):
-                        try:
-                            self._reflect(acq_input)
-                        except Exception as reflect_err:
-                            logger.error("Async reflection failed", error=str(reflect_err))
-
-                    asyncio.create_task(_async_reflect(acquisitive_input))
+                    self._reflect(acquisitive_input)
 
                 if self._do_exit_star_loop(trace_outputs.get("trace_outputs", {})):
                     break
@@ -317,16 +376,19 @@ class STARAgentStreamingMixin:
                 from dana.core.llm.llm_caller import is_transient_llm_error
 
                 logger.error(
-                    "Error in aquery_stream (transient=%s): %s",
-                    is_transient_llm_error(exc),
-                    exc,
-                    exc_info=True,
+                    "Provider stream failed",
+                    error_type=type(exc).__name__,
+                    transient=is_transient_llm_error(exc),
                 )
                 yield StreamEvent(
                     event_type=StreamEventType.ERROR,
-                    data=str(exc),
+                    data=exc,
                     iteration=self._star_loop_count,
                 )
                 return
 
-        yield StreamEvent(event_type=StreamEventType.DONE, data=None, iteration=self._star_loop_count)
+        yield StreamEvent(
+            event_type=StreamEventType.DONE,
+            data=None,
+            iteration=self._star_loop_count,
+        )

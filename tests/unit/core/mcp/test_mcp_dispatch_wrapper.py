@@ -515,6 +515,107 @@ class TestPerToolMcpUx:
         adapter._transport.call_tool.assert_awaited_once_with("fs:greet", {"name": "World"})
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_error", [False, True])
+    async def test_per_tool_dispatch_preserves_remote_status_and_identity_through_hooks(self, is_error):
+        from dana.core.mcp.dispatch_wrapper import _make_mcp_dispatcher
+
+        adapter = _mock_adapter()
+        adapter.call_tool = AsyncMock(
+            return_value={
+                "success": not is_error,
+                "result": [{"type": "text", "text": "remote response"}],
+                "tool_call_id": "tc-remote",
+                "transport_request_id": 73,
+                "_effect_unknown": is_error,
+            }
+        )
+        dispatch_map = {"fs:greet": _make_mcp_dispatcher(adapter, "fs:greet")}
+        executor = ToolExecutor(mcp_dispatch_getter=lambda: dispatch_map)
+        recorded = []
+        executor.set_execution_hooks(after=lambda call, result: recorded.append(dict(result)))
+        try:
+            results = await executor.execute_tools_async(
+                object(),
+                [
+                    {"function": "fs:greet", "tool_call_id": "tc-remote", "arguments": {}},
+                ],
+            )
+            assert len(recorded) == 1
+            for result in [results[0], recorded[0]]:
+                assert result["success"] is not is_error
+                assert result["transport_request_id"] == 73
+                assert result["tool_call_id"] == "tc-remote"
+                assert result["_effect_unknown"] is is_error
+                assert result["type"] == "mcp"
+            adapter.call_tool.assert_awaited_once_with("fs:greet", {}, "tc-remote")
+        finally:
+            executor.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("arity", [1, 2])
+    async def test_registered_dispatcher_arity_binds_before_single_effect(self, tmp_path, arity):
+        path = tmp_path / "effect"
+        received = []
+
+        async def one(arguments):
+            path.write_text(arguments["value"])
+            received.append(None)
+            return "committed"
+
+        async def two(arguments, tool_call_id=None):
+            path.write_text(arguments["value"])
+            received.append(tool_call_id)
+            return "committed"
+
+        dispatcher = one if arity == 1 else two
+        executor = ToolExecutor(mcp_dispatch_getter=lambda: {"fs:write": dispatcher})
+        try:
+            results = await executor.execute_tools_async(
+                object(),
+                [
+                    {"function": "fs:write", "arguments": {"value": "committed"}, "tool_call_id": "write-call"},
+                ],
+            )
+            assert results[0]["success"] is True
+            assert results[0]["tool_call_id"] == "write-call"
+            assert path.read_text() == "committed"
+            assert received == [None if arity == 1 else "write-call"]
+        finally:
+            executor.close()
+
+    @pytest.mark.asyncio
+    async def test_registered_dispatcher_body_typeerror_does_not_repeat_effect(self, tmp_path):
+        path = tmp_path / "effects"
+        received = []
+
+        def needs_value(value):
+            return value
+
+        async def dispatcher(arguments, tool_call_id=None):
+            with path.open("a") as file:
+                file.write("committed\n")
+            received.append(tool_call_id)
+            # This is an ordinary Python argument-binding error in the body,
+            # not evidence that the outer dispatcher rejected its arguments.
+            needs_value()
+
+        executor = ToolExecutor(mcp_dispatch_getter=lambda: {"fs:write": dispatcher})
+        try:
+            results = await executor.execute_tools_async(
+                object(),
+                [
+                    {"function": "fs:write", "arguments": {}, "tool_call_id": "write-call"},
+                ],
+            )
+            assert results[0]["success"] is False
+            assert results[0]["tool_call_id"] == "write-call"
+            assert "required positional argument" in results[0]["result"]
+            assert path.read_text() == "committed\n"
+            assert received == ["write-call"]
+        finally:
+            executor.close()
+
+    @pytest.mark.asyncio
     async def test_mcp_dispatch_does_not_intercept_native_tools(self):
         """A native @named_tool (call_mcp_tool) dispatches via the registry, NOT the MCP map."""
 

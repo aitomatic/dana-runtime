@@ -95,13 +95,20 @@ class TestEmbedderMethods:
 class TestEmbedderSwitchProvider:
     """Tests for provider switching."""
 
-    def test_switch_to_non_embedding_provider_raises(self):
-        mock_provider = _make_mock_provider()
-        embedder = Embedder(provider=mock_provider)
-        with patch("dana.common.llm.embedder.create_provider") as mock_create:
-            mock_create.return_value = _make_mock_provider(supports_embeddings=False)
+    @pytest.mark.asyncio
+    async def test_rejected_switch_preserves_provider_and_closes_candidate(self):
+        original = _make_mock_provider()
+        rejected = _make_mock_provider(supports_embeddings=False)
+        embedder = Embedder(provider=original)
+        with patch("dana.common.llm.embedder.create_provider", return_value=rejected):
             with pytest.raises(EmbeddingNotSupportedError):
                 embedder.switch_provider("anthropic")
+        assert embedder.provider is original
+        assert embedder.provider_name == "custom"
+        assert embedder.model == "test-embedding-model"
+        await embedder.aclose()
+        original.aclose.assert_awaited_once()
+        rejected.aclose.assert_awaited_once()
 
 
 class TestEmbedderAvailableProviders:

@@ -78,6 +78,9 @@ class AzureProvider(OpenAICompatibleProvider):
             azure_endpoint=azure_endpoint,
             api_version=self.api_version,
             http_client=make_logging_http_client(self.DEFAULT_TIMEOUT_SECONDS),
+            # max_retries=0: see OpenAIProvider — retry/deadline policy is owned by
+            # LLMCaller so wire attempt counts and the wall-clock budget are bounded.
+            max_retries=0,
         )
 
         # Check for use_responses_api config flag

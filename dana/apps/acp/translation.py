@@ -58,6 +58,9 @@ def host_event_to_acp_update(event: HostEvent) -> Any:
     # ASSISTANT_CONTENT_FINAL: already streamed via chunks — skip to avoid duplication.
     # TURN_*, SESSION_*: no ACP update in D1; the response signals completion.
 
+    if event.event_type is HostEventType.TURN_ERROR:
+        return update_agent_message_text(f"\nError: {event.metadata.get('error', 'Agent turn failed')}\n")
+
     # --- D2: Agent thought ---
     if event.event_type is HostEventType.THOUGHT:
         return update_agent_thought_text(event.text or "")

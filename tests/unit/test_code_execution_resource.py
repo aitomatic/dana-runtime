@@ -1,7 +1,5 @@
 """Unit tests for CodeExecutionResource."""
 
-import pytest
-
 from dana.common.resource import CodeExecutionResource
 
 
@@ -155,9 +153,7 @@ while True:
 
     def test_allowed_modules_parameter(self):
         """Test that allowed_modules parameter extends whitelist."""
-        resource = CodeExecutionResource(
-            allowed_modules=["decimal"], auto_register=False
-        )
+        resource = CodeExecutionResource(allowed_modules=["decimal"], auto_register=False)
 
         result = resource.execute("""
 import decimal

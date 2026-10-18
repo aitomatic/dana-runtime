@@ -7,8 +7,8 @@ Provides configurable responses, fault injection, and call history tracking.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import time
-from dataclasses import dataclass, field
 from typing import Any
 
 from dana.common.llm.types import LLMMessage, LLMResponse
@@ -80,13 +80,15 @@ class MockLLMClient:
     def _record_call(self, messages: list[LLMMessage], **kwargs) -> None:
         """Record a call to the mock LLM."""
         self._call_count += 1
-        self.call_history.append({
-            "call_number": self._call_count,
-            "timestamp": time.time(),
-            "messages": [{"role": m.role, "content": m.content[:100]} for m in messages],
-            "message_count": len(messages),
-            "kwargs": kwargs,
-        })
+        self.call_history.append(
+            {
+                "call_number": self._call_count,
+                "timestamp": time.time(),
+                "messages": [{"role": m.role, "content": m.content[:100]} for m in messages],
+                "message_count": len(messages),
+                "kwargs": kwargs,
+            }
+        )
 
     async def chat_response(self, messages: list[LLMMessage], **kwargs) -> LLMResponse:
         """Async chat response - matches LLM interface."""
@@ -136,51 +138,56 @@ class MockLLMClient:
         method: str = "query",
         message: str = "test message",
     ) -> LLMResponseScenario:
-        """Well-formed XML tool call."""
-        xml = f"""I'll help you with that.
-
-<tool_call>
-<target id="{target_id}"/>
-<method>{method}</method>
-<arguments>
-<message>{message}</message>
-</arguments>
-</tool_call>"""
+        """Tool call using the published CSXMLCodec response contract."""
+        xml = f"""<thinking>I'll call the requested tool.</thinking>
+<function_call>
+<invoke name="{target_id}:{method}">
+<parameter name="message">{message}</parameter>
+</invoke>
+</function_call>"""
         return LLMResponseScenario(content=xml)
 
     @staticmethod
     def malformed_xml_missing_closing() -> LLMResponseScenario:
         """XML with missing closing tag - common small LLM failure."""
-        return LLMResponseScenario(content="""I'll search for that.
+        return LLMResponseScenario(
+            content="""I'll search for that.
 
 <tool_call>
 <target id="search"/>
 <method>query</method>
 <arguments><message>test</message></arguments>
 <!-- missing </tool_call> -->
-""")
+"""
+        )
 
     @staticmethod
     def malformed_xml_wrong_tag() -> LLMResponseScenario:
         """Wrong tag name - common small LLM variation."""
-        return LLMResponseScenario(content="""<function name="search.query">
+        return LLMResponseScenario(
+            content="""<function name="search.query">
 <param>test query</param>
-</function>""")
+</function>"""
+        )
 
     @staticmethod
     def json_in_xml() -> LLMResponseScenario:
         """JSON content inside XML tags - mixed format."""
-        return LLMResponseScenario(content="""<tool_call>
+        return LLMResponseScenario(
+            content="""<tool_call>
 {"target": "search", "method": "query", "args": {"message": "test"}}
-</tool_call>""")
+</tool_call>"""
+        )
 
     @staticmethod
     def hallucinated_tool(tool_id: str = "non-existent-tool") -> LLMResponseScenario:
         """Call to non-existent tool - common small LLM failure."""
-        return LLMResponseScenario(content=f"""<tool_call>
+        return LLMResponseScenario(
+            content=f"""<tool_call>
 <target id="{tool_id}"/>
 <method>do_thing</method>
-</tool_call>""")
+</tool_call>"""
+        )
 
     @staticmethod
     def repeated_tool_calls() -> LLMResponseScenario:
@@ -217,9 +224,7 @@ class MockLLMClient:
     @staticmethod
     def error_in_reasoning() -> LLMResponseScenario:
         """Response with error in reasoning text."""
-        return LLMResponseScenario(
-            content="I encountered an error while processing your request."
-        )
+        return LLMResponseScenario(content="I encountered an error while processing your request.")
 
     @staticmethod
     def csxml_codec_format(
@@ -229,12 +234,14 @@ class MockLLMClient:
         param_value: str = "test",
     ) -> LLMResponseScenario:
         """CSXMLCodec format tool call."""
-        return LLMResponseScenario(content=f"""<thinking>I need to search for information.</thinking>
+        return LLMResponseScenario(
+            content=f"""<thinking>I need to search for information.</thinking>
 <function_call>
 <invoke name="{class_name}:{method}">
 <parameter name="{param_name}">{param_value}</parameter>
 </invoke>
-</function_call>""")
+</function_call>"""
+        )
 
     @staticmethod
     def klxml_codec_format(
@@ -244,10 +251,12 @@ class MockLLMClient:
         param_value: str = "test",
     ) -> LLMResponseScenario:
         """KLXMLCodec format tool call."""
-        return LLMResponseScenario(content=f"""<thinking>I need to search for information.</thinking>
+        return LLMResponseScenario(
+            content=f"""<thinking>I need to search for information.</thinking>
 <{class_name}:{method}>
 <param name="{param_name}">{param_value}</param>
-</{class_name}:{method}>""")
+</{class_name}:{method}>"""
+        )
 
     @staticmethod
     def native_openai_tool_calls(
@@ -259,10 +268,12 @@ class MockLLMClient:
             arguments = {"message": "test"}
         return LLMResponseScenario(
             content="",  # Content typically empty with native tool calls
-            tool_calls=[{
-                "function": function_name,
-                "arguments": arguments,
-            }],
+            tool_calls=[
+                {
+                    "function": function_name,
+                    "arguments": arguments,
+                }
+            ],
             finish_reason="tool_calls",
         )
 
@@ -285,6 +296,7 @@ class MockLLMClient:
 
 
 # ==================== Small LLM Specific Scenarios ====================
+
 
 @dataclass
 class SmallLLMScenarios:
@@ -309,28 +321,33 @@ class SmallLLMScenarios:
     @staticmethod
     def missing_attribute() -> LLMResponseScenario:
         """Target without id attribute - uses content instead."""
-        return LLMResponseScenario(content="""<tool_call>
+        return LLMResponseScenario(
+            content="""<tool_call>
 <target>search-resource</target>
 <method>query</method>
 <arguments><message>test</message></arguments>
-</tool_call>""")
+</tool_call>"""
+        )
 
     @staticmethod
     def wrong_parameter_name() -> LLMResponseScenario:
         """Common parameter name variations."""
-        return LLMResponseScenario(content="""<tool_call>
+        return LLMResponseScenario(
+            content="""<tool_call>
 <target id="search"/>
 <method>query</method>
 <arguments>
 <msg>test message</msg>
 <q>search query</q>
 </arguments>
-</tool_call>""")
+</tool_call>"""
+        )
 
     @staticmethod
     def extra_whitespace() -> LLMResponseScenario:
         """Excessive whitespace that might break parsing."""
-        return LLMResponseScenario(content="""
+        return LLMResponseScenario(
+            content="""
 
     <tool_call>
 
@@ -344,20 +361,24 @@ class SmallLLMScenarios:
 
     </tool_call>
 
-""")
+"""
+        )
 
     @staticmethod
     def mixed_codec_format() -> LLMResponseScenario:
         """CSXMLCodec tag with KLXMLCodec parameter style."""
-        return LLMResponseScenario(content="""<thinking>Processing...</thinking>
+        return LLMResponseScenario(
+            content="""<thinking>Processing...</thinking>
 <SearchResource:query>
 <parameter name="message">test</parameter>
-</SearchResource:query>""")
+</SearchResource:query>"""
+        )
 
     @staticmethod
     def numbered_list_as_tools() -> LLMResponseScenario:
         """Small LLM outputs numbered list instead of tool calls."""
-        return LLMResponseScenario(content="""I'll help you with that. Here are the steps:
+        return LLMResponseScenario(
+            content="""I'll help you with that. Here are the steps:
 
 1. Search for information using the search resource
 2. Process the results
@@ -367,4 +388,5 @@ Let me start with step 1:
 <tool_call>
 <target id="search"/>
 <method>query</method>
-</tool_call>""")
+</tool_call>"""
+        )

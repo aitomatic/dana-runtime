@@ -89,7 +89,8 @@ class RichCLIRenderer(Notifiable):
         self._agent_stack: list[str] = []  # Track parent agent IDs for subagent transitions
         self._completed_subagents: list[SubagentCardComponent] = []  # Completed subagent cards for display
         self._caller_message_shown = False  # Only show ❯ once per user interaction
-        self._seen_tool_calls = False  # Suppress streaming once tools are in play
+        self._seen_tool_calls = False
+        self._provisional_text: list[str] = []
         self._tool_names: dict[str, str] = {}  # D7.2: tool_call_id → name (HostEvent bridge)
         self._lock = threading.Lock()
 
@@ -735,6 +736,7 @@ class RichCLIRenderer(Notifiable):
         """TURN_STARTED: reset stream display and start the spinner."""
         self._flush_tool_cards()
         self._stream_display.clear()
+        self._provisional_text.clear()
         self._seen_tool_calls = False
         self._caller_message_shown = False
         self._tool_names.clear()
@@ -762,6 +764,13 @@ class RichCLIRenderer(Notifiable):
         self._flush_tool_cards()
         self._spinner.stop()
         self._stop_live()
+        if self._provisional_text:
+            if self._has_color:
+                self.console.print(Markdown("".join(self._provisional_text)))
+            else:
+                self.console.print()
+            self._provisional_text.clear()
+            self._stream_display.clear()
         if kind == "cancelled":
             self.console.print(Text(f"  ✗ {cancellation_outcome(event)}", style="yellow"))
         else:
@@ -796,15 +805,17 @@ class RichCLIRenderer(Notifiable):
         if not chunk:
             return
         self._spinner.increment_chars(len(chunk))
-        # Once tools are in play, intermediate text is reasoning — suppress.
-        if self._seen_tool_calls:
+        if not self.verbose or self._agent_stack:
             return
+        self._provisional_text.append(chunk)
         self._stream_display.append_chunk(chunk)
         self._ensure_live()
         if not self._spinner.running:
             self._spinner.start()
         if self._has_color:
             self._refresh_display()
+            if self._live is not None:
+                self._live.refresh()
         else:
             self.console.print(chunk, end="")
 
@@ -815,11 +826,18 @@ class RichCLIRenderer(Notifiable):
         self._stop_live()
         response = event.text or ""
         if response and self.verbose and not self._agent_stack:
-            self.console.print()
+            streamed = "".join(self._provisional_text)
             if self._has_color:
                 self.console.print(Markdown(response))
-            else:
+            elif streamed == response:
+                self.console.print()
+            elif not streamed:
                 self.console.print(response)
+            else:
+                self.console.print()
+                self.console.print(response)
+        self._provisional_text.clear()
+        self._stream_display.clear()
 
     def show_thought(self, event: HostEvent) -> None:
         """THOUGHT: print reasoning text (dim italic in color mode)."""
@@ -853,6 +871,14 @@ class RichCLIRenderer(Notifiable):
 
     def show_tool_requested(self, event: HostEvent) -> None:
         """TOOL_REQUESTED: enqueue a pending tool card (flushed at terminal/turn)."""
+        if self._provisional_text:
+            self._stop_live()
+            if self._has_color:
+                self.console.print(Markdown("".join(self._provisional_text)))
+            else:
+                self.console.print()
+            self._provisional_text.clear()
+            self._stream_display.clear()
         self._seen_tool_calls = True
         if self.show_tool_calls:
             self._pending_tool_cards.append(self._record_tool_name(event))

@@ -144,8 +144,7 @@ async def agent(tmp_path):
     conn = RecordingConn()
     a.on_connect(conn)
     yield a, conn
-    if a._repository is not None:
-        await a._repository.close()
+    await a.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +281,8 @@ class TestLoadSession:
         user_texts = [_update_text(u) for _, u in conn2.updates if _update_kind(u) == "user_message_chunk"]
         assert any("hello" in (t or "") for t in user_texts)
 
+        await a2.aclose()
+
 
 # ===========================================================================
 # 4. prompt — streaming, first chunk, drain-before-response
@@ -332,6 +333,8 @@ class TestPrompt:
         agent_texts = [_update_text(u) for _, u in conn.updates if _update_kind(u) == "agent_message_chunk"]
         # Chunks preserve stream order.
         assert agent_texts == ["A", "B", "C"]
+
+        await a.aclose()
 
     @pytest.mark.asyncio
     async def test_first_chunk_before_response(self, agent):
@@ -385,6 +388,8 @@ class TestBusy:
         resp1 = await asyncio.wait_for(prompt1, timeout=5.0)
         assert resp1.stop_reason == "end_turn"
 
+        await a.aclose()
+
 
 # ===========================================================================
 # 6. cancel
@@ -414,6 +419,8 @@ class TestCancel:
         gate.set()
         resp = await asyncio.wait_for(prompt_task, timeout=5.0)
         assert resp.stop_reason == "cancelled"
+
+        await a.aclose()
 
 
 # ===========================================================================
@@ -465,6 +472,8 @@ class TestResumeSession:
 
         kinds = [_update_kind(u) for _, u in conn2.updates]
         assert "user_message_chunk" in kinds
+
+        await a2.aclose()
 
 
 # ===========================================================================
@@ -698,6 +707,8 @@ class TestModelSwitching:
         assert len(resp.models.available_models) == 2
         assert resp.models.current_model_id == "anthropic/claude-sonnet-4"
 
+        await a.aclose()
+
     @pytest.mark.asyncio
     async def test_set_session_model_switches_model(self, tmp_path):
         """session/set_model switches to a configured target and journals MODEL_CHANGED."""
@@ -736,6 +747,8 @@ class TestModelSwitching:
         assert len(model_changed_facts) == 1
         assert model_changed_facts[0].payload["provider"] == "openai"
         assert model_changed_facts[0].payload["model"] == "gpt-4o"
+
+        await a.aclose()
 
     @pytest.mark.asyncio
     async def test_history_survives_switch(self, tmp_path):
@@ -786,6 +799,9 @@ class TestModelSwitching:
         assert "user_message_chunk" in kinds
         assert "agent_message_chunk" in kinds
 
+        await a2.aclose()
+        await a.aclose()
+
     @pytest.mark.asyncio
     async def test_unknown_model_target_raises(self, tmp_path):
         """Switching to an unconfigured model raises ValueError."""
@@ -809,6 +825,8 @@ class TestModelSwitching:
 
         with pytest.raises(ValueError, match="Unknown model target"):
             await a.set_session_model(model_id="openai/gpt-4o", session_id=sid)
+
+        await a.aclose()
 
     @pytest.mark.asyncio
     async def test_rollback_disables_model_switching(self, tmp_path, monkeypatch):
@@ -839,6 +857,8 @@ class TestModelSwitching:
         # set_session_model should raise
         with pytest.raises(RuntimeError, match="Model switching is disabled"):
             await a.set_session_model(model_id="openai/gpt-4o", session_id=sid)
+
+        await a.aclose()
 
     @pytest.mark.asyncio
     async def test_model_change_journaled_once(self, tmp_path):
@@ -874,6 +894,8 @@ class TestModelSwitching:
         assert len(model_changed_facts) == 2
         assert model_changed_facts[0].payload["model"] == "gpt-4o"
         assert model_changed_facts[1].payload["model"] == "claude-haiku-3"
+
+        await a.aclose()
         """initialize → session/new round-trip over stdio."""
         env = {
             **os.environ,

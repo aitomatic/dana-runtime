@@ -206,6 +206,11 @@ Learner.process_interaction(
 Return Response to User
 ```
 
+Default prompt context contains the date, timezone, and local user name. It
+does not perform IP geolocation. Applications supplying site or location context
+can override `AgentRuntime._get_runtime_context`; explicitly selecting the
+`location` field retains the existing opt-in lookup behavior.
+
 ## Resource Execution System
 
 ```
@@ -237,9 +242,8 @@ STARAgent
        │  └─ Multi-source aggregation
        │
        ├─ TaskResource
-       │  ├─ create(title, description)
-       │  ├─ update(id, status)
-       │  └─ list(filter)
+       │  ├─ task(description, prompt, subagent_type, resume)
+       │  └─ task_output(task_id)
        │
        ├─ TodoResource
        │  ├─ add(title)
@@ -260,6 +264,30 @@ STARAgent
              ├─ Annotated methods = tools
              └─ Auto schema generation
 ```
+
+`AgentRuntime` keys native tool schemas by agent, membership revision, and the
+current underlying provider identity, so changing capabilities inside one LLM
+wrapper also refreshes them. Bound dispatch registries have an independent
+agent/revision key. STAR's `with_*`, `add_*`, successful `remove_*`, and changed
+LLM binding invalidate metadata and rendered codec prompts without discarding
+prompt-template overrides. Stable warm refreshes reuse the metadata.
+`AgentSession` keys the merged `ToolCatalog` by the runtime catalog revision and
+MCP wiring identity; replacing MCP wiring refreshes its schemas and dispatch map.
+
+Tool discovery checks decorator markers with static attribute lookup before
+binding declared callables. It does not evaluate unrelated public properties,
+which can construct clients or render prompts. Normal Python attribute binding
+is preserved for functions installed directly on an instance, so their first
+required argument remains in the model-visible schema.
+Native tool dispatch resolves bound resources for the invoking agent, not a
+runtime-wide most recently used agent. That owner remains explicit across
+permission/EventBus waits, so overlapping invocations on a shared runtime do not
+redirect a resumed call to another agent's resources. Registry rebuilds publish
+a complete fresh mapping instead of clearing a mapping held by an active call.
+The owner, build revision, and mapping form one cache entry, captured once by a
+reader and replaced atomically by a builder or reset. Standalone executors retain
+the zero-argument registry-getter contract; the runtime supplies its
+invocation-aware getter through an explicit keyword dependency.
 
 ## Workflow Execution
 
@@ -318,6 +346,46 @@ Runtime (Abstract Interface)
           ├─ Parse XML responses
           └─ For non-native providers
 ```
+
+`LLMCaller` owns request retries and the logical-request deadline
+(`DANA_LLM_REQUEST_DEADLINE_SECONDS`, default 900 seconds; zero disables it).
+Each attempt receives the remaining budget as its SDK timeout; async calls
+and stream pulls are additionally bounded by that budget. Provider SDK retries
+are disabled. Streaming retries are allowed only before any chunk is emitted,
+not around an entire effect-bearing STAR cycle.
+
+Streaming completion carriers preserve provider-reported finish status,
+usage/cache/reasoning counters, response identity, and compatible protected
+replay state. Unknown finish status remains unknown; truncation and refusal
+must not become successful final answers. Typed provider errors survive the
+LLM facade. Owners call `LLM.aclose()` and `Embedder.aclose()` on the owning
+event loop; shutdown also joins cleanup of providers retired by model switches.
+Rejected provider switches leave the active client unchanged and close the
+unused replacement; rejected factory-created embedding clients are also closed.
+An incomplete response takes precedence over any included function calls.
+Responses API error events propagate as typed errors; Gemini SDK finish enums
+are normalized to wire values before the STAR completion guard.
+
+Named provider selection and assignment through `llm_client` transfer ownership
+to STAR; `llm_provider_instance` is borrowed. Replacement retires the previous
+owned client without closing borrowed clients. Agent shutdown closes internally
+created child agents, not caller-supplied children attached with `with_agents`
+or `add_agent`. The caller remains responsible for borrowed clients and children.
+Ownership follows the facade's current provider: switching from a borrowed
+provider to a newly constructed provider makes the replacement agent-owned.
+Reinjecting the same pool preserves ownership without retiring the installed
+pool; displaced facades transfer pending cleanup to the surviving facade.
+`STARAgent.close()` is non-blocking inside an event loop. Await `aclose()` to
+finish owned-provider and owned-child cleanup, including earlier retirements
+when the current provider is borrowed. Concurrent callers join a dedicated
+teardown task, not another caller's lifetime; cancelling a joiner does not
+cancel that cleanup.
+
+The public `dana.common.llm` exports load lazily. Importing message types does
+not initialize unused provider or embedding modules. Optional tracing SDKs
+remain disabled when absent. Lifecycle import, construction, and flushing run
+inside the bounded shutdown worker; failure diagnostics include exception types,
+not provider payloads.
 
 ## Provider Configuration & Priority
 
@@ -510,12 +578,37 @@ Agent.aquery_stream(message=…)
     └─ Timeline.add_entry(AssistantEntry)
 ```
 
+`AgentSession.prompt()` forwards assistant text as provisional host deltas
+before the provider finishes. Reasoning remains a distinct event. Text before
+a tool call is narration, not a committed final answer. Final content and the
+turn terminal fact commit atomically; cancellation or failure retains partial
+host output without admitting it as a successful model-facing final answer.
+
+The session owns stream pulls, closes nested iterators, and resolves in-flight
+journal commits before acknowledging cancellation. Hosts must exhaust or close
+the prompt iterator before calling `AgentSession.aclose()`. A session created
+with an injected repository borrows it; `AgentSession.create()` owns and closes
+the repository it opens. ACP and CLI close sessions before host-owned storage.
+
 ## Concurrency Model
 
-- **Async throughout**: All I/O is non-blocking
-- **Tool execution**: Sequential by default (preserves order)
-- **Multiple agents**: Can run concurrently with asyncio.gather()
-- **Web research**: Concurrent HTTP requests within single research task
+- **Bounded admission**: `ToolExecutor` shares an admission controller with
+  nested execution. Leaf tools and nested tasks have separate capacity limits;
+  queued cancellation does not release a slot held by running work.
+- **Effect ordering**: Independent calls can run concurrently. Conflicting
+  declared effects retain call order, including file targets redirected by
+  interception before execution.
+- **Blocking tools**: Only explicitly eligible synchronous tools run in the
+  bounded offload pool. Other synchronous Python still runs on the event loop;
+  asynchronous APIs do not make arbitrary blocking work non-blocking.
+- **Nested progress**: A nested call can lend its held slot to a descendant to
+  avoid self-deadlock. An ancestor cannot release that capacity while borrowed
+  descendant work remains active.
+- **Task state**: `TaskResource` constructs a fresh child from its registered
+  factory for each new task. Cancellation records `cancelled` before propagating
+  `CancelledError`; `task_output(task_id)` then returns `Status: cancelled`
+  rather than leaving an exited child permanently `running`. The existing
+  session handle remains available for an explicit resume.
 
 ## Extension Points
 
@@ -566,11 +659,12 @@ Implement provider interface + add to config.json
 
 ## Session Journal Architecture (D1: Durable Dana Conversation)
 
-The Session Journal is the **sole durable authority** for Dana agent
-sessions. Every turn — input, streamed chunks, terminal — is appended as a
-typed, immutable `JournalFact` *before* the model is invoked and *before*
-the response is returned. A host restart that calls `session/load` sees the
-full conversation replayed before the call returns.
+The Session Journal is the **sole durable authority** for journal-managed Dana
+sessions. Input and turn-start facts are committed before model execution.
+Streamed assistant text is provisional and can be journaled in buffered chunks;
+final assistant content and the successful terminal fact are committed together
+before completion is returned. Restarted hosts rebuild the conversation from
+committed final facts and compatible derived checkpoints, not provisional chunks.
 
 ```
 ┌────────────────────┐ JSON-RPC (stdio) ┌──────────────────────────────┐
@@ -651,6 +745,24 @@ version differs, `JournalConflict` is raised and no facts are persisted.
 The SQLite adapter uses `BEGIN IMMEDIATE`; the Postgres adapter uses the
 equivalent row-level lock. This is the contract that lets multiple
 subprocesses share a journal safely.
+
+Ordinary turns fold facts after the retained projection cursor instead of
+rereading the full journal. Owner/sequence-bound checkpoints are derived caches,
+not authority: reopen can rebuild from facts. The retained model working set
+and checkpoint preserve the actual plain or compressed context, including
+summary messages, completed tool groups, and compatible replay state. External
+writers remain visible through the journal version and sequence boundary.
+Restoration copies the committed snapshot before decoding, so a failed turn's
+mutable content, metadata, or tool arguments cannot corrupt recovery state.
+Checkpoint entries are decoded inside the rejection boundary; malformed caches
+fall back to the intact journal rather than preventing session load.
+
+`AgentSession` marks its agent as journal-managed before hydration. That agent
+does not also write a whole-history legacy timeline snapshot after each turn.
+Standalone STAR query/stream/resume callers retain legacy snapshot durability;
+the journal ownership flag is independent of protected replay ownership.
+Internal session checkpoint/replay reads borrow the working native messages
+synchronously and never expose those mutable objects to external callers.
 
 ### Protected state
 

@@ -294,9 +294,11 @@ def _policy_with_common_rules() -> PermissionPolicy:
         lambda op: "rm -rf blocked" if op.tool_identity.name == "bash_tool" and "rm -rf" in str(op.arguments.get("command", "")) else None
     )
     policy.deny(
-        lambda op: "protected path"
-        if op.tool_identity.name in ("write", "edit") and str(op.arguments.get("path", "")) in {".env", "node_modules"}
-        else None
+        lambda op: (
+            "protected path"
+            if op.tool_identity.name in ("write", "edit") and str(op.arguments.get("path", "")) in {".env", "node_modules"}
+            else None
+        )
     )
     return policy
 

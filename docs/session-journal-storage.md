@@ -110,6 +110,26 @@ ALL assistant finals regardless of terminal status, which differs from
 `ConversationProjector`'s committed-turn gating — partial output remains
 visible in the legacy format.
 
+### Incremental model working context
+
+The journal remains authoritative. `AgentSession` applies facts after its last
+projected sequence instead of rebuilding unchanged history. A completed turn
+may save a derived `conversation-working-v1` checkpoint containing the projection
+cursor and the retained model-facing timeline. The working timeline is a deep
+snapshot, excludes ephemeral context, and preserves compaction summaries rather
+than replaying compressed-away messages.
+
+With a protected-state codec, the entire checkpoint is encrypted and bound to
+its owner, workspace, session and sequence. Without a codec, snapshots containing
+protected reasoning are not persisted. Invalid, incompatible or unreadable
+checkpoints fall back to journal replay; checkpoint failure cannot undo a
+committed turn. Backend checkpoint updates cannot replace a newer sequence
+with an older one.
+
+Native compacted snapshots retain both the explicit summary and the oldest
+retained message carrying the same compression timestamp. Resume must not
+discard that summary and synthesize differently formatted provider context.
+
 ## 3. Rollback
 
 `DANA_SESSION_JOURNAL_AUTHORITY=0` is the documented rollback switch for the

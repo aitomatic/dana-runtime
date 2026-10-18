@@ -50,6 +50,10 @@ class OpenAIProvider(OpenAICompatibleProvider):
             api_key=self.api_key,
             base_url=self.base_url,
             http_client=make_logging_http_client(self.DEFAULT_TIMEOUT_SECONDS),
+            # max_retries=0: bounded retry ownership lives in LLMCaller, which has the
+            # request deadline and knows whether output was already emitted. The SDK
+            # default (2) tripled the wire attempts invisibly per outer attempt.
+            max_retries=0,
         )
 
         # Check for use_responses_api config flag

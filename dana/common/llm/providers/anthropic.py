@@ -228,14 +228,40 @@ class AnthropicProvider(LLMProvider):
         else:
             self.base_url = config_manager.get_provider_base_url("anthropic")
 
-        # Use official Anthropic client with prompt caching beta header
+        # Use official Anthropic client with prompt caching beta header.
+        # max_retries=0: bounded retry/deadline policy is owned by LLMCaller, which
+        # knows whether output has already been emitted. SDK-internal retries would
+        # multiply the wire attempts invisibly (default 2 → 3x) and cannot be bounded
+        # by the caller's deadline.
         client_kwargs = {
             "api_key": self.api_key,
             "default_headers": {"anthropic-beta": "prompt-caching-2024-07-31"},
+            "max_retries": 0,
         }
         if self.base_url:
             client_kwargs["base_url"] = self.base_url
         self.client = anthropic.AsyncAnthropic(**client_kwargs)
+
+    @staticmethod
+    def _tool_call_to_openai_shape(block):
+        """Convert an Anthropic ``tool_use`` block to the OpenAI-shaped ToolCall
+        object the rest of the runtime (``response_parser._to_tool_call_dicts``,
+        STAR streaming, journal replay) already expects."""
+        return type(
+            "ToolCall",
+            (),
+            {
+                "id": block.id,
+                "function": type(
+                    "Function",
+                    (),
+                    {
+                        "name": block.name,
+                        "arguments": json.dumps(block.input) if isinstance(block.input, dict) else block.input,
+                    },
+                )(),
+            },
+        )()
 
     async def chat(self, messages: list[LLMMessage], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
         """Send messages to Anthropic and get a response.
@@ -283,11 +309,13 @@ class AnthropicProvider(LLMProvider):
             if system is not None:
                 request_kwargs["system"] = system
 
-            # Call Anthropic API with per-request timeout
+            # Call Anthropic API with per-request timeout. ``timeout`` is the
+            # caller's remaining logical-request budget when supplied; the class
+            # default is the fallback so a direct provider call is still bounded.
             try:
                 response = await self.client.messages.create(
                     **request_kwargs,
-                    timeout=self.DEFAULT_TIMEOUT_SECONDS,
+                    timeout=kwargs.get("timeout") or self.DEFAULT_TIMEOUT_SECONDS,
                 )
             except Exception as e:
                 logger.error("Anthropic API error", error=str(e))
@@ -304,23 +332,7 @@ class AnthropicProvider(LLMProvider):
                     if tool_calls is None:
                         tool_calls = []
                     # Convert to OpenAI-compatible format for our runtime
-                    tool_calls.append(
-                        type(
-                            "ToolCall",
-                            (),
-                            {
-                                "id": block.id,
-                                "function": type(
-                                    "Function",
-                                    (),
-                                    {
-                                        "name": block.name,
-                                        "arguments": json.dumps(block.input) if isinstance(block.input, dict) else block.input,
-                                    },
-                                )(),
-                            },
-                        )()
-                    )
+                    tool_calls.append(self._tool_call_to_openai_shape(block))
 
             # If we used JSON prefill, prepend the prefill string
             if json_mode:
@@ -375,28 +387,56 @@ class AnthropicProvider(LLMProvider):
 
         Iterates MessageStreamEvent (not text_stream) to capture tool_use and
         thinking blocks alongside text deltas.
+
+        Request controls mirror :meth:`chat` exactly — the same caller policy
+        (temperature, max_tokens, json_mode prefill/stop_sequences) must not reach
+        the wire on one path and be dropped on the other. ``max_tokens`` stays
+        mandatory for this API; the caller's value wins over the 32000 default.
+        Emits a terminal ``response`` carrier assembled from the completed message
+        so usage/cache counters, the model id, the request id and the real stop
+        reason survive a streamed turn. ``thinking`` blocks become thinking
+        chunks (extended thinking) instead of being silently discarded.
         """
+        json_mode = kwargs.get("json_mode", False)
         try:
             system, anthropic_messages = self.prepare_messages(messages)
+
+            if json_mode:
+                anthropic_messages.append({"role": "assistant", "content": '{"done":'})
 
             request_kwargs = {
                 "model": self.model,
                 "messages": anthropic_messages,
                 "max_tokens": kwargs.get("max_tokens") or 32000,
             }
+            if "temperature" in kwargs:
+                request_kwargs["temperature"] = kwargs["temperature"]
+            if json_mode and not tools:
+                request_kwargs["stop_sequences"] = ["\n[", "\nLet me"]
             if system is not None:
                 request_kwargs["system"] = system
             if tools:
                 request_kwargs["tools"] = self.prepare_tools(tools)
+                request_kwargs["tool_choice"] = {"type": "auto", "disable_parallel_tool_use": False}
+
+            text_parts: list[str] = []
+            thinking_parts: list[str] = []
 
             async with self.client.messages.stream(
                 **request_kwargs,
-                timeout=self.DEFAULT_TIMEOUT_SECONDS,
+                timeout=kwargs.get("timeout") or self.DEFAULT_TIMEOUT_SECONDS,
             ) as stream_resp:
                 async for event in stream_resp:
                     # Text delta events
                     if event.type == "content_block_delta" and getattr(event.delta, "type", None) == "text_delta":
+                        text_parts.append(event.delta.text)
                         yield LLMStreamChunk(type="text_delta", content=event.delta.text)
+
+                    # Extended-thinking deltas (only emitted when the caller enables
+                    # Anthropic thinking). Surfaced as THINKING, same as OpenAI paths.
+                    elif event.type == "content_block_delta" and getattr(event.delta, "type", None) == "thinking_delta":
+                        thinking_parts.append(getattr(event.delta, "thinking", "") or "")
+                        yield LLMStreamChunk(type="thinking", content=getattr(event.delta, "thinking", "") or "")
 
                     # Completed tool_use block — full tool call assembled
                     elif event.type == "content_block_stop":
@@ -407,10 +447,68 @@ class AnthropicProvider(LLMProvider):
                                 tool_call={"id": block.id, "name": block.name, "input": block.input},
                             )
 
-                    # Future: thinking blocks (when Anthropic enables extended thinking in streaming)
+                # Terminal metadata carrier. Assembled from the final message the
+                # stream accumulates; no extra request is issued and no delta is
+                # repeated as provider text. When the stream ends without a final
+                # message (aborted connection), nothing is emitted here and the
+                # consumer's delta-derived state stands.
+                carrier = self._terminal_carrier_from_stream(stream_resp, json_mode, thinking_parts)
+                if carrier is not None:
+                    yield LLMStreamChunk(type="response", response=carrier)
 
         except anthropic.APITimeoutError as e:
             raise LLMTimeoutError(f"Anthropic stream timeout: {e}") from e
         except Exception as e:
             logger.error("Anthropic stream error", error=str(e))
             raise
+
+    def _terminal_carrier_from_stream(self, stream_resp, json_mode: bool, thinking_parts: list[str]) -> LLMResponse | None:
+        """Build the terminal LLMResponse for a completed Anthropic message stream.
+
+        Returns ``None`` when the stream carries no final message (e.g. the
+        connection dropped mid-flight) — the consumer must then keep its
+        delta-derived state rather than be told the turn finished cleanly.
+        """
+        try:
+            final = stream_resp.current_message_snapshot
+        except Exception:
+            final = None
+        if final is None:
+            return None
+
+        content = ""
+        tool_calls: list | None = None
+        for block in final.content or []:
+            if getattr(block, "type", None) == "text":
+                content += block.text or ""
+            elif getattr(block, "type", None) == "tool_use":
+                # List, matching chat(): response_parser._to_tool_call_dicts() and
+                # STAR's terminal fallback both iterate response.tool_calls.
+                if tool_calls is None:
+                    tool_calls = []
+                tool_calls.append(self._tool_call_to_openai_shape(block))
+
+        if json_mode:
+            content = '{"done":' + content
+
+        usage = None
+        if final.usage:
+            usage = {
+                "prompt_tokens": final.usage.input_tokens,
+                "completion_tokens": final.usage.output_tokens,
+                "total_tokens": final.usage.input_tokens + final.usage.output_tokens,
+            }
+            if hasattr(final.usage, "cache_creation_input_tokens"):
+                usage["cache_creation_tokens"] = final.usage.cache_creation_input_tokens
+            if hasattr(final.usage, "cache_read_input_tokens"):
+                usage["cached_tokens"] = final.usage.cache_read_input_tokens
+
+        return LLMResponse(
+            content=content,
+            model=getattr(final, "model", None) or self.model,
+            usage=usage,
+            finish_reason=getattr(final, "stop_reason", None),
+            tool_calls=tool_calls,
+            reasoning_content="".join(thinking_parts) or None,
+            response_id=getattr(final, "id", None),
+        )

@@ -173,9 +173,7 @@ class TestRetentionEdgeCases:
         assert deleted == 1  # Counts as deleted (entry removed from tracking)
 
     @pytest.mark.asyncio
-    async def test_retention_expiry_race(
-        self, manager: ArtifactRetentionManager, store: ArtifactStore, owner: OwnerScope
-    ) -> None:
+    async def test_retention_expiry_race(self, manager: ArtifactRetentionManager, store: ArtifactStore, owner: OwnerScope) -> None:
         """Multiple sweeps should be idempotent."""
         ref = await store.store(b"race content", "text/plain", owner)
         policy = RetentionPolicy(policy_type=RetentionPolicyType.DELETE_IMMEDIATELY)

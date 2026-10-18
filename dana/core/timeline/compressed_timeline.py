@@ -28,6 +28,7 @@ from dana.core.timeline.native_message import (
     COMPRESSED_CONTEXT_KEY,
     COMPRESSED_ENTRIES_COUNT_KEY,
     COMPRESSION_TIMESTAMP_KEY,
+    NATIVE_SOURCE_ENTRY_KEY,
     NativeMessage,
     NativeMessageRole,
     NativeToolCall,
@@ -214,11 +215,48 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
         # Internal storage for native message format
         self._native_messages: list[NativeMessage] = []
 
-        # Phase 2/3 — all mutators of compression state acquire this lock. A
-        # threading lock mirrors for sync paths that run off-loop.
         import asyncio
         import threading
 
+        # Guards the two model-facing representations (``timeline`` and
+        # ``_native_messages``) and their derived state: the incremental token
+        # total and ``_timeline_revision``. Reentrant so compaction, which holds
+        # it while composing a commit, can call mutators that take it too.
+        self._state_lock: threading.RLock = threading.RLock()
+
+        # Incremental token accounting: the total is updated by exact deltas on
+        # append/replacement/shrink, and by one recomputation at hydration and
+        # compaction boundaries. ``needs_compression()`` therefore never
+        # rescans retained history. The recorded marker (source list identity,
+        # length) is what makes a cached total trustworthy; see
+        # ``get_native_token_estimate``.
+        self._native_token_total: int = 0
+        self._native_token_source: list[NativeMessage] | None = None
+        self._native_token_len: int = 0
+
+        # True once the model-facing native state has been handed to a caller that
+        # can mutate it in place — through the ``native_messages`` getter, or by
+        # handing ``add_entry`` content/tool-argument objects it still owns. Such a
+        # change (even a same-length content edit, or a nested tool-argument dict
+        # edit) cannot be observed from the list or from the message objects, and
+        # escaped message objects survive into new lists (compaction, hydration and
+        # ``load_from_entries`` reuse the very same ``NativeMessage`` instances).
+        # While this is set, the cached total is not trusted and reads recompute.
+        # It is sticky for the timeline instance, and is only cleared by building a
+        # projection this timeline rebuilt without sharing caller-mutable state
+        # (see ``_install_built_projection``).
+        self._native_aliasing_risk: bool = False
+
+        # Bumped whenever the model-facing projection is replaced wholesale
+        # (hydration, load, compaction commit). A compaction plan captured before
+        # a (possibly awaited) summarizer call is validated against this, so a
+        # stale summary cannot commit over a projection that replaced the one it
+        # was planned against. In-place mutations (append, context swap, shrink)
+        # are caught by the plan's object-identity alignment at commit instead.
+        self._compaction_generation: int = 0
+
+        # Phase 2/3 — all mutators of compression state acquire this lock. A
+        # threading lock mirrors for sync paths that run off-loop.
         self._compact_lock: asyncio.Lock = asyncio.Lock()
         self._compact_sync_lock: threading.Lock = threading.Lock()
 
@@ -226,6 +264,14 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
         self._consecutive_compact_failures: int = 0
         self._compaction_disabled: bool = False
         self._circuit_opened_at: datetime | None = None
+
+        # The partition described by the last ``build_compression_prompt``, as
+        # ``(entries_to_compress, plan_generation)``. Hosts that own their
+        # summarizer call (prompt → LLM → ``compress_old_entries``) commit exactly
+        # this partition, so a summary is never applied to entries the summarizer
+        # did not see. Consumed (and cleared) by ``compress_old_entries``;
+        # invalidated by any projection swap.
+        self._pending_compression_plan: tuple[list[TimelineEntry], int] | None = None
 
         # Compact-session persistence (repo-agnostic, post-GH-1):
         # `_last_compression_at` is stamped by ``_apply_compression``. On the next
@@ -273,6 +319,122 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
             return 0
 
     # ------------------------------------------------------------------
+    # Incremental token accounting (single source of truth: _native_token_total)
+    # ------------------------------------------------------------------
+    #
+    # ``_native_messages`` is the representation the provider sees, so its token
+    # total is what ``needs_compression()`` compares against the trigger. That
+    # total is maintained incrementally:
+    #
+    #   * appends and in-place content replacements fold an exact delta
+    #     (``_fold_token_delta``),
+    #   * hydration, load, and compaction-replacement install a whole new list
+    #     and recompute once (``_install_model_state``).
+    #
+    # The cached total is trusted only while its marker still describes the live
+    # list *and* the model-facing state has never been aliased: same list object,
+    # same length, and ``_native_aliasing_risk`` clear. A list this size can be
+    # mutated in place by a caller holding one of its messages, and those message
+    # objects survive into later lists, so once the state has escaped the cached
+    # total is not trusted and reads recompute. Direct rebinding or trimming of
+    # ``_native_messages`` fails the marker and recomputes the same way. A stale
+    # cached value is never returned.
+
+    def _token_marker_valid(self) -> bool:
+        """True when the cached token total still describes the live native list."""
+        if self._native_aliasing_risk:
+            return False
+        return self._native_token_source is self._native_messages and self._native_token_len == len(self._native_messages)
+
+    def _anchor_token_marker(self) -> None:
+        """Record which native list the cached token total was computed for."""
+        self._native_token_source = self._native_messages
+        self._native_token_len = len(self._native_messages)
+
+    def _fold_token_delta(self, delta: int, *, marker_was_valid: bool) -> None:
+        """Fold an exact token delta from one mutation into the cached total.
+
+        ``marker_was_valid`` must be captured via ``_token_marker_valid()``
+        *before* the mutation mutated the list, because the mutation itself may
+        invalidate the marker by rebinding the list. When the marker was already
+        stale the delta is dropped: the next ``get_native_token_estimate()``
+        recomputes from the live list instead of trusting a partial sum.
+        """
+        if not marker_was_valid:
+            return
+        self._native_token_total = max(0, self._native_token_total + delta)
+        self._anchor_token_marker()
+
+    def _recompute_token_total(self) -> None:
+        """Recompute the cached token total from the live native list (one scan)."""
+        self._native_token_total = self._estimate_native_messages_list_tokens(self._native_messages)
+        self._anchor_token_marker()
+
+    def get_native_token_estimate(self) -> int:
+        """Estimated tokens of the retained model working set.
+
+        Returns the incrementally maintained total when its marker is still
+        valid, otherwise recomputes once and re-anchors. This is the entry point
+        for the compression trigger: it never rescans retained history on the
+        ordinary append-only path.
+        """
+        with self._state_lock:
+            if not self._token_marker_valid():
+                self._recompute_token_total()
+            return self._native_token_total
+
+    def _install_model_state(self, entries: list[TimelineEntry], messages: list[NativeMessage]) -> None:
+        """Replace both model-facing representations as a single projection swap.
+
+        Used by hydration/load and by compaction commit. Both lists are replaced
+        together so ``timeline`` and ``_native_messages`` cannot drift apart, the
+        token total is recomputed exactly once, and ``_compaction_generation`` is
+        bumped so any compaction plan captured against the previous projection
+        refuses to commit over the new one.
+
+        This sets — never clears — the aliasing-risk flag: compaction reuses the
+        very same ``NativeMessage`` objects it retained, and a caller may hold
+        references to them from the list that was just replaced, so the new
+        projection is not provably unaliased. See ``_install_built_projection``.
+        """
+        with self._state_lock:
+            self.timeline = entries
+            self._native_messages = messages
+            # A prompt plan describes a projection that no longer exists.
+            self._pending_compression_plan = None
+            if self._projection_shares_caller_state(entries, messages):
+                self._native_aliasing_risk = True
+            self._recompute_token_total()
+            self._compaction_generation += 1
+
+    def _install_built_projection(self, entries: list[TimelineEntry]) -> None:
+        """Install a projection built here, clearing the aliasing risk if provable.
+
+        The entries are converted to *new* ``NativeMessage`` instances (via
+        ``_timeline_entry_to_native_message``) rather than reusing caller-supplied
+        message objects, and the token total is recomputed from those instances.
+        The aliasing-risk flag is cleared only when nothing installed shares a
+        caller-mutable object (see ``_projection_shares_caller_state``) — a plain
+        string-content entry is safe, a multimodal content list or tool arguments
+        are not, whether they were handed over as live entry objects or as a dict
+        this timeline decoded (the decoded nested objects are the caller's).
+
+        Used by hydration and load, where the projection is rebuilt from a
+        journal read instead of mutated in place.
+        """
+        fresh_messages = [self._timeline_entry_to_native_message(entry) for entry in entries]
+        # The messages here are derived from the entries, so scanning the entries
+        # alone covers everything the messages share.
+        shares_caller_state = any(self._entry_is_externally_owned(entry) for entry in entries)
+        with self._state_lock:
+            self.timeline = entries
+            self._native_messages = fresh_messages
+            self._pending_compression_plan = None
+            self._native_aliasing_risk = shares_caller_state
+            self._recompute_token_total()
+            self._compaction_generation += 1
+
+    # ------------------------------------------------------------------
     # LLM call function setters
     # ------------------------------------------------------------------
 
@@ -310,12 +472,79 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
         Args:
             entry: TimelineEntry to add
         """
-        # Add to parent timeline for backward compatibility
-        super().add_entry(entry)
-
-        # Convert to native message and store
         native_msg = self._timeline_entry_to_native_message(entry)
-        self._native_messages.append(native_msg)
+        aliased = self._entry_is_externally_owned(entry)
+        with self._state_lock:
+            if aliased:
+                # The caller still owns mutable content/tool-argument objects that
+                # this message now shares; an in-place edit of theirs would be
+                # invisible to any marker, so accounting must stop trusting the
+                # cached total. Not a copy: the mutable API contract is preserved.
+                self._native_aliasing_risk = True
+            marker_was_valid = self._token_marker_valid()
+            # Add to parent timeline for backward compatibility
+            super().add_entry(entry)
+            # Convert to native message and store
+            self._native_messages.append(native_msg)
+            self._fold_token_delta(
+                self._estimate_native_message_tokens(native_msg),
+                marker_was_valid=marker_was_valid,
+            )
+
+    @staticmethod
+    def _is_caller_owned_value(value: Any) -> bool:
+        """True when a value is a mutable object the caller can still mutate in place.
+
+        Scalars, tuples and ``None`` are values this timeline can safely own or
+        simply copy: nothing a caller does to their own binding changes what was
+        stored. Dicts, lists, sets and arbitrary objects can be mutated in place
+        (including nested argument dicts), so they are treated as aliased.
+        """
+        return isinstance(value, dict | list | set | bytearray) or (
+            value is not None and not isinstance(value, str | bytes | int | float | bool | tuple)
+        )
+
+    def _entry_is_externally_owned(self, entry: TimelineEntry) -> bool:
+        """True when ``entry`` still shares caller-mutable state with this timeline.
+
+        ``add_entry`` keeps the caller's object alive in ``timeline`` and shares its
+        ``content`` (a ``str`` is immutable, but multimodal content is a list of
+        dicts) and its tool-argument structures with the native message. A caller
+        holding the entry — the ordinary ``tl.add_entry(TimelineEntry(...))`` call —
+        can therefore mutate text or arguments behind the accounting's back, so the
+        entry counts as aliased until the caller proves sole ownership by copying
+        (``TimelineEntry.from_dict(entry.to_dict())``) or building fresh values.
+
+        ``content`` is checked even when empty: the native message stores that very
+        object, so a later ``blocks.append(...)`` by the caller would be invisible.
+        ``tool_calls`` is only shared when truthy — a falsy list is never converted,
+        the native message gets ``tool_calls=None`` instead.
+        """
+        if self._is_caller_owned_value(entry.content):
+            return True
+        return bool(entry.tool_calls) and self._is_caller_owned_value(entry.tool_calls)
+
+    def _message_shares_caller_state(self, message: NativeMessage) -> bool:
+        """True when a native message still holds a caller-mutable object.
+
+        ``NativeMessage.from_dict`` keeps the decoded nested ``content`` and
+        ``arguments`` objects by reference, so a hydration path that decodes
+        caller-supplied dicts can install messages whose nested lists or argument
+        dicts the caller still holds.
+        """
+        if self._is_caller_owned_value(message.content):
+            return True
+        if message.tool_calls:
+            for call in message.tool_calls:
+                if self._is_caller_owned_value(call.arguments):
+                    return True
+        return False
+
+    def _projection_shares_caller_state(self, entries: list[TimelineEntry], messages: list[NativeMessage]) -> bool:
+        """True when any installed entry or native message shares caller-mutable state."""
+        return any(self._entry_is_externally_owned(entry) for entry in entries) or any(
+            self._message_shares_caller_state(message) for message in messages
+        )
 
     def _timeline_entry_to_native_message(self, entry: TimelineEntry) -> NativeMessage:
         """
@@ -436,12 +665,17 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
             # UNKNOWN_TOOL_CALL/FAILED_TOOL_CALL (without tool_call_id)
             role = "assistant"
 
+        metadata = entry.metadata.copy() if entry.metadata else {}
+        # Internal backlink so a compaction commit can map a retained entry to the
+        # exact message that mirrors it (see NATIVE_SOURCE_ENTRY_KEY).
+        metadata[NATIVE_SOURCE_ENTRY_KEY] = entry
+
         return NativeMessage(
             role=role,
             content=entry.content,
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
-            metadata=entry.metadata.copy() if entry.metadata else {},
+            metadata=metadata,
             timestamp=entry.timestamp,
         )
 
@@ -456,7 +690,18 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
 
         Returns:
             List of NativeMessage objects in chronological order
+
+        This returns the live backing list, which callers legitimately mutate in
+        place (that has always been the contract). Because such an edit — a
+        same-length content replacement, or a nested tool-argument dict — cannot be
+        observed from the list or the message objects, the read marks the timeline's
+        token accounting untrusted so estimates recompute from live content. The
+        mark is sticky for this instance: escaped message objects survive into later
+        projections, so only a projection this timeline rebuilt without carrying
+        caller-mutable state clears it (see ``_install_built_projection``).
         """
+        with self._state_lock:
+            self._native_aliasing_risk = True
         return self._native_messages
 
     # ------------------------------------------------------------------
@@ -558,21 +803,34 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
             context: Dictionary with context info (e.g., timestamp, user, timezone)
         """
         # Remove existing CONTEXT native messages
-        self._native_messages = [
-            msg for msg in self._native_messages if not (msg.role == "system" and msg.metadata.get("ephemeral", False))
-        ]
+        with self._state_lock:
+            marker_was_valid = self._token_marker_valid()
+            removed_tokens = 0
+            dropped: list[NativeMessage] = []
+            for msg in self._native_messages:
+                if msg.role == "system" and msg.metadata.get("ephemeral", False):
+                    removed_tokens += self._estimate_native_message_tokens(msg)
+                else:
+                    dropped.append(msg)
+            self._native_messages = dropped
+            self._fold_token_delta(-removed_tokens, marker_was_valid=marker_was_valid)
 
-        # Call parent implementation (handles timeline and creates entry)
-        super().set_context(context)
+            # Call parent implementation (handles timeline and creates entry)
+            super().set_context(context)
 
-        # The parent inserts the context entry at the beginning of self.timeline
-        # Get the context entry that was just added
-        context_entry = self.timeline[0] if self.timeline else None
-        if context_entry and context_entry.entry_type == TimelineEntryType.CONTEXT:
-            # Convert to native message and insert at the beginning
-            native_msg = self._timeline_entry_to_native_message(context_entry)
-            native_msg.metadata["ephemeral"] = True
-            self._native_messages.insert(0, native_msg)
+            # The parent inserts the context entry at the beginning of self.timeline
+            # Get the context entry that was just added
+            context_entry = self.timeline[0] if self.timeline else None
+            if context_entry and context_entry.entry_type == TimelineEntryType.CONTEXT:
+                # Convert to native message and insert at the beginning
+                native_msg = self._timeline_entry_to_native_message(context_entry)
+                native_msg.metadata["ephemeral"] = True
+                marker_was_valid = self._token_marker_valid()
+                self._native_messages.insert(0, native_msg)
+                self._fold_token_delta(
+                    self._estimate_native_message_tokens(native_msg),
+                    marker_was_valid=marker_was_valid,
+                )
 
     def clear_old_entries(self, before_timestamp: datetime) -> int:
         """
@@ -587,16 +845,22 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
         Returns:
             Number of entries removed
         """
-        original_count = len(self.timeline)
+        with self._state_lock:
+            original_count = len(self.timeline)
 
-        # Remove from timeline
-        self.timeline = [entry for entry in self.timeline if entry.timestamp >= before_timestamp]
+            # Remove from timeline
+            self.timeline = [entry for entry in self.timeline if entry.timestamp >= before_timestamp]
 
-        # Remove from native messages
-        self._native_messages = [msg for msg in self._native_messages if msg.timestamp >= before_timestamp]
+            # Remove from native messages, folding the exact removed-token delta.
+            marker_was_valid = self._token_marker_valid()
+            removal_delta = -sum(
+                self._estimate_native_message_tokens(msg) for msg in self._native_messages if msg.timestamp < before_timestamp
+            )
+            self._native_messages = [msg for msg in self._native_messages if msg.timestamp >= before_timestamp]
+            self._fold_token_delta(removal_delta, marker_was_valid=marker_was_valid)
 
-        removed_count = original_count - len(self.timeline)
-        return removed_count
+            removed_count = original_count - len(self.timeline)
+            return removed_count
 
     # ------------------------------------------------------------------
     # Default LLM call function helpers (used by CompressionMixin)

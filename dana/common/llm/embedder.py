@@ -62,6 +62,41 @@ def _cleanup_event_loop():
 
 atexit.register(_cleanup_event_loop)
 
+
+def _log_close_failure(task: asyncio.Task) -> None:
+    """Surface a scheduled provider-close failure instead of losing it."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("embedding_provider_close_failed", error_type=type(exc).__name__)
+
+
+def _close_provider(provider: LLMProvider | None, pending: set[asyncio.Task[None]]) -> None:
+    """Best-effort, loop-affine close of a retired provider's SDK client."""
+    if provider is None:
+        return
+    try:
+        try:
+            running: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is not None:
+            task = running.create_task(provider.aclose())
+            pending.add(task)
+            task.add_done_callback(pending.discard)
+            task.add_done_callback(_log_close_failure)
+            return
+        loop = _get_or_create_event_loop()
+        loop.run_until_complete(provider.aclose())
+    except Exception as e:
+        logger.warning(
+            "embedding_provider_close_failed",
+            provider=getattr(provider, "name", provider.__class__.__name__),
+            error_type=type(e).__name__,
+        )
+
+
 # Providers known to support embeddings
 _EMBEDDING_CAPABLE_PROVIDERS = {"openai", "gemini", "azure"}
 
@@ -92,6 +127,7 @@ class Embedder:
             provider: Provider name ('openai', 'gemini', 'azure') or provider instance.
             model: Embedding model name (defaults to provider's default).
         """
+        self._close_tasks: set[asyncio.Task[None]] = set()
         if isinstance(provider, str):
             self.provider = create_provider(provider, model=model)
             self.provider_name = provider
@@ -110,6 +146,8 @@ class Embedder:
                 )
 
         if not self.provider.supports_embeddings:
+            if not isinstance(provider, LLMProvider):
+                _close_provider(self.provider, self._close_tasks)
             raise EmbeddingNotSupportedError(
                 f"Provider '{self.provider_name}' does not support embeddings. Use one of: {', '.join(_EMBEDDING_CAPABLE_PROVIDERS)}"
             )
@@ -164,15 +202,32 @@ class Embedder:
         return loop.run_until_complete(self.embed_batch(texts, **kwargs))
 
     def switch_provider(self, provider: str, model: str | None = None):
-        """Switch to a different embedding provider."""
-        self.provider = create_provider(provider, model=model)
-        self.provider_name = provider
-        if not self.provider.supports_embeddings:
+        """Switch to a different embedding provider.
+
+        The previous provider owns an SDK client; close it so repeated switches do
+        not leak connection pools. Best-effort on the owning loop, mirroring
+        ``LLM.switch_provider``.
+        """
+        candidate = create_provider(provider, model=model)
+        if not candidate.supports_embeddings:
+            _close_provider(candidate, self._close_tasks)
             raise EmbeddingNotSupportedError(f"Provider '{provider}' does not support embeddings.")
-        if model and hasattr(self.provider, "embedding_model"):
-            self.provider.embedding_model = model
-        self.model = getattr(self.provider, "embedding_model", "unknown")
+        if model and hasattr(candidate, "embedding_model"):
+            candidate.embedding_model = model
+        previous = self.provider
+        self.provider = candidate
+        self.provider_name = provider
+        self.model = getattr(candidate, "embedding_model", "unknown")
+        _close_provider(previous, self._close_tasks)
         logger.info("Switched embedding provider", provider=provider, model=self.model)
+
+    async def aclose(self) -> None:
+        """Close the embedding provider client on the current (owning) loop."""
+        try:
+            await self.provider.aclose()
+        finally:
+            if self._close_tasks:
+                await asyncio.gather(*self._close_tasks, return_exceptions=True)
 
     @staticmethod
     def get_available_providers() -> list[str]:

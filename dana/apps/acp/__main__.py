@@ -29,9 +29,17 @@ def configure_stderr_logging() -> None:
 
     # Redirect structlog to stderr for ACP mode only — scoped here so we
     # never touch structlog behavior for the REPL, CLIs, or other consumers.
+    #
+    # WriteLoggerFactory, not PrintLoggerFactory: PrintLogger.msg() resolves its
+    # destination through structlog's module-global `stdout`, which is bound the
+    # first time structlog is imported. An ACP host that redirects sys.stdout
+    # (for example `contextlib.redirect_stdout(sys.stderr)`) before that import
+    # makes every later diagnostic land on the protocol stream. WriteLogger
+    # binds the stream at construction, so stdout purity no longer depends on
+    # import order.
     structlog.configure(
         wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
+        logger_factory=structlog.WriteLoggerFactory(file=sys.stderr),
     )
 
 
@@ -53,9 +61,20 @@ async def main_async() -> None:
     import acp
 
     from dana.apps.acp.agent import DanaACPAgent
+    from dana.common.observable import ashutdown_observability
 
     agent = DanaACPAgent()
-    await acp.run_agent(agent, use_unstable_protocol=True)
+    try:
+        await acp.run_agent(agent, use_unstable_protocol=True)
+    finally:
+        # Release session, permission, and journal state even when the transport
+        # fails mid-connection; then flush and stop the process-wide tracing
+        # backend. Both are bounded, so a wedged store or exporter cannot hold
+        # the process open.
+        try:
+            await agent.aclose()
+        finally:
+            await ashutdown_observability()
 
 
 if __name__ == "__main__":

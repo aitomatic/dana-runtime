@@ -45,7 +45,6 @@ class CodecRuntimeBase(AgentRuntime):
         self._codec = codec
         self._prompt_api: LocalPromptAPI | None = None
         self._prompt_apis: dict[int, LocalPromptAPI] = {}
-        self._last_native_tools_state: bool | None = None  # Track for cache invalidation
         # Codec runtimes don't use json_mode — reconfigure the shared LLMCaller.
         self._llm_caller._json_mode = False
 
@@ -113,6 +112,24 @@ class CodecRuntimeBase(AgentRuntime):
     def invalidate_system_prompt_cache(self) -> None:
         for prompt_api in self._prompt_apis.values():
             prompt_api._system_prompt = None
+
+    def reset(self) -> None:
+        """Invalidate cached tool metadata *and* the rendered codec prompt.
+
+        Structural membership changes (``with_resources``/``with_agents``/
+        ``with_workflows``) and installing a different LLM both flow through
+        here. :meth:`AgentRuntime.reset` drops the native schemas and the
+        ``@named_tool`` registry, but the codec system prompt is rendered once by
+        ``LocalPromptAPI`` and embeds the tool list (``{{available_tools_prompt}}``
+        is resolved out of ``_resources``/``_workflows``/``_agents``), so it has to
+        be cleared too or the model keeps seeing the pre-mutation tools.
+
+        Only the cached string is dropped: template overrides live on the prompt
+        API and survive, the repository snapshot is untouched, and the rebuild
+        stays lazy (next ``system_prompt`` access).
+        """
+        super().reset()
+        self.invalidate_system_prompt_cache()
 
     def override_system_prompt_template(self, agent: STARAgent, template: str, *, persist: bool = False) -> None:
         """Replace the codec runtime's full system prompt template."""

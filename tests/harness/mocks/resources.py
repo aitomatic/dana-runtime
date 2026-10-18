@@ -53,35 +53,42 @@ class MockResource(BaseResource):
         """Apply configured delay."""
         if self._delay_ms > 0:
             import time
+
             time.sleep(self._delay_ms / 1000)
 
     def query(self, message: str = "", **kwargs) -> str:
         """Query method - commonly used by agents."""
         self._apply_delay()
-        self.call_history.append({
-            "method": "query",
-            "message": message,
-            "kwargs": kwargs,
-        })
+        self.call_history.append(
+            {
+                "method": "query",
+                "message": message,
+                "kwargs": kwargs,
+            }
+        )
         return self._get_response()
 
     def read(self, **kwargs) -> str:
         """Read method."""
         self._apply_delay()
-        self.call_history.append({
-            "method": "read",
-            "kwargs": kwargs,
-        })
+        self.call_history.append(
+            {
+                "method": "read",
+                "kwargs": kwargs,
+            }
+        )
         return self._get_response()
 
     def write(self, content: str = "", **kwargs) -> str:
         """Write method."""
         self._apply_delay()
-        self.call_history.append({
-            "method": "write",
-            "content": content,
-            "kwargs": kwargs,
-        })
+        self.call_history.append(
+            {
+                "method": "write",
+                "content": content,
+                "kwargs": kwargs,
+            }
+        )
         return self._get_response()
 
 
@@ -110,11 +117,13 @@ class AsyncMockResource(BaseResource):
         """Async query method."""
         if self._delay_ms > 0:
             await asyncio.sleep(self._delay_ms / 1000)
-        self.call_history.append({
-            "method": "query",
-            "message": message,
-            "kwargs": kwargs,
-        })
+        self.call_history.append(
+            {
+                "method": "query",
+                "message": message,
+                "kwargs": kwargs,
+            }
+        )
         return self.default_response
 
 
@@ -177,11 +186,14 @@ class MockWorkflow(BaseWorkflow):
         """Execute the workflow."""
         if self._delay_ms > 0:
             import time
+
             time.sleep(self._delay_ms / 1000)
 
-        self.call_history.append({
-            "kwargs": kwargs,
-        })
+        self.call_history.append(
+            {
+                "kwargs": kwargs,
+            }
+        )
 
         if self._result_queue:
             result = self._result_queue.pop(0)
@@ -213,14 +225,16 @@ class AsyncMockWorkflow(BaseWorkflow):
         """Set delay for execution."""
         self._delay_ms = delay_ms
 
-    async def _do_execute(self, **kwargs) -> dict:
-        """Async execute the workflow."""
+    async def execute(self, **kwargs) -> dict:
+        """Expose async work at the tool boundary, not the synchronous private hook."""
         if self._delay_ms > 0:
             await asyncio.sleep(self._delay_ms / 1000)
 
-        self.call_history.append({
-            "kwargs": kwargs,
-        })
+        self.call_history.append(
+            {
+                "kwargs": kwargs,
+            }
+        )
 
         return {**self.default_result, **kwargs}
 

@@ -163,9 +163,9 @@ class TestInjectAsUserOrdering:
 
         assert len(resource_indices) == 10, f"Expected 10 RESOURCE_RESULTs, got {len(resource_indices)}"
         assert len(user_indices) == 1, f"Expected 1 USER_MESSAGE, got {len(user_indices)}"
-        assert max(resource_indices) < min(
-            user_indices
-        ), f"RESOURCE_RESULT at index {max(resource_indices)} must come before USER_MESSAGE at index {min(user_indices)}"
+        assert max(resource_indices) < min(user_indices), (
+            f"RESOURCE_RESULT at index {max(resource_indices)} must come before USER_MESSAGE at index {min(user_indices)}"
+        )
 
     def test_no_inject_leaves_no_user_message(self, agent):
         """Tool results without inject_as_user don't create spurious USER_MESSAGE entries."""

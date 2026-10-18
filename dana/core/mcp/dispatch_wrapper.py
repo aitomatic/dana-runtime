@@ -53,18 +53,25 @@ def _format_mcp_result(result: dict[str, Any]) -> str:
 def _make_mcp_dispatcher(adapter: MCPExecutionAdapter, tool_name: str) -> Any:
     """Build an async dispatch callable for one MCP tool (per-tool UX, A2).
 
-    Returns ``async (arguments: dict) -> str`` (the formatted result), so the
-    ToolExecutor's MCP dispatch path can ``await`` it and wrap the string as a
-    tool-success result. Errors are surfaced to the model, never raised.
+    Returns an async callable yielding the execution result dict with model-facing
+    text. Success, cancellation disposition, harness identity and the observed
+    transport request ID survive through ToolExecutor and its durable after-hook.
+    The optional second parameter forwards the harness identity to the adapter.
+    Errors are returned as failed results rather than raised.
     """
 
-    async def dispatch(arguments: dict[str, Any]) -> str:
+    async def dispatch(arguments: dict[str, Any], tool_call_id: str | None = None) -> dict[str, Any]:
         try:
-            result = await adapter.call_tool(tool_name, arguments or {})
+            result = await adapter.call_tool(tool_name, arguments or {}, tool_call_id)
         except Exception as exc:  # noqa: BLE001 — surface to the model, never crash the turn
             logger.warning("MCP dispatch failed for '%s': %s", tool_name, exc)
-            return f"Error calling MCP tool '{tool_name}': {exc}"
-        return _format_mcp_result(result)
+            result = {"success": False, "result": f"Error calling MCP tool '{tool_name}': {exc}"}
+            if tool_call_id is not None:
+                result["tool_call_id"] = tool_call_id
+        result["result"] = _format_mcp_result(result)
+        result["type"] = "mcp"
+        result["target"] = tool_name
+        return result
 
     return dispatch
 

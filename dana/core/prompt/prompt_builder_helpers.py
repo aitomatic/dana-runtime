@@ -55,10 +55,18 @@ def render_template(template: str, values: dict[str, str]) -> str:
 
 
 def log_prompt_build(agent: Any, system_prompt: str, timeline: Any, messages: list) -> None:
-    """Log prompt build metadata via the debug logger."""
+    """Log prompt build metadata via the debug logger.
+
+    Returns immediately when diagnostics are off so the metadata dict, the agent
+    attribute reads, and the timeline length are not computed on the hot prompt
+    path. Diagnostics are opt-in (``DANA_LLM_DEBUG_LOGGING``), so the default
+    build does no work here.
+    """
     from dana.common.llm.debug_logger import get_debug_logger
 
     debug_logger = get_debug_logger()
+    if not debug_logger.enabled:
+        return
     debug_logger.log_agent_interaction(
         agent_id=agent.object_id,
         agent_type=agent.agent_type,

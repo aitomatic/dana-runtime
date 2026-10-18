@@ -58,12 +58,14 @@ def test_run_all_phases():
 
 
 def test_acquisitive_phase():
-    reflection = StubReflection({
-        "acquisitive": "lesson: env var issue",
-        "episodic": "Episode summary",
-        "integrative": "Integration notes",
-        "retentive": "[]",
-    })
+    reflection = StubReflection(
+        {
+            "acquisitive": "lesson: env var issue",
+            "episodic": "Episode summary",
+            "integrative": "Integration notes",
+            "retentive": "[]",
+        }
+    )
 
     reflection.run(stmemory=_build_stmemory(), ltmemory=FakeLTMemory())
 
@@ -73,12 +75,14 @@ def test_acquisitive_phase():
 
 
 def test_episodic_phase():
-    reflection = StubReflection({
-        "acquisitive": "lesson: env var issue",
-        "episodic": "Episode summary",
-        "integrative": "Integration notes",
-        "retentive": "[]",
-    })
+    reflection = StubReflection(
+        {
+            "acquisitive": "lesson: env var issue",
+            "episodic": "Episode summary",
+            "integrative": "Integration notes",
+            "retentive": "[]",
+        }
+    )
 
     result = reflection.run(stmemory=_build_stmemory(), ltmemory=FakeLTMemory())
 
@@ -86,12 +90,14 @@ def test_episodic_phase():
 
 
 def test_integrative_phase_queries_ltmemory():
-    reflection = StubReflection({
-        "acquisitive": "lesson: env var issue",
-        "episodic": "Episode summary",
-        "integrative": "Integration notes",
-        "retentive": "[]",
-    })
+    reflection = StubReflection(
+        {
+            "acquisitive": "lesson: env var issue",
+            "episodic": "Episode summary",
+            "integrative": "Integration notes",
+            "retentive": "[]",
+        }
+    )
     ltmemory = FakeLTMemory()
 
     reflection.run(stmemory=_build_stmemory(), ltmemory=ltmemory)
@@ -100,12 +106,14 @@ def test_integrative_phase_queries_ltmemory():
 
 
 def test_retentive_phase_outputs_valid_json():
-    reflection = StubReflection({
-        "acquisitive": "lesson: env var issue",
-        "episodic": "Episode summary",
-        "integrative": "Integration notes",
-        "retentive": '[{"type": "lesson", "content": "Do env var checks", "context": "deploy"}]',
-    })
+    reflection = StubReflection(
+        {
+            "acquisitive": "lesson: env var issue",
+            "episodic": "Episode summary",
+            "integrative": "Integration notes",
+            "retentive": '[{"type": "lesson", "content": "Do env var checks", "context": "deploy"}]',
+        }
+    )
 
     result = reflection.run(stmemory=_build_stmemory(), ltmemory=FakeLTMemory())
 
@@ -114,15 +122,17 @@ def test_retentive_phase_outputs_valid_json():
 
 
 def test_stores_to_ltmemory():
-    reflection = StubReflection({
-        "acquisitive": "lesson: env var issue",
-        "episodic": "Episode summary",
-        "integrative": "Integration notes",
-        "retentive": (
-            '[{"type": "lesson", "content": "Check env vars", "context": "deploy"},'
-            ' {"type": "pattern", "content": "Recurring config issues", "context": "ops"}]'
-        ),
-    })
+    reflection = StubReflection(
+        {
+            "acquisitive": "lesson: env var issue",
+            "episodic": "Episode summary",
+            "integrative": "Integration notes",
+            "retentive": (
+                '[{"type": "lesson", "content": "Check env vars", "context": "deploy"},'
+                ' {"type": "pattern", "content": "Recurring config issues", "context": "ops"}]'
+            ),
+        }
+    )
     ltmemory = FakeLTMemory()
 
     reflection.run(stmemory=_build_stmemory(), ltmemory=ltmemory)
@@ -131,12 +141,14 @@ def test_stores_to_ltmemory():
 
 
 def test_empty_session():
-    reflection = StubReflection({
-        "acquisitive": "",
-        "episodic": "",
-        "integrative": "",
-        "retentive": "[]",
-    })
+    reflection = StubReflection(
+        {
+            "acquisitive": "",
+            "episodic": "",
+            "integrative": "",
+            "retentive": "[]",
+        }
+    )
     ltmemory = FakeLTMemory()
 
     result = reflection.run(stmemory=STMemory(), ltmemory=ltmemory)
@@ -145,12 +157,14 @@ def test_empty_session():
 
 
 def test_result_structure():
-    reflection = StubReflection({
-        "acquisitive": "lesson: env var issue",
-        "episodic": "Episode summary",
-        "integrative": "Integration notes",
-        "retentive": "[]",
-    })
+    reflection = StubReflection(
+        {
+            "acquisitive": "lesson: env var issue",
+            "episodic": "Episode summary",
+            "integrative": "Integration notes",
+            "retentive": "[]",
+        }
+    )
 
     result = reflection.run(stmemory=_build_stmemory(), ltmemory=FakeLTMemory())
 

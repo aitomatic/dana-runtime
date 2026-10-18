@@ -6,14 +6,13 @@ Evaluates whether the STAR loop exit conditions are reliable and predictable.
 
 from __future__ import annotations
 
-import pytest
 import threading
-import time
 
-from .mocks.llm_client import MockLLMClient, LLMResponseScenario
-from .mocks.resources import MockResource, FailingResource
-from .fault_injection import FaultInjector, FaultConfig, FaultScenarios
+import pytest
+
+from .fault_injection import FaultConfig, FaultScenarios
 from .harness_agent import HarnessAgent
+from .mocks.llm_client import MockLLMClient
 
 
 class TestNormalExitConditions:
@@ -34,11 +33,13 @@ class TestNormalExitConditions:
         """Tool call followed by final response should exit cleanly."""
         mock_llm = harness_agent_with_resource._mock_llm
 
-        mock_llm.queue_response(MockLLMClient.well_formed_tool_call(
-            target_id="mock-resource",
-            method="query",
-            message="test",
-        ))
+        mock_llm.queue_response(
+            MockLLMClient.well_formed_tool_call(
+                target_id="mock-resource",
+                method="query",
+                message="test",
+            )
+        )
         mock_llm.queue_response(MockLLMClient.simple_response("Based on results: done"))
 
         result = harness_agent_with_resource.query(message="Search for something")
@@ -58,13 +59,15 @@ class TestMaxIterationsHandling:
 
         # Queue more tool calls than MAX_ITERATIONS
         for i in range(15):
-            mock_llm.queue_response(MockLLMClient.well_formed_tool_call(
-                target_id="mock-resource",
-                method="query",
-                message=f"iteration {i}",
-            ))
+            mock_llm.queue_response(
+                MockLLMClient.well_formed_tool_call(
+                    target_id="mock-resource",
+                    method="query",
+                    message=f"iteration {i}",
+                )
+            )
 
-        result = harness_agent_with_resource.query(message="Keep searching")
+        harness_agent_with_resource.query(message="Keep searching")
 
         # Should have exited at or before MAX_ITERATIONS
         loop_count = harness_agent_with_resource.get_loop_count()
@@ -76,11 +79,13 @@ class TestMaxIterationsHandling:
 
         # Queue 3 tool calls then final response
         for i in range(3):
-            mock_llm.queue_response(MockLLMClient.well_formed_tool_call(
-                target_id="mock-resource",
-                method="query",
-                message=f"query {i}",
-            ))
+            mock_llm.queue_response(
+                MockLLMClient.well_formed_tool_call(
+                    target_id="mock-resource",
+                    method="query",
+                    message=f"query {i}",
+                )
+            )
         mock_llm.queue_response(MockLLMClient.simple_response("Done"))
 
         result = harness_agent_with_resource.query(message="Do three searches")
@@ -99,9 +104,7 @@ class TestExceptionHandling:
     concerns identified in the investigation.
     """
 
-    def test_exception_in_think_phase_caught_not_propagated(
-        self, harness_agent_with_faults, fault_injector
-    ):
+    def test_exception_in_think_phase_caught_not_propagated(self, harness_agent_with_faults, fault_injector):
         """Exception in _think phase is caught by base query() - not propagated.
 
         KNOWN ISSUE: BaseSTARAgent.query() catches all exceptions and logs with print().
@@ -120,9 +123,7 @@ class TestExceptionHandling:
         # Result contains error info
         assert result is not None
 
-    def test_exception_in_act_phase_caught_not_propagated(
-        self, harness_agent_with_faults, fault_injector, mock_resource
-    ):
+    def test_exception_in_act_phase_caught_not_propagated(self, harness_agent_with_faults, fault_injector, mock_resource):
         """Exception in _act phase is caught by base query() - not propagated.
 
         KNOWN ISSUE: Same as above - exceptions are swallowed.
@@ -130,10 +131,12 @@ class TestExceptionHandling:
         harness_agent_with_faults.with_resources(mock_resource)
         mock_llm = harness_agent_with_faults._mock_llm
 
-        mock_llm.queue_response(MockLLMClient.well_formed_tool_call(
-            target_id="mock-resource",
-            method="query",
-        ))
+        mock_llm.queue_response(
+            MockLLMClient.well_formed_tool_call(
+                target_id="mock-resource",
+                method="query",
+            )
+        )
 
         fault_injector.add_fault(FaultScenarios.act_phase_exception())
 
@@ -141,18 +144,18 @@ class TestExceptionHandling:
         result = harness_agent_with_faults.query(message="Test")
         assert result is not None
 
-    def test_exception_in_see_phase_caught_not_propagated(
-        self, harness_agent_with_faults, fault_injector
-    ):
+    def test_exception_in_see_phase_caught_not_propagated(self, harness_agent_with_faults, fault_injector):
         """Exception in _see phase is caught by base query() - not propagated.
 
         KNOWN ISSUE: Same as above - exceptions are swallowed.
         """
-        fault_injector.add_fault(FaultConfig(
-            phase="see",
-            fault_type="exception",
-            message="See phase failure",
-        ))
+        fault_injector.add_fault(
+            FaultConfig(
+                phase="see",
+                fault_type="exception",
+                message="See phase failure",
+            )
+        )
 
         # Exception is caught internally
         result = harness_agent_with_faults.query(message="Test")
@@ -164,9 +167,7 @@ class TestExceptionHandling:
         KNOWN ISSUE: LLM errors are caught and logged, not propagated.
         """
         mock_llm = harness_agent._mock_llm
-        mock_llm.queue_response(MockLLMClient.exception_response(
-            RuntimeError("LLM API error")
-        ))
+        mock_llm.queue_response(MockLLMClient.exception_response(RuntimeError("LLM API error")))
 
         # Exception is caught internally
         result = harness_agent.query(message="Test")
@@ -225,7 +226,7 @@ class TestExitFlagPropagation:
 
     def test_empty_message_triggers_early_exit(self, harness_agent):
         """Empty or missing message should trigger early exit."""
-        result = harness_agent.query(message="")
+        harness_agent.query(message="")
 
         # Should exit quickly (may be 0 or 1 iterations depending on early exit)
         assert harness_agent.get_loop_count() <= 1
@@ -237,7 +238,6 @@ class TestEmptyDictVsNoneHandling:
     def test_none_trace_handled(self, harness_agent):
         """None trace should be handled consistently."""
         # This tests the internal _do_exit_star_loop behavior
-        from dana.core.agent.base_star_agent import EXIT_STAR_LOOP_FLAG
 
         # Test with None - should return True (exit)
         # Note: We can't easily test this without mocking internal methods
@@ -272,9 +272,7 @@ class TestConcurrentQueries:
                     agent_type=f"concurrent_test_{agent_id}",
                     auto_register=False,
                 )
-                agent._mock_llm.queue_response(
-                    MockLLMClient.simple_response(f"Response {agent_id}")
-                )
+                agent._mock_llm.queue_response(MockLLMClient.simple_response(f"Response {agent_id}"))
                 result = agent.query(message=f"Query {agent_id}")
                 results.append((agent_id, result))
             except Exception as e:
@@ -297,10 +295,12 @@ class TestPhaseExecutionOrder:
         """Phases should execute in SEE -> THINK -> ACT order."""
         mock_llm = harness_agent_with_resource._mock_llm
 
-        mock_llm.queue_response(MockLLMClient.well_formed_tool_call(
-            target_id="mock-resource",
-            method="query",
-        ))
+        mock_llm.queue_response(
+            MockLLMClient.well_formed_tool_call(
+                target_id="mock-resource",
+                method="query",
+            )
+        )
         mock_llm.queue_response(MockLLMClient.simple_response("Done"))
 
         harness_agent_with_resource.query(message="Test")
@@ -335,10 +335,12 @@ class TestToolExecutionErrors:
         """Failing resource should be handled gracefully."""
         mock_llm = agent_with_failing_resource._mock_llm
 
-        mock_llm.queue_response(MockLLMClient.well_formed_tool_call(
-            target_id="failing-resource",
-            method="query",
-        ))
+        mock_llm.queue_response(
+            MockLLMClient.well_formed_tool_call(
+                target_id="failing-resource",
+                method="query",
+            )
+        )
         mock_llm.queue_response(MockLLMClient.simple_response("I encountered an error"))
 
         # Should complete without crashing

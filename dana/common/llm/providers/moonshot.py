@@ -42,6 +42,8 @@ class MoonshotProvider(OpenAICompatibleProvider):
             api_key=self.api_key,
             base_url=self.base_url,
             http_client=make_logging_http_client(self.DEFAULT_TIMEOUT_SECONDS),
+            # max_retries=0: retry/deadline policy is owned by LLMCaller.
+            max_retries=0,
         )
 
         # Moonshot never uses Responses API

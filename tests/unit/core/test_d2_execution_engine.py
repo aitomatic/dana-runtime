@@ -222,78 +222,68 @@ class TestCooperativeLatency:
                 max_latency_ms=None,
             )
 
-    def test_cooperative_tool_cancel_sets_flag(self):
-        """Cancelling a cooperative tool sets the cancellation flag."""
-        cancelled = False
+    @pytest.mark.parametrize("async_mode", [False, True])
+    @pytest.mark.parametrize("budget", [1, 5000])
+    def test_completed_effect_is_not_relabelled_as_cancelled(self, tmp_path, async_mode, budget):
+        path = tmp_path / "effect.txt"
 
-        def adapter(args: dict) -> dict:
-            nonlocal cancelled
-            # Simulate a tool that checks cancellation
-            return {"result": "done", "success": True}
+        def adapter(args):
+            engine.cancel("tc1")
+            if budget == 1:
+                time.sleep(0.01)
+            path.write_text("committed")
+            return {"success": True, "result": path.read_text()}
+
+        async def async_adapter(args):
+            engine.cancel("tc1")
+            if budget == 1:
+                await asyncio.sleep(0.01)
+            path.write_text("committed")
+            return {"success": True, "result": path.read_text()}
 
         entry = _make_entry(
-            name="coop",
-            adapter=adapter,
+            "coop",
+            async_adapter if async_mode else adapter,
+            cancellable=True,
+            max_latency_ms=budget,
+        )
+        engine = ToolExecutionEngine(_make_catalog([entry]))
+        try:
+            result = asyncio.run(engine.execute_async(_call("coop"))) if async_mode else engine.execute(_call("coop"))
+            assert path.read_text() == "committed"
+            assert result == {"success": True, "result": "committed"}
+            assert engine._in_flight == {}
+        finally:
+            engine.close()
+
+    @pytest.mark.parametrize("async_mode", [False, True])
+    def test_cancellation_pending_exception_is_effect_unknown(self, tmp_path, async_mode):
+        path = tmp_path / "effect.txt"
+
+        def adapter(args):
+            engine.cancel("tc1")
+            path.write_text("committed")
+            raise RuntimeError("response lost after effect")
+
+        async def async_adapter(args):
+            return adapter(args)
+
+        entry = _make_entry(
+            "coop",
+            async_adapter if async_mode else adapter,
             cancellable=True,
             max_latency_ms=5000,
         )
-        catalog = _make_catalog([entry])
-        engine = ToolExecutionEngine(catalog)
-
-        # Execute and cancel
-        result = engine.execute(_call("coop"))
-        engine.cancel("tc1")
-
-        assert result["success"] is True
-        # The result should have the _cancelled marker
-        # (cancellation was requested after execution completed in this test)
-        engine.close()
-
-    def test_cooperative_latency_violation_logged(self):
-        """When a cooperative tool exceeds its declared latency, it's logged."""
-        import logging
-
-        log_records: list[logging.LogRecord] = []
-
-        class _Handler(logging.Handler):
-            def emit(self, record: logging.LogRecord) -> None:
-                log_records.append(record)
-
-        handler = _Handler()
-        logger = logging.getLogger("dana.core.tool.execution_engine")
-        logger.addHandler(handler)
-        logger.setLevel(logging.WARNING)
-
-        slow_adapter_called = False
-
-        def slow_adapter(args: dict) -> dict:
-            nonlocal slow_adapter_called
-            slow_adapter_called = True
-            time.sleep(0.05)  # Simulate work
-            return {"result": "slow-done", "success": True}
-
-        entry = _make_entry(
-            name="slow_coop",
-            adapter=slow_adapter,
-            cancellable=True,
-            max_latency_ms=10,  # Very short — tool will exceed this
-        )
-        catalog = _make_catalog([entry])
-        engine = ToolExecutionEngine(catalog)
-
-        # Cancel before execution completes
-        # We need to trigger the latency check path
-        # The cancel flag is set, and the tool takes longer than max_latency_ms
-        in_flight = engine._in_flight.get("tc1")
-        if in_flight:
-            in_flight.cancel()
-
-        result = engine.execute(_call("slow_coop"))
-        engine.cancel("tc1")
-
-        assert result["success"] is True
-        assert slow_adapter_called is True
-        logger.removeHandler(handler)
+        engine = ToolExecutionEngine(_make_catalog([entry]))
+        try:
+            result = asyncio.run(engine.execute_async(_call("coop"))) if async_mode else engine.execute(_call("coop"))
+            assert path.read_text() == "committed"
+            assert result["success"] is False
+            assert result["_effect_unknown"] is True
+            assert "_cancelled" not in result
+            assert engine._in_flight == {}
+        finally:
+            engine.close()
 
     def test_cooperative_async_execution(self):
         """Cooperative tools work in async mode."""

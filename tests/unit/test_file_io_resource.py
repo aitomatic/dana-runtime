@@ -182,9 +182,9 @@ class TestPdfRead:
         with patch.dict("sys.modules", {"fitz": None}):
             with patch(
                 "builtins.__import__",
-                side_effect=lambda name, *args: (_ for _ in ()).throw(ImportError())
-                if name == "fitz"
-                else __builtins__.__import__(name, *args),
+                side_effect=lambda name, *args: (
+                    (_ for _ in ()).throw(ImportError()) if name == "fitz" else __builtins__.__import__(name, *args)
+                ),
             ):
                 result = await tmp_resource.read(str(f))
 

@@ -189,23 +189,19 @@ class DanaCodeApp:
         the in-memory permission grant db (D7.3) so it does not leak a worker
         thread on exit.
         """
-        if self._repo is not None:
-            with contextlib.suppress(Exception):
-                await self._repo.close()
-            self._repo = None
-        if self._grant_db is not None:
-            with contextlib.suppress(Exception):
-                await self._grant_db.close()
-            self._grant_db = None
-        # D7.5 (AC #4): release MCP transports/leases so configured stdio servers
-        # do not leak subprocesses on REPL exit.
-        if self.agent_session is not None:
-            with contextlib.suppress(Exception):
-                await self.agent_session.dispose_mcp()
-            # D7.6: detach the TOOL_CALL permission hook so it does not outlive
-            # the session (best-effort).
-            with contextlib.suppress(Exception):
-                self.agent_session._unregister_policy_hook()
+        # Operations may still need journal/grant storage during their cleanup.
+        try:
+            if self.agent_session is not None:
+                await self.agent_session.aclose()
+        finally:
+            if self._repo is not None:
+                with contextlib.suppress(Exception):
+                    await self._repo.close()
+                self._repo = None
+            if self._grant_db is not None:
+                with contextlib.suppress(Exception):
+                    await self._grant_db.close()
+                self._grant_db = None
 
     async def _initialize_session(self) -> None:
         """Construct an AgentSession backed by the Session Journal.
@@ -453,6 +449,8 @@ class DanaCodeApp:
             with contextlib.suppress(Exception):
                 await gen.aclose()
             print("\n⏹ Turn interrupted.\n")
+        finally:
+            await gen.aclose()
 
     # ------------------------------------------------------------------
     # Legacy path (DANA_CODE_AGENTSESSION_ENABLED=0)

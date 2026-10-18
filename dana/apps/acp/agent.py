@@ -136,6 +136,7 @@ class DanaACPAgent:
         self._agent_factory = agent_factory or _default_agent_factory
         self._owner_id = owner_id or os.environ.get("USER", "local")
         self._sessions: dict[str, AgentSession] = {}
+        self._grant_dbs: dict[str, aiosqlite.Connection] = {}
         self._repository: JournalRepository | None = None
         self._conn: Any = None
         # Feature flag: DANA_SESSION_JOURNAL_AUTHORITY=0 selects legacy
@@ -166,6 +167,49 @@ class DanaACPAgent:
             os.makedirs(os.path.dirname(self._journal_path) or ".", exist_ok=True)
             self._repository = await SQLiteJournalRepository.open(self._journal_path)
         return self._repository
+
+    async def aclose(self) -> None:
+        """Close session operations before their permission and journal stores."""
+        first_error: Exception | None = None
+        for session in self._sessions.values():
+            try:
+                await session.aclose()
+            except Exception as exc:
+                first_error = first_error or exc
+        self._sessions.clear()
+        for connection in self._grant_dbs.values():
+            try:
+                await connection.close()
+            except Exception as exc:
+                first_error = first_error or exc
+        self._grant_dbs.clear()
+        if self._repository is not None:
+            try:
+                await self._repository.close()
+            except Exception as exc:
+                first_error = first_error or exc
+            self._repository = None
+        if first_error is not None:
+            raise first_error
+
+    async def _configure_session_policy(self, session: AgentSession) -> None:
+        if not self._policy_grants_enabled:
+            return
+        from dana.core.policy.store_schema import POLICY_SQLITE_DDL
+        from dana.core.policy.store_sqlite import SQLiteGrantStore
+
+        grant_db = await aiosqlite.connect(":memory:")
+        try:
+            grant_db.row_factory = aiosqlite.Row
+            for statement in POLICY_SQLITE_DDL:
+                await grant_db.execute(statement)
+            await grant_db.commit()
+            evaluator = PolicyEvaluator(create_default_hard_policy(), SQLiteGrantStore(grant_db), session.permission_mode)
+            session.set_policy_evaluator(evaluator)
+        except BaseException:
+            await grant_db.close()
+            raise
+        self._grant_dbs[session.session_id] = grant_db
 
     @property
     def journal_authority_enabled(self) -> bool:
@@ -272,20 +316,7 @@ class DanaACPAgent:
         )
         # Set the current version to match the journal (SESSION_CREATED fact)
         session._current_version = init_facts[0].sequence
-        # Wire policy evaluator for permission adapter (D3)
-        if self._policy_grants_enabled:
-            from dana.core.policy.store_schema import POLICY_SQLITE_DDL
-            from dana.core.policy.store_sqlite import SQLiteGrantStore
-
-            grant_db = await aiosqlite.connect(":memory:")
-            grant_db.row_factory = aiosqlite.Row
-            for stmt in POLICY_SQLITE_DDL:
-                await grant_db.execute(stmt)
-            await grant_db.commit()
-            grant_store = SQLiteGrantStore(grant_db)
-            hard_policy = create_default_hard_policy()
-            evaluator = PolicyEvaluator(hard_policy, grant_store, PermissionMode.DEFAULT)
-            session.set_policy_evaluator(evaluator)
+        await self._configure_session_policy(session)
         self._sessions[session_id] = session
         logger.info("session created", session_id=session_id, cwd=cwd)
 
@@ -516,6 +547,13 @@ class DanaACPAgent:
             agent_factory=self._agent_factory,
         )
         await session.load()
+        previous = self._sessions.get(session_id)
+        if previous is not None:
+            await previous.aclose()
+        old_grants = self._grant_dbs.pop(session_id, None)
+        if old_grants is not None:
+            await old_grants.close()
+        await self._configure_session_policy(session)
         self._sessions[session_id] = session
 
         # Replay host events as session_update notifications BEFORE returning.
@@ -599,11 +637,14 @@ class DanaACPAgent:
         text_blocks, content_blocks_payload = normalized_blocks_to_text_blocks(normalized_blocks)
         stop_reason = "end_turn"
 
+        from contextlib import aclosing
+
         try:
-            async for event in session.prompt(text_blocks, content_blocks=content_blocks_payload):
-                update = host_event_to_acp_update(event)
-                if update is not None:
-                    await self._notify(session_id, update)
+            async with aclosing(session.prompt(text_blocks, content_blocks=content_blocks_payload)) as events:
+                async for event in events:
+                    update = host_event_to_acp_update(event)
+                    if update is not None:
+                        await self._notify(session_id, update)
         except SessionBusy:
             stop_reason = "max_turn_requests"
             return PromptResponse(stop_reason=stop_reason)
@@ -613,9 +654,9 @@ class DanaACPAgent:
             if terminal.fact_type is FactType.TURN_CANCELLED:
                 stop_reason = "cancelled"
             elif terminal.fact_type is FactType.TURN_ERROR:
-                # ACP has no "error" stop_reason; end_turn signals the turn ended.
-                # The error details are visible in host events (TURN_ERROR update).
-                stop_reason = "end_turn"
+                # The ACP transport maps exceptions to JSON-RPC error responses.
+                # A failed model turn must not masquerade as successful end_turn.
+                raise RuntimeError(terminal.error or "Agent turn failed")
 
         return PromptResponse(stop_reason=stop_reason)
 

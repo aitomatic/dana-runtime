@@ -181,9 +181,7 @@ class TestEdgeCases:
     """Edge cases: concurrent duplicate uploads, zero-byte content."""
 
     @pytest.mark.asyncio
-    async def test_concurrent_duplicate_uploads(
-        self, store: ArtifactStore, owner: OwnerScope
-    ) -> None:
+    async def test_concurrent_duplicate_uploads(self, store: ArtifactStore, owner: OwnerScope) -> None:
         """Simulate concurrent duplicate uploads — both should succeed and return same ref."""
         content = b"concurrent content"
         import asyncio

@@ -209,15 +209,7 @@ class GeminiProvider(LLMProvider):
         try:
             system_instruction, contents = self.prepare_messages(messages)
 
-            config = genai_types.GenerateContentConfig()
-            if system_instruction:
-                config.system_instruction = system_instruction
-            if "temperature" in kwargs:
-                config.temperature = kwargs["temperature"]
-            if "max_tokens" in kwargs:
-                config.max_output_tokens = kwargs["max_tokens"]
-            if tools:
-                config.tools = self.prepare_tools(tools)
+            config = self._build_generate_config(system_instruction, tools, kwargs)
 
             response = await self.client.aio.models.generate_content(
                 model=self.model,
@@ -237,19 +229,9 @@ class GeminiProvider(LLMProvider):
                             tool_calls = []
                         tool_calls.append(self._part_to_tool_call(part.function_call))
 
-            usage = None
-            if response.usage_metadata:
-                usage = {
-                    "prompt_tokens": response.usage_metadata.prompt_token_count or 0,
-                    "completion_tokens": response.usage_metadata.candidates_token_count or 0,
-                    "total_tokens": response.usage_metadata.total_token_count or 0,
-                }
+            usage = self._usage_dict(response.usage_metadata)
 
-            finish_reason = None
-            if response.candidates:
-                fr = response.candidates[0].finish_reason
-                if fr:
-                    finish_reason = str(fr)
+            finish_reason = self._candidate_finish_reason(response)
 
             # Gemini silently truncates over-budget prompts via MAX_TOKENS finish
             # reason — there is no SDK PTL error. Best-effort WARNING log only;
@@ -277,47 +259,122 @@ class GeminiProvider(LLMProvider):
             raise
 
     async def stream(self, messages: list[LLMMessage], tools: list | None = None, **kwargs):
-        """Stream LLMStreamChunk from Gemini."""
+        """Stream LLMStreamChunk from Gemini.
+
+        Request controls mirror :meth:`chat`: same ``GenerateContentConfig`` build
+        for temperature, output token ceiling and tools, so a caller policy cannot
+        reach the wire on one path and be dropped on the other.
+
+        Emits a terminal ``response`` carrier carrying the real usage counters, the
+        model version and the provider's finish reason (including MAX_TOKENS, which
+        the non-streaming path already warns about). Without it a streamed turn had
+        no usage/cache accounting at all and a truncated response was
+        indistinguishable from a complete one.
+        """
         try:
             system_instruction, contents = self.prepare_messages(messages)
 
-            config = genai_types.GenerateContentConfig()
-            if system_instruction:
-                config.system_instruction = system_instruction
-            if "temperature" in kwargs:
-                config.temperature = kwargs["temperature"]
-            if "max_tokens" in kwargs:
-                config.max_output_tokens = kwargs["max_tokens"]
-            if tools:
-                config.tools = self.prepare_tools(tools)
+            config = self._build_generate_config(system_instruction, tools, kwargs)
 
             stream = await self.client.aio.models.generate_content_stream(
                 model=self.model,
                 contents=contents,
                 config=config,
             )
+            text_parts: list[str] = []
+            tool_calls: list = []
+            usage_metadata = None
+            finish_reason: str | None = None
+            model_version: str | None = None
+
             async for chunk in stream:
+                if getattr(chunk, "usage_metadata", None):
+                    usage_metadata = chunk.usage_metadata
+                if getattr(chunk, "model_version", None):
+                    model_version = chunk.model_version
                 if not chunk.candidates or not chunk.candidates[0].content or not chunk.candidates[0].content.parts:
+                    candidate_finish = self._candidate_finish_reason(chunk)
+                    if candidate_finish:
+                        finish_reason = candidate_finish
                     continue
+
+                if self._candidate_finish_reason(chunk):
+                    finish_reason = self._candidate_finish_reason(chunk)
 
                 for part in chunk.candidates[0].content.parts:
                     if part.text:
+                        text_parts.append(part.text)
                         yield LLMStreamChunk(type="text_delta", content=part.text)
                     elif part.function_call:
-                        yield LLMStreamChunk(
-                            type="tool_use",
-                            tool_call={
-                                "id": str(uuid.uuid4()),
-                                "name": part.function_call.name,
-                                "input": dict(part.function_call.args) if part.function_call.args else {},
-                            },
-                        )
+                        tool_call = {
+                            "id": str(uuid.uuid4()),
+                            "name": part.function_call.name,
+                            "input": dict(part.function_call.args) if part.function_call.args else {},
+                        }
+                        tool_calls.append(tool_call)
+                        yield LLMStreamChunk(type="tool_use", tool_call=tool_call)
+
+            # Same fabrication guard as the OpenAI-compatible path: only report a
+            # terminal when the provider reported a finish reason or usage counters.
+            if finish_reason is not None or usage_metadata is not None:
+                yield LLMStreamChunk(
+                    type="response",
+                    response=LLMResponse(
+                        content="".join(text_parts),
+                        model=model_version or self.model,
+                        usage=self._usage_dict(usage_metadata),
+                        finish_reason=finish_reason,
+                        tool_calls=tool_calls or None,
+                    ),
+                )
 
         except httpx.TimeoutException as e:
             raise LLMTimeoutError(f"Gemini stream timeout: {e}") from e
         except Exception as e:
             logger.error("Gemini stream error", error=str(e))
             raise
+
+    def _build_generate_config(self, system_instruction, tools, kwargs: dict):
+        """Build the GenerateContentConfig shared by chat() and stream().
+
+        One assembly point keeps the two paths from drifting: a control added here
+        reaches both, and an unsupported control is dropped identically in both.
+        ``timeout`` is the caller's remaining logical-request budget, passed as the
+        per-request HttpOptions timeout (same *1000 compensation as the client
+        default, see ``__init__``) so the budget bounds the awaited call itself.
+        """
+        config = genai_types.GenerateContentConfig()
+        if system_instruction:
+            config.system_instruction = system_instruction
+        if "temperature" in kwargs:
+            config.temperature = kwargs["temperature"]
+        if "max_tokens" in kwargs:
+            config.max_output_tokens = kwargs["max_tokens"]
+        if kwargs.get("timeout"):
+            config.http_options = genai_types.HttpOptions(timeout=int(kwargs["timeout"] * 1000))
+        if tools:
+            config.tools = self.prepare_tools(tools)
+        return config
+
+    @staticmethod
+    def _candidate_finish_reason(chunk) -> str | None:
+        """Read the finish reason's wire value from a response or streaming chunk."""
+        candidates = getattr(chunk, "candidates", None)
+        if not candidates:
+            return None
+        fr = getattr(candidates[0], "finish_reason", None)
+        return str(getattr(fr, "value", fr)) if fr else None
+
+    @staticmethod
+    def _usage_dict(usage_metadata) -> dict[str, int] | None:
+        """Map Gemini usage metadata onto the shared usage shape."""
+        if not usage_metadata:
+            return None
+        return {
+            "prompt_tokens": usage_metadata.prompt_token_count or 0,
+            "completion_tokens": usage_metadata.candidates_token_count or 0,
+            "total_tokens": usage_metadata.total_token_count or 0,
+        }
 
     # --- Embedding methods ---
 

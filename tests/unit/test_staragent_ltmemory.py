@@ -1,10 +1,8 @@
 """Tests for STARAgent LTMemory integration."""
 
-import tempfile
 from pathlib import Path
+import tempfile
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from dana.common.protocols.types import LearningPhase
 

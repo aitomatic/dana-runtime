@@ -2,8 +2,6 @@
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from dana.core.memory import LTMemory
 
 
@@ -15,12 +13,14 @@ class TestLTMemory:
         """Test persists memory to file."""
         ltmem = LTMemory(path=str(tmp_path))
 
-        ltmem.store({
-            "type": "lesson",
-            "content": "Test lesson content",
-            "context": "testing",
-            "timestamp": "2024-01-15T10:30:00Z",
-        })
+        ltmem.store(
+            {
+                "type": "lesson",
+                "content": "Test lesson content",
+                "context": "testing",
+                "timestamp": "2024-01-15T10:30:00Z",
+            }
+        )
 
         # Verify file exists and contains the memory
         content = ltmem.memories_file.read_text()
@@ -34,10 +34,12 @@ class TestLTMemory:
         """Test generates timestamp if missing."""
         ltmem = LTMemory(path=str(tmp_path))
 
-        ltmem.store({
-            "type": "fact",
-            "content": "Some fact",
-        })
+        ltmem.store(
+            {
+                "type": "fact",
+                "content": "Some fact",
+            }
+        )
 
         content = ltmem.memories_file.read_text()
         # Should have auto-generated timestamp
@@ -49,11 +51,13 @@ class TestLTMemory:
         """Test storing memory without optional context."""
         ltmem = LTMemory(path=str(tmp_path))
 
-        ltmem.store({
-            "type": "pattern",
-            "content": "A pattern observed",
-            "timestamp": "2024-01-15T11:00:00Z",
-        })
+        ltmem.store(
+            {
+                "type": "pattern",
+                "content": "A pattern observed",
+                "timestamp": "2024-01-15T11:00:00Z",
+            }
+        )
 
         content = ltmem.memories_file.read_text()
         assert "**Content**: A pattern observed" in content
@@ -118,16 +122,20 @@ class TestLTMemory:
         """Test multiple stores append to file."""
         ltmem = LTMemory(path=str(tmp_path))
 
-        ltmem.store({
-            "type": "lesson",
-            "content": "First lesson",
-            "timestamp": "2024-01-15T10:00:00Z",
-        })
-        ltmem.store({
-            "type": "fact",
-            "content": "Second fact",
-            "timestamp": "2024-01-15T11:00:00Z",
-        })
+        ltmem.store(
+            {
+                "type": "lesson",
+                "content": "First lesson",
+                "timestamp": "2024-01-15T10:00:00Z",
+            }
+        )
+        ltmem.store(
+            {
+                "type": "fact",
+                "content": "Second fact",
+                "timestamp": "2024-01-15T11:00:00Z",
+            }
+        )
 
         content = ltmem.memories_file.read_text()
         assert "First lesson" in content
