@@ -407,23 +407,40 @@ class ToolExecutor:
             wait_for_offload: When True, block until queued blocking work
                 finishes. Call from a non-loop thread (it joins worker threads).
         """
-        if self._closed:
+        if not self._begin_close():
             return
-        self._closed = True
-        if self._owns_admission:
-            self._admission.close()
         self._offload_pool.shutdown(wait=wait_for_offload)
         self._observe("tool_executor_closed", {"waited_for_offload": wait_for_offload})
 
     async def aclose(self, *, wait_for_offload: bool = False) -> None:
-        """Async lifecycle cleanup (alias of :meth:`close`).
+        """Async lifecycle cleanup (alias of :meth:`close`, loop-safe).
 
         Exists so a host can call ``await executor.aclose()`` inside its own
-        ``aclose()`` without blocking the loop, and ``executor.close()`` from
-        sync teardown. MCP transports and provider clients are NOT owned here;
-        the session releases those.
+        ``aclose()``. When ``wait_for_offload=True`` the join of this executor's
+        worker threads runs on a separate thread (:meth:`BlockingIOPool.ashutdown`),
+        so awaiting the teardown does not stall the host's event loop for the
+        duration of in-flight blocking work. MCP transports and provider clients
+        are NOT owned here; the session releases those.
         """
-        self.close(wait_for_offload=wait_for_offload)
+        if not self._begin_close():
+            return
+        await self._offload_pool.ashutdown(wait=wait_for_offload)
+        self._observe("tool_executor_closed", {"waited_for_offload": wait_for_offload})
+
+    def _begin_close(self) -> bool:
+        """Claim the one-shot close; ``False`` when already closed.
+
+        Shared by the sync and async paths so their ownership rules cannot drift:
+        admission bookkeeping is released only when this executor owns its
+        controller - the shared process-wide default is never cleared, and no
+        in-flight work is ever cancelled.
+        """
+        if self._closed:
+            return False
+        self._closed = True
+        if self._owns_admission:
+            self._admission.close()
+        return True
 
     @property
     def closed(self) -> bool:

@@ -374,6 +374,11 @@ An incomplete response takes precedence over any included function calls.
 Responses API error events propagate as typed errors; Gemini SDK finish enums
 are normalized to wire values before the STAR completion guard.
 
+Sampling omission and explicit zero are different caller policies. Runtime
+construction preserves that provenance through `LLMCaller`: absent streaming
+temperature leaves the provider default intact, while explicit zero is not
+silently omitted. Provider model restrictions still apply independently.
+
 Named provider selection and assignment through `llm_client` transfer ownership
 to STAR; `llm_provider_instance` is borrowed. Replacement retires the previous
 owned client without closing borrowed clients. Agent shutdown closes internally
@@ -510,6 +515,9 @@ an escaped public message reference also requires attribute-change checks.
 Retained dependency comparisons can still scale with mutable history size.
 This is incremental token estimation, not a constant-time guarantee for
 arbitrary caller-mutated histories.
+Snapshot retention also consumes memory proportional to aliased payloads.
+Preserving public mutation visibility can cost more than recounting on some
+workloads; plain-history benchmark gains must not be generalized to this path.
 
 Runtime-context replacement, hydration, shrink, and compaction keep the message
 cache aligned with the live projection. Hydrating caller-owned dictionaries
@@ -538,13 +546,18 @@ OpenClaude-style engines:
    gate skips shrink when it cannot close the token gap alone — prevents
    vacuous summaries over stubs.
 3. **Reactive compact + circuit breaker (P2)** — `PromptTooLongError`
-   raised by providers is caught in `llm_caller._invoke_llm_sync/async`,
-   which calls `timeline.reactive_compact(attempt)` (drop 5→10→20 oldest
-   kept entries + forward-orphan pruning + full summary) with exponential
-   backoff 1s/3s. After 3 consecutive failures the circuit opens;
+   raised by providers is caught in `llm_caller._invoke_llm_sync/async`.
+   The sync path uses `timeline.reactive_compact(attempt)`; the async path
+   awaits `timeline.reactive_compact_async(attempt)`. Both retain progressive
+   drops, forward-orphan pruning, full summary and exponential backoff.
+   After 3 consecutive failures the circuit opens;
    cooldown `DANA_CIRCUIT_COOLDOWN_SECONDS` (default 300s) plus half-open
    probe provide automatic recovery. Kill switch via
    `DANA_DISABLE_REACTIVE_COMPACT=1`.
+   Async compaction propagates cancellation to the awaited summarizer rather
+   than abandoning a worker that can later overwrite the timeline. A sync-only
+   callback must be joined before ownership releases, so its remaining physical
+   duration can overrun the logical request deadline.
 
 **Provider PTL mapping:**
 | Provider | Detection |
@@ -622,11 +635,22 @@ the repository it opens. ACP and CLI close sessions before host-owned storage.
   file targets redirected by interception. MCP `readOnlyHint=True` calls can
   overlap; unannotated MCP calls serialize within their server, not globally.
   Catalogs and session lifecycle hooks resolve against the invoking agent.
-- **Blocking tools**: Only synchronous callables explicitly marked
-  `@blocking_io` run in the bounded worker pool. Unmarked synchronous Python
-  stays on the event loop; it is not assumed thread-safe. Cancellation signals
-  cooperative waits and retains admission/effect ownership until physical work
-  exits. A non-cooperative callable can therefore delay cancellation.
+- **Blocking tools**: Synchronous callables explicitly marked `@blocking_io`
+  run in the bounded worker pool. Unmarked synchronous Python stays on the
+  event loop; it is not assumed thread-safe. Async file tools may explicitly
+  offload their blocking cores through `run_blocking`; async signatures do not
+  imply inline disk I/O. Cancellation signals cooperative waits and retains
+  admission/effect ownership until physical work exits. A non-cooperative
+  callable can therefore delay cancellation; Python threads cannot safely be
+  forcibly terminated.
+  Root executors close only their owned pool; a direct-call fallback pool lives
+  until process exit. Awaited worker joins run off-loop. File-edit path locks
+  are weakly indexed, with strong ownership through each holder or waiter, so
+  completed paths do not accumulate registry entries.
+- **Bash pipe ownership**: Process exit and output completion are separate.
+  Descendants may keep inherited pipes open after the shell exits. Status stays
+  `running` until output drains, while `exit_code` can report the terminal process.
+  Pipe draining never holds the task-state lock across a wait.
 - **Nested progress**: A nested call can lend its held slot to a descendant to
   avoid self-deadlock. An ancestor cannot release that capacity while borrowed
   descendant work remains active.

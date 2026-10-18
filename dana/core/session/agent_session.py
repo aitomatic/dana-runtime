@@ -668,9 +668,9 @@ class AgentSession:
                                 timestamp=event.timestamp,
                                 metadata={
                                     "tool_call_id": call_id,
-                                    "tool_name": fact.payload["tool_name"],
+                                    "tool_name": fact.payload.get("tool_name", ""),
                                     "kind": fact.payload.get("kind"),
-                                    "raw_input": fact.payload["arguments"],
+                                    "raw_input": fact.payload.get("arguments", {}),
                                 },
                             )
                         tool_events.append(event)
@@ -1020,7 +1020,7 @@ class AgentSession:
                     if caller_cancelled:
                         raise
                     return
-                if caller_cancelled or not self._turn_cancel_requested:
+                if caller_cancelled or isinstance(cancellation, GeneratorExit):
                     # _append_facts resolved any interrupted commit and recorded
                     # its version, so a durable terminal must not be duplicated.
                     if self._last_terminal is None and not any(
@@ -1058,11 +1058,12 @@ class AgentSession:
                                 correlation_id=correlation_id,
                                 exc_info=True,
                             )
-                    # The caller's cancellation is the reason this turn ended: it
-                    # must propagate (never reported as a normal return), after the
-                    # durable boundary is settled.
-                    raise
-                # Cancellation requested via cancel(). Persist any buffered
+                    # Only cancellation of the consuming task propagates to its
+                    # caller. Closing the iterator terminalizes without yielding.
+                    if caller_cancelled:
+                        raise
+                    return
+                # Internal or explicit session cancellation: persist buffered
                 # partial text, then a single TURN_CANCELLED terminal.
                 try:
                     if chunk_buffer:
@@ -1110,20 +1111,9 @@ class AgentSession:
                     sequence=cancel_result.appended_facts[0].sequence,
                     text=partial,
                 )
-                if isinstance(cancellation, GeneratorExit):
-                    return
-                # I4: `cancel()` (explicit session cancel) owns the outcome and
-                # the caller keeps iterating to observe the TURN_CANCELLED event.
-                # A cancellation that did NOT come from `cancel()` is the caller's
-                # own task being cancelled (asyncio.timeout / TaskGroup / a host
-                # shutting the turn down): the durable terminal above is already
-                # committed, so the CancelledError is now propagated instead of
-                # being reported as a normal return.
-                requested = self._turn_cancel_requested
-                if not requested:
-                    # The event stream ends here; the durable outcome is already
-                    # recorded and observable via last_terminal / replay.
-                    raise
+                # Internal stream cancellation and explicit cancel() both produce
+                # a normal cancellation terminal. The consumer's task was not
+                # cancelled, so it must not receive an unrelated CancelledError.
                 while tool_events:
                     yield tool_events.popleft()
                 yield HostEvent(
@@ -1238,19 +1228,17 @@ class AgentSession:
                         break
             self._current_version = result.new_version
             self._committed_batch_types = tuple(fact.fact_type for fact in result.appended_facts)
-            if self._tool_commit_observer is not None:
-                self._tool_commit_observer(result.appended_facts, cancelled)
             try:
+                if self._tool_commit_observer is not None:
+                    self._tool_commit_observer(result.appended_facts, cancelled)
                 self._advance_conversation(result.appended_facts)
             except Exception:
-                # C3: the batch is already durable. A failure in the derived fold
-                # (e.g. a malformed protected payload or a projection bug) must
-                # never surface as a second terminal for a turn that already
-                # committed one. Drop the derived cache and rebuild it from the
-                # authoritative journal on the next request instead.
+                # The batch is already durable. Observer or derived-fold failure
+                # must not turn committed success into a second terminal.
+                # Rebuild the derived cache from the journal on the next request.
                 self._invalidate_conversation_cache()
                 logger.warning(
-                    "conversation fold failed after commit",
+                    "post-commit observation failed",
                     session_id=self._session_id,
                     version=self._current_version,
                     exc_info=True,

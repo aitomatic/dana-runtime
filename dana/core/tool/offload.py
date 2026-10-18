@@ -16,10 +16,12 @@ There are two kinds of pools:
   the same pool because the pool is bound to the dispatch context
   (:func:`bind_blocking_io_pool`) rather than passed around by hand.
 * **Default pool** — the fallback for direct/legacy callers that never bound a
-  pool (a bare ``FileIOResource`` used outside a session). It is process-wide and
-  is closed only by an explicit application-level
-  :func:`shutdown_default_blocking_io_executor` call; **a session close never
-  kills it** (that would poison concurrent and future sessions).
+  pool (a bare ``FileIOResource`` used outside a session). It is process-wide, so
+  it has no session owner: it is closed at **process lifecycle** (an ``atexit``
+  handler registered by this module, which is why a session never has to close
+  it) and can also be closed explicitly with
+  :func:`shutdown_default_blocking_io_executor`; **a session close never kills
+  it** (that would poison concurrent and future sessions).
 
 ``run_blocking`` resolves the pool at call time: bound pool first, default pool
 otherwise. Exceptions from the callable propagate unchanged — offloading never
@@ -48,6 +50,7 @@ dispatch asks cooperative callables to stop waiting by setting ``cancel``.
 from __future__ import annotations
 
 import asyncio
+import atexit
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
@@ -253,14 +256,39 @@ class BlockingIOPool:
         return self._pool is not None
 
     def _executor(self) -> ThreadPoolExecutor:
-        """Lazily create (once) and return the underlying executor."""
+        """Lazily create (once) and return the underlying executor.
+
+        The closed check is made *under* the lock: ``shutdown`` takes the same
+        lock to set ``_closed``, so a concurrent close cannot land between the
+        check and the create. Without that, a close running in that window let a
+        caller build a brand-new executor after ``shutdown`` had already run -
+        the pool reported itself closed while a fresh worker thread (which
+        nothing would ever join) was started behind it.
+        """
+        with self._lock:
+            return self._started_executor_locked()
+
+    def _started_executor_locked(self) -> ThreadPoolExecutor:
+        """Caller must hold ``self._lock``. Refuse when closed, else create once."""
         if self._closed:
             raise BlockingIOShutdown("blocking I/O pool was shut down; no new offloads are accepted")
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix=self._name)
+            logger.info("blocking_io_pool_started", max_workers=self._max_workers, name=self._name)
+        return self._pool
+
+    def _submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+        """Submit ``fn(*args, **kwargs)`` to this pool, refusing to race a close.
+
+        Submission happens *inside* the lock so a concurrent :meth:`shutdown`
+        can neither drop the submission as "after shutdown" (the raw executor's
+        own ``RuntimeError``) nor lose the worker it started. Either this call
+        gets a bounded, owned worker that ``shutdown`` will account for, or it
+        fails with the documented :class:`BlockingIOShutdown` - never a
+        half-closed pool with an unjoinable thread behind it.
+        """
         with self._lock:
-            if self._pool is None:
-                self._pool = ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix=self._name)
-                logger.info("blocking_io_pool_started", max_workers=self._max_workers, name=self._name)
-            return self._pool
+            return self._started_executor_locked().submit(fn, *args, **kwargs)
 
     async def run(self, func: Callable[..., Any], *args: Any, _claim: PhysicalWorkClaim | None = None, **kwargs: Any) -> Any:
         """Run ``func(*args, **kwargs)`` on this pool and await the result.
@@ -292,7 +320,11 @@ class BlockingIOPool:
         # Submit directly (not via ``run_in_executor``) so the underlying concurrent
         # future is in hand: its ``cancel()`` result is the only honest signal that
         # the work never started.
-        concurrent = self._executor().submit(call)
+        try:
+            concurrent = self._submit(call)
+        except BaseException:
+            handle.done.set()
+            raise
         future = asyncio.wrap_future(concurrent, loop=loop)
 
         def _settle_if_dropped(settled: asyncio.Future) -> None:
@@ -311,7 +343,7 @@ class BlockingIOPool:
         Used by the legacy synchronous dispatch path, which has no loop to stall
         but still wants bounded, lifecycle-owned execution. Exceptions propagate.
         """
-        return self._executor().submit(_run_claimed, contextvars.copy_context(), func, args, kwargs, PhysicalWorkClaim()).result()
+        return self._submit(_run_claimed, contextvars.copy_context(), func, args, kwargs, PhysicalWorkClaim()).result()
 
     def shutdown(self, wait: bool = False) -> None:
         """Close this pool (idempotent). Affects only this pool's own threads.
@@ -331,6 +363,19 @@ class BlockingIOPool:
         if pool is not None:
             pool.shutdown(wait=wait, cancel_futures=not wait)
         logger.info("blocking_io_pool_stopped", waited=wait, name=self._name)
+
+    async def ashutdown(self, wait: bool = False) -> None:
+        """Await :meth:`shutdown` without parking the event loop.
+
+        ``ThreadPoolExecutor.shutdown(wait=True)`` *joins* the worker threads,
+        so calling it from a coroutine stalls every other task on that loop for
+        as long as the longest piece of in-flight blocking work takes. The join
+        is run on a separate thread instead, so an awaited teardown still waits
+        for the physical work to finish while the loop keeps servicing other
+        coroutines. Behaviour (including the ``wait`` semantics) is otherwise
+        identical to the synchronous call.
+        """
+        await asyncio.to_thread(self.shutdown, wait)
 
 
 # ----------------------------------------------------------------------
@@ -375,9 +420,14 @@ def bind_blocking_io_pool(pool: BlockingIOPool | None) -> contextvars.Token:
     """Bind ``pool`` as the current context's offload pool (returns a reset token).
 
     An owning executor binds its session pool for the duration of a dispatch so
-    every resource call inside (including nested agents) offloads to the session's
-    own bounded pool. Unbinding restores the previous binding, so a closed
-    session's callers fall back to the default pool rather than failing.
+    that *offloading* work - a nested :func:`run_blocking` call, including one
+    made by a nested agent, or an explicitly ``@blocking_io``-marked synchronous
+    callable that dispatch moves to a worker - resolves to the session's own
+    bounded pool instead of the process default. Binding does not itself offload
+    anything: an unmarked synchronous resource method stays on the event-loop
+    thread (I7), exactly as it would with no binding. Unbinding restores the
+    previous binding, so a closed session's callers fall back to the default pool
+    rather than failing.
     """
     return _bound_pool.set(pool)
 
@@ -479,3 +529,15 @@ def shutdown_default_blocking_io_executor(wait: bool = False) -> None:
         _default_pool = None
     if pool is not None:
         pool.shutdown(wait=wait)
+
+
+# The default pool has no session owner, so nothing else would ever close it:
+# a bare ``FileIOResource`` (or any direct/legacy ``run_blocking`` caller) starts
+# worker threads that would otherwise still be alive when the interpreter begins
+# waiting to join non-daemon threads at exit. This is *process* lifecycle, the one
+# boundary that legitimately closes a pool shared by every session - never a
+# session teardown, which must stay scoped to its own pool. Closing here only
+# joins threads at a point where no further offload can be issued, so it can
+# never poison the sessions the module documentation warns about. Idempotent, and
+# a no-op when the default pool was never started.
+atexit.register(shutdown_default_blocking_io_executor, True)

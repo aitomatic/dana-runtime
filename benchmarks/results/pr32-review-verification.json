@@ -1,6 +1,6 @@
 {
   "schema": "dana.pr32-review-verification/1",
-  "scope": "PR #32 review-repair patch containing this record; correctness checks, not a new performance comparison",
+  "scope": "Historical first repair pass at a0da647. Subsequent re-review found SQLite BEGIN cancellation and Bash inherited-pipe blockers, plus explicit-zero temperature and lifecycle gaps. This is not current-head verification or an all-addressed claim.",
   "original_measurement_commit": "07b9037439dd81e45ec1862fce0d3850ec152bd8",
   "final_checks": {
     "ruff_check": "uv run --no-sync ruff check .: passed",
@@ -26,15 +26,15 @@
     "C3": "Committed journal facts remain authoritative after projection failure; rebuild instead of a second terminal",
     "I1": "ACP reports one error notification and returns normal end_turn; lifecycle translation coverage restored",
     "I2": "Crash-recovery observation reaches the intended request once and is not checkpointed",
-    "I3": "Shared SQLite connection transactions serialized",
-    "I4": "Caller cancellation propagates after owned cleanup; explicit session cancellation remains a normal terminal",
+    "I3": "Initial transaction serialization; re-review found queued BEGIN cancellation unresolved at this commit",
+    "I4": "Caller cancellation propagates after owned cleanup; internal producer cancellation remained a caveat at this commit",
     "I5": "Policy denials become recoverable policy_block tool results",
     "I6": "Permission resolution precedes shared admission",
     "I7": "Only explicitly blocking_io synchronous tools run on workers; Bash task state synchronized",
     "I8": "Cooperative blocking waits stop; non-cooperative work retains admission and effect ownership until physical exit",
     "I9": "MCP read-only calls may overlap; unknown effects ordered per server; metadata retained in actual session catalog",
     "I10": "Attempt timeout bounded by remaining retry budget and configured/default attempt timeout",
-    "I11": "Streaming default temperature omission preserved",
+    "I11": "Default omission restored; explicit zero still incorrectly omitted at this commit",
     "I12": "Pre-first-chunk deadline followed by per-chunk idle timeout; no retry after partial output",
     "I13": "Flush cached LangSmith client owning traceable runs",
     "I14": "Per-message token deltas with mutable-alias checks; comparisons still scale with mutable payload size",
@@ -50,7 +50,7 @@
     "S9": "Public MCP ClientSession constructor stream wrapping replaces private SDK mutation",
     "S10": "STAR retry ownership documented",
     "S11": "Five benchmark drivers moved into benchmarks with reproduction guidance and CI smoke",
-    "S12": "Original numeric sample extract and this repair record committed publicly",
+    "S12": "Original raw extract published at a0da647; current tree links it from a bounded aggregate summary",
     "S13": "PostgreSQL CI job enabled for pull requests and manual dispatch"
   },
   "actual_path_checks": [

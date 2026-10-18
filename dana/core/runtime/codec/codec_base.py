@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 from dana.common.llm.llm import LLM
 from dana.common.llm.types import LLMMessage, LLMResponse
 from dana.core.knowledge.prompts.codecs import AbstractCodec, CSXMLCodec, NativeToolsCodec
+from dana.core.llm.llm_caller import UNSET, _Unset
 from dana.core.prompt.prompt_api import LocalPromptAPI
 from dana.core.runtime.base import AgentRuntime
 
@@ -28,7 +29,7 @@ class CodecRuntimeBase(AgentRuntime):
     def __init__(
         self,
         model: str | None = None,
-        temperature: float = 0,
+        temperature: float | None | _Unset = UNSET,
         max_tokens: int | None = None,
         llm: LLM | None = None,
         provider: str = "anthropic",

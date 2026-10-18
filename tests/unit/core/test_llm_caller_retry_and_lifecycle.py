@@ -25,7 +25,8 @@ from dana.common.llm.types import (
     PromptTooLongError,
     ProviderError,
 )
-from dana.core.llm.llm_caller import LLMCaller, ProviderConfig
+from dana.core.llm.llm_caller import DEFAULT_TEMPERATURE, LLMCaller, ProviderConfig
+from dana.core.runtime.default import DefaultRuntime
 
 
 def _response(content: str = "ok") -> LLMResponse:
@@ -108,8 +109,9 @@ class TestStreamRetrySafety:
 
 
 class TestStreamRequestControls:
-    """Streaming must send the same caller policy the non-streaming path sends,
-    except for the runtime default temperature, which streaming omits."""
+    """Streaming must send the same caller policy the non-streaming path sends.
+    The one deliberate difference is the *unset* temperature: streaming omits it so
+    the provider's own sampling default applies."""
 
     @pytest.mark.asyncio
     async def test_stream_forwards_explicit_temperature_and_max_tokens(self):
@@ -133,7 +135,8 @@ class TestStreamRequestControls:
         assert llm.sent_tools[0] is None
 
     @pytest.mark.asyncio
-    async def test_unset_controls_are_omitted_not_sent_as_null(self):
+    async def test_explicit_none_temperature_is_omitted(self):
+        """An explicit ``None`` asks for no sampling parameter on either path."""
         llm = _StreamingLLM(fail_after=0, exc=ProviderError("x"), succeed_on_attempt=1)
         caller = LLMCaller(llm=llm, temperature=None, max_tokens=None)
 
@@ -145,15 +148,17 @@ class TestStreamRequestControls:
         assert "max_tokens" not in sent
 
     @pytest.mark.asyncio
-    async def test_runtime_default_temperature_is_not_sent_on_the_stream_path(self):
-        """I11: the runtime's own temperature=0 default must not be a wire policy.
+    async def test_unset_temperature_is_omitted_on_the_stream_path(self):
+        """I11: a caller that never expressed a sampling policy sends none.
 
-        o3/o4 on Responses and Azure gpt-5 deployments not named gpt-5* reject a
-        sampling parameter with a 400, and Anthropic/Gemini silently lose their
-        provider default. Only an explicit non-default value is a caller choice.
+        ``UNSET`` is the constructor default, so the default-constructed caller
+        (and the runtime that forwards its own unresolved default) leaves the
+        provider's sampling default in force. o3/o4 on Responses and Azure gpt-5
+        deployments not named gpt-5* reject a sampling parameter with a 400, and
+        Anthropic/Gemini silently lose their provider default.
         """
         llm = _StreamingLLM(fail_after=0, exc=ProviderError("x"), succeed_on_attempt=1)
-        caller = LLMCaller(llm=llm, temperature=0)
+        caller = LLMCaller(llm=llm)  # temperature defaults to UNSET
 
         async for _ in caller.call_llm_stream([LLMMessage(role="user", content="hi")]):
             pass
@@ -161,8 +166,24 @@ class TestStreamRequestControls:
         assert "temperature" not in llm.sent_kwargs[0]
 
     @pytest.mark.asyncio
-    async def test_default_temperature_still_reaches_the_nonstream_path(self):
-        """The non-streaming wire shape is unchanged by this PR."""
+    async def test_explicit_zero_temperature_reaches_the_stream_wire(self):
+        """I11 regression: an explicit 0 is a decision, not "unset".
+
+        The value-only rule this replaces compared against the default 0 and
+        silently dropped exactly this case. Determinism is a real request: a
+        caller that asks for greedy decoding must get it on the streaming path,
+        the same way the non-streaming path already forwarded it.
+        """
+        llm = _StreamingLLM(fail_after=0, exc=ProviderError("x"), succeed_on_attempt=1)
+        caller = LLMCaller(llm=llm, temperature=0)
+
+        async for _ in caller.call_llm_stream([LLMMessage(role="user", content="hi")]):
+            pass
+
+        assert llm.sent_kwargs[0]["temperature"] == 0, "an explicit 0 must not be treated as the runtime default"
+
+    @pytest.mark.asyncio
+    async def test_explicit_zero_temperature_reaches_the_nonstream_wire(self):
         llm = MagicMock()
         llm.chat_response_sync.return_value = _response()
         caller = LLMCaller(llm=llm, temperature=0)
@@ -170,6 +191,138 @@ class TestStreamRequestControls:
         caller.call_llm([])
 
         assert llm.chat_response_sync.call_args.kwargs["temperature"] == 0
+
+    @pytest.mark.asyncio
+    async def test_unset_temperature_keeps_the_nonstream_default_wire_shape(self):
+        """The non-streaming wire shape is unchanged by this PR: an unset control
+        still resolves to the runtime default ``0`` there."""
+        llm = MagicMock()
+        llm.chat_response_sync.return_value = _response()
+        caller = LLMCaller(llm=llm)
+
+        caller.call_llm([])
+
+        assert llm.chat_response_sync.call_args.kwargs["temperature"] == DEFAULT_TEMPERATURE
+
+    def test_build_request_kwargs_intent_matrix(self):
+        """The full intent matrix, both routes, with no provider involved.
+
+        Four caller intents x two routes: this is the table the value-only
+        comparison could not express, and where an explicit 0 was lost.
+        """
+        cases = [
+            # (constructor kwarg, expected stream value / omitted, expected sync value / omitted)
+            ({}, "omit", DEFAULT_TEMPERATURE),
+            ({"temperature": None}, "omit", "omit"),
+            ({"temperature": 0}, 0, 0),
+            ({"temperature": 0.0}, 0.0, 0.0),
+            ({"temperature": 0.7}, 0.7, 0.7),
+        ]
+        for kwargs, stream_expected, sync_expected in cases:
+            caller = LLMCaller(llm=MagicMock(), **kwargs)
+
+            stream_kwargs = caller._build_request_kwargs(streaming=True)
+            if stream_expected == "omit":
+                assert "temperature" not in stream_kwargs, f"{kwargs}: stream must omit"
+            else:
+                assert stream_kwargs["temperature"] == stream_expected, f"{kwargs}: stream value"
+
+            sync_kwargs = caller._build_request_kwargs(streaming=False)
+            if sync_expected == "omit":
+                assert "temperature" not in sync_kwargs, f"{kwargs}: sync must omit"
+            else:
+                assert sync_kwargs["temperature"] == sync_expected, f"{kwargs}: sync value"
+
+
+class TestRuntimeTemperatureProvenance:
+    """The runtime forwards *intent*, not just a number: its own default must not
+    become a wire policy while a caller-supplied 0 must reach the wire."""
+
+    def test_agent_runtime_default_temperature_is_unset_intent(self):
+        runtime = DefaultRuntime()
+        assert runtime._temperature == DEFAULT_TEMPERATURE, "attribute keeps its historic resolved value"
+        assert runtime._temperature_configured is False, "no sampling policy was expressed"
+        assert "temperature" not in runtime._llm_caller._build_request_kwargs(streaming=True)
+
+    def test_agent_runtime_explicit_zero_is_configured_intent(self):
+        runtime = DefaultRuntime(temperature=0)
+        assert runtime._temperature == 0
+        assert runtime._temperature_configured is True
+        assert runtime._llm_caller._build_request_kwargs(streaming=True)["temperature"] == 0
+
+    def test_agent_runtime_nonzero_temperature_reaches_stream_and_sync(self):
+        runtime = DefaultRuntime(temperature=0.5)
+        assert runtime._temperature == 0.5
+        assert runtime._llm_caller._build_request_kwargs(streaming=True)["temperature"] == 0.5
+        assert runtime._llm_caller._build_request_kwargs(streaming=False)["temperature"] == 0.5
+
+    def test_codec_runtime_preserves_unset_intent(self):
+        """Every runtime layer must forward the sentinel, not resolve it to 0."""
+        from dana.core.runtime.codec import CodecRuntimeWithNativeToolUse
+
+        runtime = CodecRuntimeWithNativeToolUse()
+        assert runtime._temperature_configured is False
+        assert "temperature" not in runtime._llm_caller._build_request_kwargs(streaming=True)
+
+    def test_star_agent_default_runtime_omits_temperature_on_stream(self):
+        """The production construction path: STARAgent builds its runtime with no
+        temperature, so streaming must not send one."""
+        from dana.core.agent.star_agent import STARAgent
+
+        agent = STARAgent(
+            agent_type="i11-provenance",
+            auto_register=False,
+            enable_web_search=False,
+            enable_skills=False,
+            enable_code_execution=False,
+        )
+        runtime = agent._runtime
+        assert runtime._temperature_configured is False
+        assert "temperature" not in runtime._llm_caller._build_request_kwargs(streaming=True)
+
+    def test_runtime_default_temperature_is_not_sent_on_the_stream_wire(self):
+        """End to end through the runtime's own caller: the I11 user-visible case.
+
+        A default-constructed runtime streams through its LLMCaller; nothing may
+        put the runtime's internal default on the wire.
+        """
+        sent: list[dict] = []
+
+        class _StreamingLLM:
+            async def stream(self, messages, tools=None, **kwargs):
+                sent.append(kwargs)
+                yield LLMStreamChunk(type="text_delta", content="hi")
+                yield LLMStreamChunk(type="response", response=_response("hi"))
+
+        runtime = DefaultRuntime(llm=_StreamingLLM())
+
+        async def _drive():
+            async for _ in runtime._llm_caller.call_llm_stream([LLMMessage(role="user", content="hi")]):
+                pass
+
+        asyncio.run(_drive())
+
+        assert sent and "temperature" not in sent[0], "the runtime default must not become a wire policy"
+
+    def test_runtime_explicit_zero_temperature_reaches_the_stream_wire(self):
+        """The same end-to-end path, with the caller actually asking for 0."""
+        sent: list[dict] = []
+
+        class _StreamingLLM:
+            async def stream(self, messages, tools=None, **kwargs):
+                sent.append(kwargs)
+                yield LLMStreamChunk(type="text_delta", content="hi")
+                yield LLMStreamChunk(type="response", response=_response("hi"))
+
+        runtime = DefaultRuntime(llm=_StreamingLLM(), temperature=0)
+
+        async def _drive():
+            async for _ in runtime._llm_caller.call_llm_stream([LLMMessage(role="user", content="hi")]):
+                pass
+
+        asyncio.run(_drive())
+
+        assert sent[0]["temperature"] == 0, "an explicit 0 through the runtime must reach the wire"
 
 
 class TestBoundedRetryAndDeadline:
@@ -599,8 +752,13 @@ class TestTypedErrorsAtTheConsumerBoundary:
         assert LLMCaller._is_transient_error(PromptTooLongError("prompt is too long")) is False
 
     @pytest.mark.asyncio
-    async def test_reactive_compaction_runs_off_the_event_loop(self):
-        """Async PTL recovery must not block the loop with synchronous compaction."""
+    async def test_foreign_timeline_compaction_runs_off_the_event_loop(self):
+        """A timeline with only the sync seam is offloaded, not run inline.
+
+        Foreign/legacy timelines expose ``reactive_compact`` alone; blocking the
+        event loop on it would stall every other task, so it runs in a worker and
+        the caller joins that worker rather than orphaning it.
+        """
         calls: list[int] = []
 
         class _Timeline:
@@ -650,6 +808,216 @@ class TestTypedErrorsAtTheConsumerBoundary:
         assert result.content == "compacted"
         assert calls == [1]
         assert compact_threads and compact_threads[0] != loop_thread, "compaction must run in a worker thread"
+
+    @pytest.mark.asyncio
+    async def test_async_compaction_seam_is_preferred_and_runs_on_the_caller_thread(self):
+        """A timeline exposing ``reactive_compact_async`` is awaited, not offloaded.
+
+        This is the ownership fix: ``asyncio.to_thread`` cannot be stopped, so an
+        abandoned await would leave a worker mutating a released timeline. The
+        async seam keeps every mutation on this awaiting thread, so the caller's
+        deadline reaches the provider and no late writer survives.
+        """
+        seen: list[tuple[str, int]] = []
+
+        class _Timeline:
+            _consecutive_compact_failures = 0
+            _compaction_disabled = False
+            _circuit_opened_at = None
+
+            class _Cfg:
+                enable_reactive_compact = True
+
+            _compressed_config = _Cfg()
+
+            def reactive_compact(self, attempt: int) -> None:  # pragma: no cover - must not be used
+                seen.append(("sync", attempt))
+
+            async def reactive_compact_async(self, attempt: int) -> None:
+                import threading
+
+                seen.append((f"async:{threading.get_ident()}", attempt))
+
+        timeline = _Timeline()
+
+        class _Agent:
+            object_id = "a1"
+            agent_type = "test"
+            _timeline = timeline
+
+        class _LLM:
+            def __init__(self):
+                self.n = 0
+
+            async def chat_response(self, messages, **kwargs):
+                self.n += 1
+                if self.n == 1:
+                    raise PromptTooLongError("too long")
+                return _response("compacted")
+
+        import threading
+
+        loop_thread = threading.get_ident()
+        caller = LLMCaller(llm=_LLM(), agent_getter=lambda: _Agent(), native_tools_getter=lambda: None)
+        with patch("asyncio.sleep", new=AsyncMock()):
+            result = await caller._invoke_llm_async(caller._llm, [LLMMessage(role="user", content="x")])
+
+        assert result.content == "compacted"
+        assert len(seen) == 1, "exactly one compaction ran"
+        marker, attempt = seen[0]
+        assert marker == f"async:{loop_thread}", "the async seam must be awaited on the caller's own thread"
+        assert attempt == 1
+
+    @pytest.mark.asyncio
+    async def test_cancelled_await_joins_a_foreign_sync_compaction(self):
+        """Cancellation must not orphan an un-stoppable foreign compaction.
+
+        The worker owns its mutation to completion; the caller waits for it and
+        only then re-raises, so nothing keeps writing to a released timeline.
+        """
+        import threading
+
+        started = threading.Event()
+        finished = threading.Event()
+
+        class _Timeline:
+            _consecutive_compact_failures = 0
+            _compaction_disabled = False
+            _circuit_opened_at = None
+
+            class _Cfg:
+                enable_reactive_compact = True
+
+            _compressed_config = _Cfg()
+
+            def reactive_compact(self, attempt: int) -> None:
+                started.set()
+                time.sleep(0.05)
+                finished.set()
+
+        class _Agent:
+            object_id = "a1"
+            agent_type = "test"
+            _timeline = _Timeline()
+
+        class _LLM:
+            async def chat_response(self, messages, **kwargs):
+                raise PromptTooLongError("too long")
+
+        caller = LLMCaller(llm=_LLM(), agent_getter=lambda: _Agent(), native_tools_getter=lambda: None)
+        task = asyncio.ensure_future(caller._invoke_llm_async(caller._llm, [LLMMessage(role="user", content="x")]))
+        deadline = time.monotonic() + 2.0
+        while not started.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.005)
+        assert started.is_set(), "the foreign compaction must have started on a worker thread"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert finished.is_set(), "the foreign compaction worker must be joined, not orphaned"
+
+    @pytest.mark.asyncio
+    async def test_cancelled_await_preserves_owner_cancellation_when_the_worker_fails(self):
+        """A worker failure during the join must not replace owner cancellation.
+
+        The worker is joined after cancellation, so its exception surfaces while
+        the join is in flight. That failure is the worker's, not this call's
+        result: the owner's ``CancelledError`` must still be what escapes, and the
+        worker's exception must be retrieved rather than left unretrieved.
+        """
+        import gc
+        import threading
+
+        started = threading.Event()
+        released = threading.Event()
+
+        class _Timeline:
+            _consecutive_compact_failures = 0
+            _compaction_disabled = False
+            _circuit_opened_at = None
+
+            class _Cfg:
+                enable_reactive_compact = True
+
+            _compressed_config = _Cfg()
+
+            def reactive_compact(self, attempt: int) -> None:
+                started.set()
+                # Hold the worker in flight so cancellation lands before it fails.
+                released.wait(2.0)
+                raise ValueError("worker blew up after the owner left")
+
+        class _Agent:
+            object_id = "a1"
+            agent_type = "test"
+            _timeline = _Timeline()
+
+        class _LLM:
+            async def chat_response(self, messages, **kwargs):
+                raise PromptTooLongError("too long")
+
+        loop = asyncio.get_running_loop()
+        unretrieved: list[str] = []
+        previous = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, ctx: unretrieved.append(str(ctx.get("message", ""))))
+        try:
+            caller = LLMCaller(llm=_LLM(), agent_getter=lambda: _Agent(), native_tools_getter=lambda: None)
+            task = asyncio.ensure_future(caller._invoke_llm_async(caller._llm, [LLMMessage(role="user", content="x")]))
+            deadline = time.monotonic() + 2.0
+            while not started.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.005)
+            assert started.is_set(), "the foreign compaction must have started on a worker thread"
+
+            task.cancel()
+            # Let the CancelledError be delivered into the coroutine (entering the
+            # join) before the worker is allowed to fail, so the case under test is
+            # "failure observed while joining", not "failure racing the cancel".
+            for _ in range(5):
+                await asyncio.sleep(0)
+            released.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            await asyncio.sleep(0)  # let any late worker teardown run
+            gc.collect()
+        finally:
+            loop.set_exception_handler(previous)
+
+        assert not any("never retrieved" in m for m in unretrieved), unretrieved
+
+    @pytest.mark.asyncio
+    async def test_foreign_sync_compaction_failure_propagates_without_cancellation(self):
+        """Without an owner cancellation the worker's own failure is the result.
+
+        The join only exists to keep a cancelled caller from orphaning the worker;
+        the direct path must keep propagating whatever the compaction raises.
+        """
+
+        class _Timeline:
+            _consecutive_compact_failures = 0
+            _compaction_disabled = False
+            _circuit_opened_at = None
+
+            class _Cfg:
+                enable_reactive_compact = True
+
+            _compressed_config = _Cfg()
+
+            def reactive_compact(self, attempt: int) -> None:
+                raise ValueError("direct compaction failure")
+
+        class _Agent:
+            object_id = "a1"
+            agent_type = "test"
+            _timeline = _Timeline()
+
+        class _LLM:
+            async def chat_response(self, messages, **kwargs):
+                raise PromptTooLongError("too long")
+
+        caller = LLMCaller(llm=_LLM(), agent_getter=lambda: _Agent(), native_tools_getter=lambda: None)
+        with pytest.raises(ValueError, match="direct compaction failure"):
+            await caller._invoke_llm_async(caller._llm, [LLMMessage(role="user", content="x")])
 
 
 class TestClientLifecycle:

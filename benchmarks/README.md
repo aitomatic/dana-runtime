@@ -58,13 +58,13 @@ actual CLI/ACP interaction and storage integration tests.
 
 ## Public original measurement extract
 
-[`results/pr32-original-measurements.json`](results/pr32-original-measurements.json)
-contains complete numeric samples for selected original headline paths, all 240
-startup observations and all 144 paired implementation attempts. It also retains
-paired and controlled-experiment latency summaries. Original artifact SHA-256s,
-B1/B2 source digests, quality failures, outliers and request/usage counts are
-included. Credentials, endpoint addresses, provider payloads and private absolute
-workspace paths are excluded.
+[`results/pr32-original-summary.json`](results/pr32-original-summary.json)
+keeps aggregate historical results in the working tree. The complete 503 KB
+[raw measurement extract](https://raw.githubusercontent.com/aitomatic/dana-runtime/a0da647/benchmarks/results/pr32-original-measurements.json)
+is pinned to the earlier public commit; its SHA-256 and byte count are recorded
+in the summary. It includes selected headline samples, all 240 startup observations
+and all 144 paired attempts. Credentials, endpoint addresses, provider payloads
+and private absolute workspace paths are excluded.
 
 **These measurements describe original commit
 `07b9037439dd81e45ec1862fce0d3850ec152bd8`, not the repaired review head.** They do
@@ -89,12 +89,18 @@ with pinned source and unchanged workloads before making new speed claims.
 ## Review-repair verification
 
 [`results/pr32-review-verification.json`](results/pr32-review-verification.json)
-maps all 31 review items to their resolutions and records bounded actual-path
-checks. These checks include crash recovery, commit-boundary cancellation,
-physical worker ownership, real local MCP servers, policy/admission isolation,
-tool-using timeline accounting and SQLite/PostgreSQL reopen fidelity.
+records the first repair pass over 31 review items and bounded actual-path checks.
+It is historical evidence, not a claim that subsequent review found no defects.
+Checks include crash recovery, commit-boundary cancellation, physical worker
+ownership, real local MCP servers, policy/admission isolation, tool-using timeline
+accounting and SQLite/PostgreSQL reopen fidelity.
 
-The current CI benchmark step was executed verbatim with an independent network
+[`results/pr32-rereview-verification.json`](results/pr32-rereview-verification.json)
+records the second-pass cancellation, pipe-drain, sampling-intent and lifecycle
+repairs, including defects caught during integration review. It also reports
+the remaining mutable-alias accounting cost rather than claiming a speedup.
+
+In the first repair pass, the CI benchmark step was executed with an independent network
 guard: five entry points exited zero and all seven JSON assertions passed.
 Two tools-history observations remain observations, not defects or hidden passes.
 These small runs are correctness smokes, not a new speed comparison.

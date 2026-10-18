@@ -35,6 +35,13 @@ MAX_OUTPUT_CHARS = 30000
 #: ``Popen.communicate`` preserves partial reads across a retry, so slicing is safe.
 WAIT_POLL_INTERVAL_S = 0.1
 
+#: Drain budget for a *non-blocking* drain of a process that is already reaped.
+#: Output already at end-of-file costs none of it (the selector reports the pipes
+#: ready at once and ``wait`` returns immediately for a reaped process); the budget
+#: only bounds the case where a descendant inherited the pipes and keeps them open,
+#: so a poll can never turn into a wait.
+NOWAIT_DRAIN_TIMEOUT_S = 0.01
+
 
 @dataclass
 class BackgroundTask:
@@ -52,7 +59,15 @@ class BackgroundTask:
     description: str
     stdout_buffer: list[str] = field(default_factory=list)
     stderr_buffer: list[str] = field(default_factory=list)
+    #: True once the process's pipes have reached end-of-file and the final output is
+    #: recorded. A killed command whose descendant still holds the pipes keeps this
+    #: ``False`` on purpose: its output stream is still open, so a later poll finishes
+    #: the drain and recovers what the command wrote instead of stranding it.
     completed: bool = False
+    #: The terminated process's exit code, recorded as soon as it is known: by a drain
+    #: that reached end-of-file, or by a kill that delivered a signal. Stays ``None``
+    #: while the process is still alive. A set code with ``completed`` False means the
+    #: process is finished but a descendant is still holding its output stream open.
     exit_code: int | None = None
     #: Guards this task's mutable state (buffers, completed, exit_code) so a
     #: blocking wait and a concurrent poll/kill cannot tear it (I7).
@@ -297,7 +312,10 @@ class BashResource(BaseResource):
 
         Args:
             task_id: Task ID returned by execute() with run_in_background=True
-            wait: If True, wait for task to complete. If False, return current output.
+            wait: If True, wait for the command's output stream to close (see
+                ``timeout``). If False, report what is already available without
+                waiting: a shell that has been reaped is drained within a tiny
+                budget, but a descendant that still holds its pipes is left alone.
             timeout: Max wait time in milliseconds, including any queued waiter
                 (default 30000, max 600000)
 
@@ -322,31 +340,25 @@ class BashResource(BaseResource):
             }
 
         with task.lock:
-            # Check if already completed
-            if task.completed:
-                return {
-                    "success": True,
-                    "status": "completed",
-                    "stdout": "".join(task.stdout_buffer),
-                    "stderr": "".join(task.stderr_buffer),
-                    "exit_code": task.exit_code,
-                }
+            drained = task.completed
 
-            # Check current status
-            poll_result = task.process.poll()
-
-        if poll_result is not None and not wait:
-            return self._finish_task(task, task_id, poll_result)
+        if drained:
+            return self._completed_result(task)
 
         if not wait:
+            # A poll never waits for the output stream to close. A running command
+            # is reported as-is: reading its pipes would make the poll a wait. A
+            # shell the OS has already reaped *is* drained, within the tiny
+            # :data:`NOWAIT_DRAIN_TIMEOUT_S` budget, because its stream is normally
+            # at end-of-file and its output must not be stranded (a descendant that
+            # inherited the pipes, as in ``sleep 300 & echo hi``, keeps them open;
+            # then the poll reports the terminal code it has, records no final
+            # output yet, and loses nothing: a later poll resumes the same drain).
             with task.lock:
-                return {
-                    "success": True,
-                    "status": "running",
-                    "stdout": "".join(task.stdout_buffer),
-                    "stderr": "".join(task.stderr_buffer),
-                    "exit_code": None,
-                }
+                reaped = task.process.poll() is not None
+            if not reaped:
+                return self._running_result(task)
+            return self._wait_for_task(task, task_id, NOWAIT_DRAIN_TIMEOUT_S, poll=True)
 
         # One deadline covers acquiring the waiter lock and draining the process.
         timeout_ms = timeout or 30000
@@ -355,60 +367,115 @@ class BashResource(BaseResource):
 
         return self._wait_for_task(task, task_id, timeout_seconds)
 
-    def _wait_for_task(self, task: BackgroundTask, task_id: str, timeout_seconds: float) -> dict[str, Any]:
-        """Acquire the waiter lock and wait within one cancellable deadline.
+    def _completed_result(self, task: BackgroundTask) -> dict[str, Any]:
+        """The recorded final output of a command whose pipes have been drained."""
+        with task.lock:
+            return {
+                "success": True,
+                "status": "completed",
+                "stdout": "".join(task.stdout_buffer),
+                "stderr": "".join(task.stderr_buffer),
+                "exit_code": task.exit_code,
+            }
+
+    def _running_result(
+        self,
+        task: BackgroundTask,
+        *,
+        note: str | None = None,
+        cancelled: bool = False,
+    ) -> dict[str, Any]:
+        """The status of a command whose output has not been fully drained.
+
+        Reading the recorded buffers takes ``task.lock`` for that read only: the
+        caller holds no lock and is not waiting on a pipe. ``exit_code`` is reported
+        once the *process* is terminal even though the stream is still open (a killed
+        command, or a shell whose descendant holds the pipes), so a finished process is
+        never described as merely running; it stays ``None`` while the process lives.
+        """
+        with task.lock:
+            stdout = "".join(task.stdout_buffer)
+            stderr = "".join(task.stderr_buffer)
+            exit_code = task.exit_code
+            # ``returncode`` is set once the process is reaped and is ``None`` while it
+            # runs, so this never invents a status for a live command.
+            reaped_code = task.process.returncode
+
+        result = {
+            "success": True,
+            "status": "running",
+            "stdout": stdout,
+            "stderr": stderr if note is None else stderr + note,
+            "exit_code": exit_code if exit_code is not None else reaped_code,
+        }
+        if cancelled:
+            result["cancelled"] = True
+        return result
+
+    def _wait_for_task(
+        self,
+        task: BackgroundTask,
+        task_id: str,
+        timeout_seconds: float,
+        *,
+        poll: bool = False,
+    ) -> dict[str, Any]:
+        """Drain the process within one cancellable deadline and return its status.
+
+        This is the only code path that touches a task's pipes, shared by waits and
+        polls. ``task.lock`` is taken for brief state reads and writes only: the
+        process wait happens under ``task.wait_lock`` *alone*, so a poll or a wait
+        can never stall :meth:`list_tasks`, which runs on the event loop and needs
+        ``task.lock``.
 
         Both lock acquisition and ``communicate`` use
-        :data:`WAIT_POLL_INTERVAL_S` slices. A queued waiter can therefore time
-        out or honour its own cancellation without waiting for another caller's
-        up-to-ten-minute process wait. Only the lock holder drains the pipes or
-        records output, so a timeout or cancellation never splits or duplicates
-        the command's output.
+        :data:`WAIT_POLL_INTERVAL_S` slices. A queued waiter can therefore time out
+        or honour its own cancellation without waiting for another caller's
+        up-to-ten-minute process wait. Only the lock holder drains or records
+        output, so a timeout or cancellation never splits or duplicates the
+        command's output: buffers are appended only after a drain really succeeded.
 
-        The background command is never killed here: abandoning a wait is not
-        abandoning the model's process. ``Popen.communicate`` accumulates partial
-        reads across timeout retries, so another waiter can finish them losslessly.
+        ``poll`` bounds the whole path by :data:`NOWAIT_DRAIN_TIMEOUT_S`, never
+        queues for the drain lock and never reports cancellation or a timeout note,
+        because a poll is a status read rather than a wait.
+
+        The command is never killed here: abandoning a wait is not abandoning the
+        model's process. ``Popen.communicate`` accumulates partial reads across
+        timeout retries, so the next caller finishes them losslessly.
         """
         deadline = time.monotonic() + max(0.0, timeout_seconds)
         acquired = False
         try:
             while True:
-                claim = current_physical_work()
-                if claim is not None and claim.cancel.is_set():
-                    logger.info("bash_wait_cancelled", task_id=task_id)
-                    with task.lock:
-                        return {
-                            "success": True,
-                            "status": "running",
-                            "cancelled": True,
-                            "stdout": "".join(task.stdout_buffer),
-                            "stderr": "".join(task.stderr_buffer) + "\n(wait cancelled; command still running)",
-                            "exit_code": None,
-                        }
+                if not poll:
+                    claim = current_physical_work()
+                    if claim is not None and claim.cancel.is_set():
+                        logger.info("bash_wait_cancelled", task_id=task_id)
+                        return self._running_result(
+                            task,
+                            note="\n(wait cancelled; command still running)",
+                            cancelled=True,
+                        )
 
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    with task.lock:
-                        return {
-                            "success": True,
-                            "status": "running",
-                            "stdout": "".join(task.stdout_buffer),
-                            "stderr": "".join(task.stderr_buffer) + f"\n(still running after {timeout_seconds}s wait)",
-                            "exit_code": None,
-                        }
+                    note = None if poll else f"\n(still running after {timeout_seconds}s wait)"
+                    return self._running_result(task, note=note)
 
                 if not acquired:
-                    acquired = task.wait_lock.acquire(timeout=min(WAIT_POLL_INTERVAL_S, remaining))
-                    if acquired:
-                        with task.lock:
-                            if task.completed:
-                                return {
-                                    "success": True,
-                                    "status": "completed",
-                                    "stdout": "".join(task.stdout_buffer),
-                                    "stderr": "".join(task.stderr_buffer),
-                                    "exit_code": task.exit_code,
-                                }
+                    if poll:
+                        # A poll must not queue behind another caller's drain.
+                        acquired = task.wait_lock.acquire(blocking=False)
+                        if not acquired:
+                            return self._running_result(task)
+                    else:
+                        acquired = task.wait_lock.acquire(timeout=min(WAIT_POLL_INTERVAL_S, remaining))
+                        if not acquired:
+                            continue
+                    with task.lock:
+                        already_drained = task.completed
+                    if already_drained:
+                        return self._completed_result(task)
                     # Recheck cancellation and the shared deadline after waiting
                     # for the lock, before starting any process wait.
                     continue
@@ -424,40 +491,10 @@ class BashResource(BaseResource):
                     task.exit_code = task.process.returncode
                     exit_code = task.exit_code
                 logger.info("bash_background_completed", task_id=task_id, exit_code=exit_code)
-                return {
-                    "success": True,
-                    "status": "completed",
-                    "stdout": "".join(task.stdout_buffer),
-                    "stderr": "".join(task.stderr_buffer),
-                    "exit_code": exit_code,
-                }
+                return self._completed_result(task)
         finally:
             if acquired:
                 task.wait_lock.release()
-
-    def _finish_task(self, task: BackgroundTask, task_id: str, exit_code: int) -> dict[str, Any]:
-        """Record a task the OS already reaped and return its final output.
-
-        Only one caller may drain the pipe, so the wait lock is taken first; the
-        "already completed" state is re-checked inside it in case a concurrent
-        waiter won the race (the second caller then reads the recorded buffers).
-        """
-        with task.wait_lock:
-            with task.lock:
-                if not task.completed:
-                    stdout, stderr = task.process.communicate()
-                    task.stdout_buffer.append(stdout)
-                    task.stderr_buffer.append(stderr)
-                    task.completed = True
-                    task.exit_code = exit_code
-                    logger.info("bash_background_completed", task_id=task_id, exit_code=exit_code)
-                return {
-                    "success": True,
-                    "status": "completed",
-                    "stdout": "".join(task.stdout_buffer),
-                    "stderr": "".join(task.stderr_buffer),
-                    "exit_code": task.exit_code,
-                }
 
     @tool_use
     @blocking_io
@@ -482,45 +519,94 @@ class BashResource(BaseResource):
             }
 
         with task.lock:
-            if task.completed:
-                return {
-                    "success": True,
-                    "message": f"Task '{task_id}' already completed",
-                }
+            drained = task.completed
+            reaped = task.process.poll() is not None
+        if drained or reaped:
+            # Nothing left to signal. A reaped process is already terminal, and if a
+            # descendant still holds its stream open the recorded (signal) code stands
+            # while a later poll finishes the drain.
+            return {
+                "success": True,
+                "message": f"Task '{task_id}' already completed",
+            }
 
+        exit_code = -15  # SIGTERM
         try:
             task.process.terminate()
-            task.process.wait(timeout=5)
-            with task.lock:
-                task.completed = True
-                task.exit_code = -15  # SIGTERM
-
-            logger.info("bash_task_killed", task_id=task_id)
-
-            return {
-                "success": True,
-                "message": f"Task '{task_id}' terminated",
-            }
-        except subprocess.TimeoutExpired:
-            task.process.kill()
-            with task.lock:
-                task.completed = True
-                task.exit_code = -9  # SIGKILL
-
-            return {
-                "success": True,
-                "message": f"Task '{task_id}' killed (force)",
-            }
+        except ProcessLookupError:
+            # Already exited between the check above and the signal: record what it
+            # produced instead of reporting a failure.
+            pass
         except Exception as e:
             return {
                 "success": False,
                 "message": f"Failed to kill task: {e}",
             }
 
+        forced = False
+        try:
+            task.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            task.process.kill()
+            try:
+                task.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            exit_code = -9  # SIGKILL
+            forced = True
+
+        self._drain_killed_task(task, task_id, exit_code)
+        logger.info("bash_task_killed", task_id=task_id, forced=forced)
+        return {
+            "success": True,
+            "message": f"Task '{task_id}' killed (force)" if forced else f"Task '{task_id}' terminated",
+        }
+
+    def _drain_killed_task(self, task: BackgroundTask, task_id: str, exit_code: int) -> None:
+        """Record a killed command's terminal status, draining its output when bounded.
+
+        A kill must never turn into an unbounded wait: the drain is bounded
+        (:data:`NOWAIT_DRAIN_TIMEOUT_S`) and never queues behind a waiter that already
+        owns the drain lock. Two outcomes are therefore possible and are kept distinct:
+
+        * the drain reached end-of-file. Everything the command wrote is recorded and
+          ``completed`` is set, so the drain is finished for good;
+        * the drain did not (a descendant still holds the pipes, or another caller owns
+          the lock). ``completed`` stays ``False`` and the tail is left unread; the
+          signal exit code is still recorded, and a later poll or listing finishes the
+          drain and records whatever the command had written. Marking the task drained
+          here would strand that output permanently, because the stream really is still
+          open and no caller would ever read it again.
+        """
+        outcome = self._wait_for_task(task, task_id, NOWAIT_DRAIN_TIMEOUT_S, poll=True)
+        with task.lock:
+            if task.completed:
+                # The drain above finished; keep the recorded code, which is the real
+                # one when the command had already exited on its own.
+                return
+            if task.exit_code is None and outcome["status"] == "completed":
+                task.exit_code = outcome["exit_code"]
+            if task.process.poll() is not None:
+                # The process is gone, so the signal code is authoritative even though a
+                # descendant is still holding the stream open.
+                task.exit_code = exit_code
+
     @tool_use
     def list_tasks(self) -> dict[str, Any]:
         """
         List all background tasks.
+
+        Runs on the event loop, so it never waits: for each task it takes
+        ``task.lock`` for a brief read only. A command the OS has already reaped is
+        drained through the same bounded, non-queuing path a poll uses, so a listing
+        can never strand a finished command's output.
+
+        ``status`` reports whether the output stream is finished: "completed" once the
+        final output has been drained and recorded, "running" while a descendant still
+        holds the stream open. ``exit_code`` is the process's own status, reported as
+        soon as it is known; a finished process with ``status`` "running" means only
+        that a descendant keeps the stream open, and the output recorded so far remains
+        readable through ``get_task_output``.
 
         Returns:
             Dict with list of tasks and their statuses
@@ -530,20 +616,32 @@ class BashResource(BaseResource):
             snapshot = list(self._background_tasks.items())
         for task_id, task in snapshot:
             with task.lock:
-                # Update status
-                if not task.completed and task.process.poll() is not None:
-                    task.completed = True
-                    task.exit_code = task.process.returncode
+                drained = task.completed
+                # Only a reaped process is worth draining here; a running one would
+                # make this a wait.
+                reaped = None if drained else task.process.poll() is not None
+                exit_code = task.exit_code
 
-                tasks.append(
-                    {
-                        "task_id": task_id,
-                        "command": task.command[:50] + "..." if len(task.command) > 50 else task.command,
-                        "description": task.description,
-                        "status": "completed" if task.completed else "running",
-                        "exit_code": task.exit_code,
-                    }
-                )
+            if reaped:
+                outcome = self._wait_for_task(task, task_id, NOWAIT_DRAIN_TIMEOUT_S, poll=True)
+                if outcome["status"] == "completed":
+                    drained = True
+                    exit_code = outcome["exit_code"]
+                else:
+                    # Undrained: the process may still be terminal (killed, or reaped
+                    # with a descendant holding the stream), so report the code it has.
+                    with task.lock:
+                        exit_code = task.exit_code if task.exit_code is not None else task.process.returncode
+
+            tasks.append(
+                {
+                    "task_id": task_id,
+                    "command": task.command[:50] + "..." if len(task.command) > 50 else task.command,
+                    "description": task.description,
+                    "status": "completed" if drained else "running",
+                    "exit_code": exit_code,
+                }
+            )
 
         return {
             "success": True,

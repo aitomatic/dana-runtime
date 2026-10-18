@@ -5,6 +5,7 @@ Provides edit() tool mirroring Claude Code's exact string replacement signature.
 
 from pathlib import Path
 import threading
+import weakref
 
 from dana.common.protocols.war import named_tool
 from dana.core.resource.base_resource import BaseResource
@@ -28,13 +29,37 @@ class FileEditResource(BaseResource):
         # Per-path ordering for read-modify-write edits. Two concurrent Edit calls
         # naming the same file must not interleave (one would clobber the other);
         # edits of different files stay concurrent. A plain thread lock (not an
-        # asyncio.Lock) is used because the critical section runs on the offload
-        # worker threads, and because it must survive loop changes without binding.
-        self._path_locks: dict[str, threading.Lock] = {}
+        # asyncio.Lock) is used because this resource *explicitly* offloads its
+        # blocking cores with ``run_blocking`` (dispatch offloads only callables
+        # that opted in with ``@blocking_io``, and none of these are marked), so the
+        # critical section runs on the offload pool's worker threads and the lock
+        # must not be bound to any loop.
+        #
+        # The registry holds the locks *weakly* so it stays bounded: an entry lives
+        # exactly as long as some caller that obtained it still holds the strong
+        # reference ``_path_lock`` returns - a waiter blocked on the lock counts,
+        # because it holds that reference for its whole ``with`` block. Once the
+        # last holder/waiter exits, the entry is collected instead of accumulating
+        # one lock per distinct path edited for the process lifetime. A strong dict
+        # could not drop it (nothing else would ever release the mapping), and
+        # evicting a lock that someone still holds would hand a second thread a
+        # second lock for the same path and lose the mutual exclusion.
+        #
+        # Every access goes through ``_path_locks_guard``; the map itself is not
+        # thread-safe, and the weakref module's own dead-entry removal only ever
+        # drops the entry whose referent is already gone (never a live successor).
+        self._path_locks: weakref.WeakValueDictionary[str, threading.Lock] = weakref.WeakValueDictionary()
         self._path_locks_guard = threading.Lock()
 
     def _path_lock(self, resolved_path: Path) -> threading.Lock:
-        """The lock serializing read-modify-write edits to one resolved path."""
+        """The lock serializing read-modify-write edits to one resolved path.
+
+        Returns a *strong* reference the caller must keep for its whole critical
+        section (``with self._path_lock(path): ...``). Holding it is what keeps the
+        path's single lock alive while it is held or waited on, so two edit calls
+        for one path can never be handed two different locks; it is also the only
+        thing keeping the weakly-referenced registry entry from being collected.
+        """
         key = str(resolved_path)
         with self._path_locks_guard:
             lock = self._path_locks.get(key)

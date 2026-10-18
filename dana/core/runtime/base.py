@@ -20,7 +20,7 @@ from dana.common.llm.llm import LLM
 from dana.common.llm.types import LLMMessage, LLMResponse
 from dana.common.observable import observable
 from dana.common.utils.misc import Misc
-from dana.core.llm.llm_caller import LLMCaller
+from dana.core.llm.llm_caller import DEFAULT_TEMPERATURE, UNSET, LLMCaller, _Unset
 from dana.core.llm.response_parser import JSONResponseParser
 from dana.core.prompt.prompt_builder import PromptBuilder
 from dana.core.runtime.protocols import ParsedResponse
@@ -95,14 +95,20 @@ When you need to call tools, use the function calling API directly — do NOT in
     def __init__(
         self,
         model: str | None = None,
-        temperature: float = 0,
+        temperature: float | None | _Unset = UNSET,
         max_tokens: int | None = None,
         llm: LLM | None = None,
         provider: str = "anthropic",
         use_native_tools: bool | None = None,
     ):
         self._model = model
-        self._temperature = temperature
+        #: Resolved numeric temperature, preserved for readers of the attribute
+        #: (tests and subclasses). ``_temperature_configured`` records whether the
+        #: caller actually expressed a sampling policy: the value alone cannot
+        #: (its default and an explicit ``0`` are identical), and that distinction
+        #: is what keeps the streaming path from sending the runtime default.
+        self._temperature = DEFAULT_TEMPERATURE if isinstance(temperature, _Unset) else temperature
+        self._temperature_configured = not isinstance(temperature, _Unset)
         self._max_tokens = max_tokens
         self._llm = llm
         self._provider = provider

@@ -7,6 +7,9 @@ executor relies on (I7/I8):
 * the public synchronous API is unchanged, so the offload pool can run it;
 * a cancelled wait returns promptly and leaves the *command* running (the wait is
   abandoned, not the model's process);
+* a shell the OS has reaped can still have its pipes held open by a *descendant*
+  it spawned (``sleep 300 & echo hi``): a poll must stay bounded, a listing must
+  stay responsive, and the output must still be deliverable later;
 * concurrent poll/kill/list calls cannot tear the shared task state.
 """
 
@@ -15,7 +18,9 @@ from __future__ import annotations
 import asyncio
 from functools import wraps
 import inspect
+from pathlib import Path
 import shlex
+import subprocess
 import threading
 import time
 from typing import Any
@@ -32,6 +37,18 @@ def _start_sleeper(resource: BashResource, seconds: int = 30) -> str:
     task = resource._execute_background(f"exec sleep {seconds}", "long-running probe")
     assert task["success"], task
     return task["task_id"]
+
+
+def _reap_shell(resource: BashResource, task_id: str, timeout: float = 5.0) -> None:
+    """Wait until the *shell* is reaped, leaving any descendant process untouched.
+
+    Reaping does not close the pipes: a backgrounded grandchild that inherited them
+    keeps the stream open, which is exactly the state under test. The class-level
+    task state stays ``completed=False`` because only the drain sets that.
+    """
+    process = resource._background_tasks[task_id].process
+    process.wait(timeout=timeout)
+    assert process.poll() is not None, "the shell was not reaped"
 
 
 @pytest.fixture
@@ -262,6 +279,288 @@ class TestCooperativeWait:
                     task.cancel()
             await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 3)
             await executor.aclose(wait_for_offload=True)
+
+
+class TestInheritedPipeDrain:
+    """A reaped shell whose pipes a descendant still holds must not stall the loop.
+
+    ``sleep 300 & echo hi`` is the reported shape: the shell exits, the grandchild
+    keeps the inherited pipes open, so the stream never reaches end-of-file. Draining
+    that stream used to run ``communicate()`` unbounded while holding ``task.lock``;
+    because :meth:`BashResource.list_tasks` takes that lock on the event loop, the
+    loop stopped until the descendant died. The gate is a rendezvous: the descendant
+    holds the pipes until the test creates the file, so no assertion below depends on
+    how long a process takes, only on which stream a process holds open.
+    """
+
+    @staticmethod
+    def _start_pipe_holder(resource: BashResource, gate: Path) -> tuple[str, subprocess.Popen[str]]:
+        """Shell prints and exits; a backgrounded descendant holds the pipes until ``gate``.
+
+        The descendant also gives up after roughly thirty seconds, so a test that
+        fails before opening the gate cannot leave a looping subshell behind. The
+        assertions below all run far inside that ceiling.
+        """
+        command = (
+            f"( n=1500; while [ ! -f {shlex.quote(str(gate))} ] && [ $n -gt 0 ]; do"
+            " n=$((n-1)); sleep 0.02; done; printf 'descendant-out' ) & printf 'shell-out'"
+        )
+        started = resource._execute_background(command, "inherited pipe holder")
+        assert started["success"], started
+        return started["task_id"], resource._background_tasks[started["task_id"]].process
+
+    @staticmethod
+    def _call_with_deadline(call, timeout: float = 10.0):
+        """Run ``call`` on a worker thread and report whether it finished.
+
+        A call that never returns is the failure under test, so it must surface as a
+        failed assertion instead of hanging the suite. The worker is a daemon, and
+        every caller opens its gate in a ``finally``, so a hung call is also released.
+        """
+        box: dict[str, Any] = {}
+
+        def run() -> None:
+            try:
+                box["value"] = call()
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+                box["error"] = exc
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            return False, None
+        if "error" in box:
+            raise box["error"]
+        return True, box["value"]
+
+    @staticmethod
+    def _observe_drain_entered(process: subprocess.Popen[str], monkeypatch: pytest.MonkeyPatch) -> threading.Event:
+        """Flag the moment the class actually enters a process drain.
+
+        The concurrency window under test is "a caller is inside ``communicate``", so
+        the tests must observe that state rather than assume it after a sleep. The
+        wrapper only signals and delegates: the real blocking call is untouched.
+        """
+        entered = threading.Event()
+        communicate = process.communicate
+
+        def observe(*args, **kwargs):
+            entered.set()
+            return communicate(*args, **kwargs)
+
+        monkeypatch.setattr(process, "communicate", observe)
+        return entered
+
+    def test_poll_of_a_reaped_shell_returns_while_a_descendant_holds_the_pipes(self, resource, tmp_path):
+        gate = tmp_path / "pipe-gate"
+        task_id, _ = self._start_pipe_holder(resource, gate)
+        _reap_shell(resource, task_id)
+
+        try:
+            finished, outcome = self._call_with_deadline(lambda: resource.get_task_output(task_id, wait=False))
+            assert finished, "a poll must not wait for a descendant to close the pipes"
+            assert outcome["status"] == "running", outcome
+            # The shell itself is gone, so its own exit status is already known even
+            # though the stream it left open is not drained yet.
+            assert outcome["exit_code"] == 0
+        finally:
+            gate.write_text("")
+
+    def test_list_tasks_stays_responsive_while_a_drain_holds_a_reaped_shells_pipe(self, resource, monkeypatch, tmp_path):
+        """The event-loop path must never queue behind a caller that owns ``task.lock``."""
+        gate = tmp_path / "pipe-gate"
+        task_id, process = self._start_pipe_holder(resource, gate)
+        _reap_shell(resource, task_id)
+        entered = self._observe_drain_entered(process, monkeypatch)
+
+        poll: dict[str, Any] = {}
+
+        def drain() -> None:
+            poll.update(resource.get_task_output(task_id, wait=False))
+
+        thread = threading.Thread(target=drain, daemon=True)
+        thread.start()
+        try:
+            assert entered.wait(5), "the poll never reached its process drain"
+            for _ in range(5):
+                finished, listed = self._call_with_deadline(resource.list_tasks, timeout=2.0)
+                assert finished, "list_tasks blocked behind a drain that owns a task lock"
+                row = next(row for row in listed["tasks"] if row["task_id"] == task_id)
+                assert row["status"] == "running", "a listing reported a task finished while its pipes were still held"
+            thread.join(timeout=2)
+            assert not thread.is_alive(), "a poll did not return while a descendant held the pipes"
+            assert poll["status"] == "running", poll
+        finally:
+            gate.write_text("")
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    def test_list_tasks_stays_responsive_while_a_wait_drains_a_held_pipe(self, resource, monkeypatch, tmp_path):
+        """A wait in flight holds the drain lock, never ``task.lock``, for its whole life."""
+        gate = tmp_path / "pipe-gate"
+        task_id, process = self._start_pipe_holder(resource, gate)
+        _reap_shell(resource, task_id)
+        entered = self._observe_drain_entered(process, monkeypatch)
+
+        waiter: dict[str, Any] = {}
+
+        def wait() -> None:
+            waiter.update(resource.get_task_output(task_id, wait=True, timeout=600000))
+
+        thread = threading.Thread(target=wait, daemon=True)
+        thread.start()
+        try:
+            assert entered.wait(5), "the wait never reached its process drain"
+            for _ in range(5):
+                finished, listed = self._call_with_deadline(resource.list_tasks, timeout=2.0)
+                assert finished, "list_tasks blocked behind a wait in progress"
+                row = next(row for row in listed["tasks"] if row["task_id"] == task_id)
+                assert row["status"] == "running", row
+                finished, polled = self._call_with_deadline(lambda: resource.get_task_output(task_id, wait=False), timeout=2.0)
+                assert finished, "a poll queued behind a wait in progress"
+                assert polled["status"] == "running", polled
+                assert not polled.get("cancelled"), "a poll must not report a cancellation it never received"
+        finally:
+            gate.write_text("")
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+        assert waiter["status"] == "completed", waiter
+        assert waiter["stdout"] == "shell-outdescendant-out", "the drain lost output that had already been written"
+
+    def test_repeated_polls_are_stable_and_lose_no_output_when_the_pipe_closes(self, resource, tmp_path):
+        gate = tmp_path / "pipe-gate"
+        task_id, _ = self._start_pipe_holder(resource, gate)
+        _reap_shell(resource, task_id)
+
+        try:
+            for _ in range(20):
+                finished, polled = self._call_with_deadline(lambda: resource.get_task_output(task_id, wait=False), timeout=2.0)
+                assert finished, "a poll of a held pipe blocked"
+                assert polled["status"] == "running", polled
+        finally:
+            gate.write_text("")
+
+        final = resource.get_task_output(task_id, timeout=5000)
+        assert final["status"] == "completed", final
+        assert final["exit_code"] == 0
+        assert final["stdout"] == "shell-outdescendant-out", "polls must not lose or duplicate output"
+        assert resource.get_task_output(task_id, wait=False) == final
+
+    def test_list_tasks_does_not_strand_a_reaped_shells_output(self, resource):
+        started = resource._execute_background("printf 'ready'", "quick probe")
+        task_id = started["task_id"]
+        _reap_shell(resource, task_id)
+        assert not resource._background_tasks[task_id].completed
+
+        finished, listed = self._call_with_deadline(resource.list_tasks, timeout=5.0)
+        assert finished
+        row = next(row for row in listed["tasks"] if row["task_id"] == task_id)
+        assert row["status"] == "completed", "a listing reported a finished command as still running"
+        outcome = resource.get_task_output(task_id, wait=False)
+        assert outcome["status"] == "completed"
+        assert outcome["stdout"] == "ready", "the listing drained the pipes without recording the output"
+
+    def test_kill_with_a_holding_descendant_stays_bounded_and_finishes_the_task(self, resource, tmp_path):
+        gate = tmp_path / "pipe-gate"
+        task_id, process = self._start_pipe_holder(resource, gate)
+        _reap_shell(resource, task_id)
+
+        try:
+            finished, outcome = self._call_with_deadline(lambda: resource.kill_task(task_id))
+            assert finished, "a kill must not wait for a descendant to close the pipes"
+            assert outcome["success"] is True
+            assert process.poll() is not None
+
+            finished, listed = self._call_with_deadline(resource.list_tasks, timeout=2.0)
+            assert finished, "the loop blocked behind a kill's drain"
+            row = next(row for row in listed["tasks"] if row["task_id"] == task_id)
+            # The shell was already gone, so no signal was delivered and its own code
+            # stands; the descendant keeps the stream open, so the drain is unfinished.
+            assert row["status"] == "running", "a listing reported a drain that never completed"
+            assert row["exit_code"] == 0, "a reaped process must report its own exit status"
+        finally:
+            gate.write_text("")
+        final = resource.get_task_output(task_id, timeout=5000)
+        assert final["status"] == "completed", final
+        assert final["exit_code"] == 0, "the real exit status was overwritten by a signal that was never sent"
+        assert final["stdout"] == "shell-outdescendant-out", final
+
+    def test_kill_records_output_a_held_command_had_already_written(self, resource, tmp_path):
+        marker = tmp_path / "command-ready"
+        # The command writes, then blocks forever: the signal is delivered while the
+        # output is sitting in the pipe, so losing it is the failure under test.
+        command = f"printf 'kill-output'; : > {shlex.quote(str(marker))}; exec sleep 300"
+        started = resource._execute_background(command, "kill output probe")
+        assert started["success"], started
+        task_id = started["task_id"]
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(0.005)
+        assert marker.exists(), "the command never reached its blocking point"
+
+        finished, outcome = self._call_with_deadline(lambda: resource.kill_task(task_id))
+        assert finished
+        assert outcome["success"] is True
+        polled = resource.get_task_output(task_id, wait=False)
+        assert polled["status"] == "completed"
+        assert polled["stdout"] == "kill-output", "killing a task dropped output it had already written"
+        assert polled["exit_code"] == -15
+
+    def test_kill_under_a_busy_drain_lock_can_be_finished_by_a_later_poll(self, resource, tmp_path):
+        """A kill that cannot drain must not claim the task is drained.
+
+        The shell writes, backgrounds a descendant that holds the pipes, then waits.
+        The kill's bounded drain is blocked by a caller that already owns the drain
+        lock, so the final output cannot be recorded at kill time. Marking the task
+        drained there stranded that output for good because nothing would ever read the
+        open stream again. The kill must instead record the terminal signal status and
+        leave the drain open for a later call to finish.
+        """
+        gate = tmp_path / "pipe-gate"
+        ready = tmp_path / "descendant-ready"
+        command = (
+            f"printf 'killed-out'; ( : > {shlex.quote(str(ready))}; n=1500;"
+            f" while [ ! -f {shlex.quote(str(gate))} ] && [ $n -gt 0 ]; do n=$((n-1)); sleep 0.02; done;"
+            " printf 'descendant-out' ) & wait"
+        )
+        started = resource._execute_background(command, "killed pipe holder")
+        assert started["success"], started
+        task_id = started["task_id"]
+        task = resource._background_tasks[task_id]
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not ready.exists():
+            time.sleep(0.005)
+        assert ready.exists(), "the descendant never started"
+
+        # Stand in for a waiter that owns the drain lock for the whole kill.
+        assert task.wait_lock.acquire(timeout=5)
+        try:
+            finished, outcome = self._call_with_deadline(lambda: resource.kill_task(task_id))
+            assert finished, "the kill queued behind the busy drain lock instead of staying bounded"
+            assert outcome["success"] is True
+            assert task.completed is False, "the kill claimed a drain it never performed"
+            assert task.exit_code == -15, "the terminal signal status was not retained"
+
+            row = next(row for row in resource.list_tasks()["tasks"] if row["task_id"] == task_id)
+            assert row["status"] == "running", "a listing reported a drain that never completed"
+            assert row["exit_code"] == -15, "the recorded terminal signal status was not reported"
+
+            polled = resource.get_task_output(task_id, wait=False)
+            assert polled["exit_code"] == -15, "the recorded terminal code was reported as an unknown status"
+            for _ in range(3):
+                assert resource.get_task_output(task_id, wait=False)["stdout"] == "", "a poll reported output it had not read"
+        finally:
+            task.wait_lock.release()
+            gate.write_text("")
+
+        final = resource.get_task_output(task_id, timeout=10000)
+        assert final["status"] == "completed", final
+        assert final["stdout"] == "killed-outdescendant-out", "output already written was stranded by the kill"
+        assert final["exit_code"] == -15
+        assert resource.get_task_output(task_id, wait=False) == final, "the recovered output was not recorded exactly once"
 
 
 class TestSharedStateSafety:

@@ -324,6 +324,51 @@ async def test_caller_cancellation_propagates_after_durable_terminal(repo):
     assert terminals == [FactType.TURN_CANCELLED]
 
 
+@pytest.mark.asyncio
+async def test_internal_stream_cancellation_does_not_cancel_consumer(repo):
+    scope = await _seed(repo, "sess-1")
+
+    class InternallyCancelledAgent(ScriptedAgent):
+        async def aquery_stream(self, *, message=None, **kwargs):
+            yield StreamEvent(event_type=StreamEventType.TEXT_DELTA, data="partial", iteration=0)
+            raise asyncio.CancelledError
+
+    session = _make_session(repo, scope, InternallyCancelledAgent())
+    events = await _collect(session.prompt([TextBlock(text="run")]))
+    assert events[-1].event_type.value == "turn_cancelled"
+    assert asyncio.current_task().cancelling() == 0
+    facts = await repo.read_facts(scope, "sess-1")
+    assert [f.fact_type for f in facts if f.fact_type in _TERMINAL_FACTS] == [FactType.TURN_CANCELLED]
+
+
+@pytest.mark.asyncio
+async def test_postcommit_observer_failure_preserves_committed_version_and_rebuild(repo):
+    scope = await _seed(repo, "sess-1")
+    session = _make_session(repo, scope, ScriptedAgent(chunks=["ok"]))
+    await session.load()
+
+    def fail_observation(facts, cancelled):
+        raise ValueError("synthetic post-commit observation failure")
+
+    session._tool_commit_observer = fail_observation
+    await session.append_fact(
+        NewJournalFact(
+            fact_type=FactType.MODEL_CHANGED,
+            correlation_id="model-change",
+            causation_id=None,
+            payload={"model": "synthetic-model"},
+        )
+    )
+    facts = await repo.read_facts(scope, "sess-1")
+    assert facts[-1].fact_type is FactType.MODEL_CHANGED
+    assert session.version == facts[-1].sequence
+    assert session._conversation_state is None
+    session._tool_commit_observer = None
+    await _collect(session.prompt([TextBlock(text="continue")]))
+    facts = await repo.read_facts(scope, "sess-1")
+    assert [f.fact_type for f in facts if f.fact_type in _TERMINAL_FACTS] == [FactType.TURN_COMPLETED]
+
+
 # ---------------------------------------------------------------------------
 # I4: caller cancellation while a durable append is parked
 # ---------------------------------------------------------------------------
@@ -809,6 +854,7 @@ async def test_note_visible_on_native_request_path_and_retired_after_recovery(re
     class TimelineAgent(ScriptedAgent):
         async def aquery_stream(self, *, message=None, **kwargs):
             # Exactly what build_prompt would hand the provider for this turn.
+            timeline.set_context({"timestamp": "2026-10-19T00:00:00Z", "user": "synthetic"})
             seen.append(list(timeline.to_llm_messages()))
             async for event in super().aquery_stream(message=message, **kwargs):
                 yield event

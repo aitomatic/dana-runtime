@@ -3,13 +3,27 @@ Compression engine mixin for CompressedTimeline.
 
 Provides CompressionMixin with all compression-related methods:
 needs_compression, get_entries_to_keep_and_compress, compress, compress_async,
-_apply_compression, build_compression_prompt, etc.
+reactive_compact, reactive_compact_async, _apply_compression,
+build_compression_prompt, etc.
+
+Two seams own reactive compaction state differently, and neither leaves a writer
+behind a caller that has gone away:
+
+* ``reactive_compact`` is synchronous: the caller blocks for the whole run,
+  summarizer included, so every mutation is on its own thread.
+* ``reactive_compact_async`` is for awaited callers: it mutates only on the
+  awaiting thread (the bounded drop prefix synchronously, then the commit after
+  the summarizer returns), awaits an async summarizer in place so cancellation
+  reaches the provider, and joins rather than abandons an unavoidable blocking
+  sync summarizer.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from datetime import datetime
+import inspect
 from typing import TYPE_CHECKING
 
 from structlog import get_logger
@@ -1148,74 +1162,314 @@ Respond with ONLY a JSON object containing the summary:
         Drop counts: attempt 1 → 5, 2 → 10, 3 → 20. Always runs the full
         summary path (never shrink-bypass). Raises `CompactCircuitOpenError`
         when the circuit is open and cooldown not elapsed.
+
+        The caller blocks for the whole run, summarizer included, so ownership of
+        every mutation is the caller's own thread. The cancellation-capable
+        :meth:`reactive_compact_async` is the variant for awaited callers.
         """
         from dana.common.llm.types import CompactCircuitOpenError
 
         with self._compact_sync_lock:
-            self._check_circuit_and_probe()
-
-            drop_count = {1: 5, 2: 10, 3: 20}.get(attempt, 20)
-            if len(self.timeline) <= drop_count:
-                drop_count = max(0, len(self.timeline) - 1)
-
-            if drop_count <= 0:
-                # Nothing useful to drop — treat as attempt failure.
-                self._consecutive_compact_failures += 1
-                if self._consecutive_compact_failures >= 3:
-                    self._compaction_disabled = True
-                    self._circuit_opened_at = datetime.now()
-                    raise CompactCircuitOpenError(f"reactive_compact cannot drop entries; timeline={len(self.timeline)}")
-                return
-
-            # Drop the oldest entries, then prune forward-orphans. The native
-            # projection is rebuilt from the entries that actually remain — by
-            # occurrence, not by identity set — rather than by slicing a
-            # same-length tail off ``_native_messages``, which goes wrong as soon
-            # as the two lists differ in length (any prior compaction prepends a
-            # summary message).
-            with self._state_lock:
-                new_entries = self._ensure_tool_pair_integrity(self._remove_forward_orphans(self.timeline[drop_count:]))
-                mirrors = self._rebuild_native_mirrors(self.timeline, self._suffix_retention_flags(self.timeline, new_entries))
-                self._install_model_state(new_entries, mirrors)
-
-            # Re-summarize via internal primitives so failures propagate into the
-            # circuit-breaker counter (compress() swallows exceptions).
             try:
-                llm_call_fn = self._llm_call_fn or self._get_default_llm_call_fn()
-                if llm_call_fn is None:
-                    raise RuntimeError("no LLM call function available for reactive_compact")
-                plan = self._plan_compression()
-                n = 0
-                if plan is not None:
-                    entries_to_compress, prompt, plan_generation = plan
-                    response = llm_call_fn(prompt)
-                    summary = self._extract_summary_from_response(response)
-                    if not summary:
-                        raise RuntimeError("empty summary from LLM")
-                    n = self._apply_compression(
-                        entries_to_compress,
-                        summary,
-                        plan_generation=plan_generation,
-                    )
-                # Success — close circuit and reset counter.
-                self._consecutive_compact_failures = 0
-                self._compaction_disabled = False
-                self._circuit_opened_at = None
-                logger.info(
-                    "reactive_compact_done",
-                    attempt=attempt,
-                    entries_dropped=drop_count,
-                    entries_compressed=n,
-                )
+                drop_count = self._begin_reactive_compact(attempt)
+                if drop_count <= 0:
+                    return
+                self._reactive_compact_summary(attempt, drop_count, mode="sync")
             except CompactCircuitOpenError:
                 raise
             except Exception as e:
-                self._consecutive_compact_failures += 1
-                if self._consecutive_compact_failures >= 3:
-                    self._compaction_disabled = True
-                    self._circuit_opened_at = datetime.now()
-                    raise CompactCircuitOpenError(f"reactive_compact failed 3x consecutive; last error: {e}") from e
+                failure = self._record_compact_failure(e)
+                if failure is e:
+                    raise
+                raise failure from e
+
+    async def reactive_compact_async(self: CompressedTimeline, attempt: int) -> None:
+        """Awaitable reactive compaction whose mutations stay on the caller's thread.
+
+        Same drop counts and circuit semantics as :meth:`reactive_compact`, but
+        every mutation of the timeline happens on the awaiting thread: the bounded
+        drop prefix runs synchronously (no suspension point inside it), the
+        summarizer is awaited in place, and the commit runs after it returns. An
+        awaiting caller that is cancelled or times out therefore cannot leave a
+        worker thread installing a projection on a timeline it no longer owns.
+
+        Summarizer ownership:
+
+        * an async summarizer (``_llm_call_async_fn``, or the runtime's
+          ``call_llm_async``) is awaited directly, so the cancellation reaches the
+          provider, which can abort the request;
+        * a sync-only summarizer is unavoidable blocking physical work. It is
+          offloaded so the event loop stays responsive, and the await is *joined*
+          rather than abandoned: if this task is cancelled the join still runs to
+          completion before the cancellation is re-raised, and the worker only
+          ever returns the produced text. Cancellation therefore delays the
+          return, it never leaves the run's work unowned.
+
+        Raises:
+            CompactCircuitOpenError: circuit open and cooldown unexpired, or a
+                failed run that exhausts the failure budget.
+        """
+        # Phase 1 - bounded drop and plan capture, serialized on the compaction
+        # lock. Synchronous end to end, so this task cannot be suspended between
+        # its steps, and the lock is never held across the summarizer await (an
+        # awaiting caller that is abandoned must not leave the lock held).
+        from dana.common.llm.types import CompactCircuitOpenError
+
+        try:
+            async with self._compact_lock:
+                drop_count = self._begin_reactive_compact(attempt)
+                plan = self._plan_compression() if drop_count > 0 else None
+                if drop_count > 0 and plan is None:
+                    # Nothing left to summarize: the drop is the whole run.
+                    self._close_circuit_after_success(attempt, drop_count, 0, mode="async")
+
+            if drop_count <= 0 or plan is None:
+                return
+
+            # Phase 2 - await the summarizer with no lock held. Nothing mutates
+            # here on any thread, so a cancellation at this point installs nothing.
+            summary = await self._summarize_for_plan(plan)
+
+            # Phase 3 - commit on the awaiting (owner) thread, serialized.
+            async with self._compact_lock:
+                self._commit_reactive_compact(attempt, drop_count, plan, summary, mode="async")
+        except asyncio.CancelledError:
+            # Owner cancellation is not a compaction failure: no commit ran and no
+            # thread of this run is still working, so the circuit stays untouched.
+            raise
+        except CompactCircuitOpenError:
+            raise
+        except Exception as e:
+            failure = self._record_compact_failure(e)
+            if failure is e:
                 raise
+            raise failure from e
+
+    # ------------------------------------------------------------------
+    # Reactive compaction internals (shared by the sync and async seams)
+    # ------------------------------------------------------------------
+
+    def _begin_reactive_compact(self: CompressedTimeline, attempt: int) -> int:
+        """Circuit check + bounded drop prefix. Returns the drop count (0 → done).
+
+        Fully synchronous so neither the sync nor the async seam can be cancelled
+        between its steps. Mutates only through ``_install_model_state``, which
+        takes ``_state_lock``; the caller holds the compaction lock.
+        """
+        from dana.common.llm.types import CompactCircuitOpenError
+
+        self._check_circuit_and_probe()
+
+        drop_count = {1: 5, 2: 10, 3: 20}.get(attempt, 20)
+        if len(self.timeline) <= drop_count:
+            drop_count = max(0, len(self.timeline) - 1)
+
+        if drop_count <= 0:
+            # Nothing useful to drop - treat as attempt failure.
+            self._consecutive_compact_failures += 1
+            if self._consecutive_compact_failures >= 3:
+                self._compaction_disabled = True
+                self._circuit_opened_at = datetime.now()
+                raise CompactCircuitOpenError(f"reactive_compact cannot drop entries; timeline={len(self.timeline)}")
+            return 0
+
+        # Drop the oldest entries, then prune forward-orphans. The native
+        # projection is rebuilt from the entries that actually remain - by
+        # occurrence, not by identity set - rather than by slicing a same-length
+        # tail off ``_native_messages``, which goes wrong as soon as the two lists
+        # differ in length (any prior compaction prepends a summary message).
+        with self._state_lock:
+            new_entries = self._ensure_tool_pair_integrity(self._remove_forward_orphans(self.timeline[drop_count:]))
+            mirrors = self._rebuild_native_mirrors(self.timeline, self._suffix_retention_flags(self.timeline, new_entries))
+            self._install_model_state(new_entries, mirrors)
+        return drop_count
+
+    def _reactive_compact_summary(self: CompressedTimeline, attempt: int, drop_count: int, *, mode: str) -> None:
+        """Synchronous summarizer leg: plan → call → commit → close circuit.
+
+        Used by the sync seam, whose caller blocks for the whole run. ``mode``
+        labels the log event so the two seams stay distinguishable in telemetry.
+        """
+        llm_call_fn = self._llm_call_fn or self._get_default_llm_call_fn()
+        if llm_call_fn is None:
+            raise RuntimeError("no LLM call function available for reactive_compact")
+        plan = self._plan_compression()
+        n = 0
+        if plan is not None:
+            entries_to_compress, prompt, plan_generation = plan
+            summary = self._reduce_compact_response(llm_call_fn(prompt))
+            if not summary:
+                raise RuntimeError("empty summary from LLM")
+            n = self._apply_compression(
+                entries_to_compress,
+                summary,
+                plan_generation=plan_generation,
+            )
+        self._close_circuit_after_success(attempt, drop_count, n, mode=mode)
+
+    async def _summarize_for_plan(self: CompressedTimeline, plan: tuple[list[TimelineEntry], str, int]) -> str:
+        """Produce the summary text for a captured plan, with no lock held.
+
+        Two ownership shapes, in order of preference:
+
+        * an async summarizer (``_llm_call_async_fn``, or the runtime's
+          ``call_llm_async``) is awaited in place, so owner cancellation reaches
+          the provider and nothing of this run is left executing afterwards;
+        * a sync-only summarizer is unavoidable blocking physical work. It is
+          offloaded to keep the loop responsive, and the await is *joined* rather
+          than abandoned: on cancellation the join still runs to completion before
+          the cancellation propagates, so no thread of this run outlives it. The
+          caller's deadline may overrun by that call's remaining duration - which
+          is honest: a thread cannot be killed, and reporting a bounded return
+          while its work ran on would not be.
+
+        The worker never touches timeline state: only the returned text crosses the
+        thread boundary, and the commit happens afterwards on the awaiting thread.
+        """
+        _, prompt, _generation = plan
+
+        async_fn = self._llm_call_async_fn or self._get_default_llm_call_async_fn()
+        if async_fn is not None:
+            return self._require_summary(self._reduce_compact_response(await async_fn(prompt)))
+
+        llm_call_fn = self._llm_call_fn or self._get_default_llm_call_fn()
+        if llm_call_fn is None:
+            raise RuntimeError("no LLM call function available for reactive_compact")
+
+        task = asyncio.ensure_future(asyncio.to_thread(llm_call_fn, prompt))
+        try:
+            response = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            logger.warning("reactive_compact_sync_summarizer_join", reason="cancelled_during_blocking_summarizer")
+            await self._drain_worker_after_cancel(task)
+            # The owner's cancellation is the outcome that survives: the summary
+            # the drained worker produced (or the failure it raised) is discarded,
+            # never raised in its place.
+            raise
+
+        return self._require_summary(self._reduce_compact_response(response))
+
+    @staticmethod
+    async def _drain_worker_after_cancel(task: asyncio.Task) -> None:
+        """Wait out an un-abortable summarizer worker, discarding its outcome.
+
+        ``asyncio.to_thread`` work cannot be aborted, so the only correct options
+        are to join it or to orphan it; orphan only the *value*, never the work.
+        The worker is therefore waited for to completion, and whatever it then
+        returns or raises is swallowed here.
+
+        This matters for ownership, not just tidiness: if the worker's own failure
+        (a callback raising, say, ``ValueError``) were allowed to propagate out of
+        the join, it would replace the owner's :class:`asyncio.CancelledError` and
+        be mistaken for a compaction failure, wrongly charging the circuit for a
+        run the owner abandoned. A re-cancellation during the wait (a request
+        deadline followed by an owner cancel, or a task group tearing down its
+        children) must not release the worker either, so the join keeps going.
+        """
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                # The worker failed while being joined. That is not the owner's
+                # outcome and must not be raised here.
+                break
+        # Retrieve the result/exception so asyncio does not log it as never
+        # retrieved. The value is deliberately dropped: only the owner's
+        # cancellation leaves this call. ``BaseException`` is caught because a
+        # summarizer raising ``SystemExit``/``KeyboardInterrupt`` must not escape
+        # here either: that would replace the owner's cancellation just as much.
+        if not task.cancelled():
+            try:
+                task.exception()
+            except BaseException:
+                pass
+
+    def _reduce_compact_response(self: CompressedTimeline, response: object) -> str:
+        """Reduce a summarizer result to the summary text, on both seams.
+
+        Shared so the JSON envelope the compression prompt asks for is unwrapped
+        identically whether the callable was awaited or offloaded.
+        """
+        return self._extract_summary_from_response(self._adapt_compact_response(response)) or ""
+
+    @staticmethod
+    def _require_summary(summary: str) -> str:
+        """Reject an empty summarizer result the way a failed run is rejected."""
+        if not summary:
+            raise RuntimeError("empty summary from LLM")
+        return summary
+
+    def _commit_reactive_compact(
+        self: CompressedTimeline,
+        attempt: int,
+        drop_count: int,
+        plan: tuple[list[TimelineEntry], str, int],
+        summary: str,
+        *,
+        mode: str,
+    ) -> None:
+        """Commit a produced summary for ``plan`` and close the circuit.
+
+        ``_apply_compression`` validates the captured partition against the live
+        projection (generation + live object identities) and reports 0 when it no
+        longer matches, so a plan overtaken while the summarizer ran cannot
+        resurrect replaced history.
+        """
+        entries_to_compress, _prompt, plan_generation = plan
+        n = self._apply_compression(entries_to_compress, summary, plan_generation=plan_generation)
+        self._close_circuit_after_success(attempt, drop_count, n, mode=mode)
+
+    def _close_circuit_after_success(self: CompressedTimeline, attempt: int, drop_count: int, n: int, *, mode: str) -> None:
+        """Reset the failure budget and record a completed compaction."""
+        self._consecutive_compact_failures = 0
+        self._compaction_disabled = False
+        self._circuit_opened_at = None
+        logger.info(
+            "reactive_compact_done",
+            attempt=attempt,
+            entries_dropped=drop_count,
+            entries_compressed=n,
+            mode=mode,
+        )
+
+    def _record_compact_failure(self: CompressedTimeline, error: Exception) -> Exception:
+        """Count one failed run and return the exception to raise.
+
+        Returns ``CompactCircuitOpenError`` once the failure budget is exhausted,
+        otherwise the original error, so the caller can ``raise ... from e`` and
+        preserve the cause chain.
+        """
+        from dana.common.llm.types import CompactCircuitOpenError
+
+        self._consecutive_compact_failures += 1
+        if self._consecutive_compact_failures >= 3:
+            self._compaction_disabled = True
+            self._circuit_opened_at = datetime.now()
+            return CompactCircuitOpenError(f"reactive_compact failed 3x consecutive; last error: {error}")
+        return error
+
+    @staticmethod
+    def _adapt_compact_response(response: object) -> str:
+        """Reduce a summarizer result to text without running an un-awaited coroutine.
+
+        ``_llm_call_fn`` / ``_llm_call_async_fn`` are documented as prompt → text,
+        but a callable wired straight to a runtime returns an ``LLMResponse``. Both
+        accepted shapes reduce to text here, so callers and tests that provide
+        either keep working. An awaitable reaching this point is refused rather
+        than silently flattened by ``str()``.
+        """
+        if response is None:
+            return ""
+        if isinstance(response, str):
+            return response
+        content = getattr(response, "content", None)
+        if isinstance(content, str):
+            return content
+        if inspect.isawaitable(response):
+            raise RuntimeError("async summarizer callable returned an awaitable; await it in an async seam")
+        return str(response)
 
     def get_entries_for_compression(self: CompressedTimeline) -> list[TimelineEntry]:
         """

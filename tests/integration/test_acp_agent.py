@@ -1047,6 +1047,7 @@ class TestPromptFailureContract:
             assert len([f for f in wire.frames if f.get("method") == "session/update"]) == 2
         finally:
             await wire.close()
+            await a.aclose()
 
     @pytest.mark.asyncio
     async def test_session_usable_after_failed_turn(self, tmp_path):
@@ -1075,6 +1076,7 @@ class TestPromptFailureContract:
             assert len([t for t in texts if "Error: boom" in t]) == 1
         finally:
             await wire.close()
+            await a.aclose()
 
     @pytest.mark.asyncio
     async def test_unknown_session_still_returns_internal_error(self, tmp_path):

@@ -336,9 +336,9 @@ class TimelineSerializerMixin:
             native = [NativeMessage.from_dict(msg) for msg in native_messages]
             cut = self._native_compression_cutoff(native)
             retained = native[cut:]
-            # Messages decoded from dicts still share any mutable value those
-            # dicts held (e.g. a multimodal content list), so this install does
-            # not clear the aliasing-risk flag.
+            # Decoding creates fresh message and metadata containers, but nested
+            # content and argument values can still alias caller-owned payloads.
+            # Installation snapshots those dependencies for token accounting.
             self._install_model_state(self.timeline, retained)
             # The supplied native messages are the authoritative model-facing
             # projection for this load, so tag the ones matching live entries and
@@ -425,7 +425,7 @@ class TimelineSerializerMixin:
         return cut
 
     def _tag_native_mirrors(self: CompressedTimeline, entries: list[TimelineEntry], messages: list[NativeMessage]) -> int:
-        """Tag each native message with the entry at the same index.
+        """Pair entries and native messages by their tail-aligned projection.
 
         A hydration path that receives both representations decodes them
         independently, so the pairing has to be re-established before a later
@@ -433,13 +433,12 @@ class TimelineSerializerMixin:
         through the mutable public API, and their reasoning/replay metadata)
         instead of rebuilding a fresh projection from the entries.
 
-        The two lists are the same projection, so with a whole-projection load they
-        are index-aligned — except that a compaction prepends a summary message,
-        which has no entry. The alignment is therefore established from the tail
-        (the offset is at most the extra summary cohort), giving a single linear
-        pass with no repeated search. Decoded message objects are this timeline's
-        own (``NativeMessage.from_dict`` builds fresh instances), so no value
-        guessing is needed.
+        The supplied representations must describe the same projection. A native
+        summary cohort can precede the entry-backed suffix, so alignment uses the
+        list-length offset in one linear pass. This is positional association,
+        not semantic matching or validation of independently edited lists.
+        Decoding creates new message containers, but their nested payloads may
+        retain caller aliases; tagging copies no payloads.
 
         Returns:
             Number of messages tagged.

@@ -57,9 +57,40 @@ DEFAULT_REQUEST_DEADLINE_SECONDS = 900.0
 STREAM_IDLE_TIMEOUT_SECONDS = 360.0
 
 # Sampling temperature the runtimes configure by default (``AgentRuntime``'s
-# ``temperature=0``). The streaming path omits it so the provider's own default
-# applies; see :meth:`LLMCaller._build_request_kwargs`.
+# ``temperature=0``). It is the *default*, not a requested policy: streaming omits
+# it so the provider's own default applies, while the non-streaming wire shape is
+# unchanged; see :meth:`LLMCaller._build_request_kwargs`.
 DEFAULT_TEMPERATURE = 0.0
+
+
+class _Unset:
+    """Sentinel for a request control the caller never supplied.
+
+    The distinction that matters is *intent*, not value: the runtimes construct
+    their caller with ``temperature=0`` whether or not sampling was ever asked
+    for, so the value ``0`` cannot tell "the runtime default" from "an explicit
+    0". Reading a value as intent silently drops the explicit choice (I11). This
+    sentinel is what a constructor default binds to, so ``UNSET`` means "no
+    policy" while any concrete value, including ``0`` and ``None``, is a caller
+    decision that reaches the wire.
+
+    Mirrors the ``fields_set`` distinction Pydantic exposes for models; the
+    request controls here are plain constructor parameters, so the equivalent is
+    a sentinel default.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+    def __bool__(self) -> bool:
+        # Falsy so ``UNSET`` reads as "not set" in boolean contexts.
+        return False
+
+
+#: A control that was never supplied by any caller.
+UNSET = _Unset()
 
 # Keywords that indicate a transient (retriable) provider error.
 # "connection" matches openai.APIConnectionError → wrapped as ProviderError("...: Connection error.").
@@ -134,9 +165,16 @@ class LLMCaller:
     provider:
         Provider name (e.g. ``"anthropic"``, ``"openai"``).
     temperature:
-        Sampling temperature forwarded to the LLM call.
+        Sampling temperature forwarded to the LLM call. Defaults to
+        :data:`UNSET`, meaning **no caller ever expressed a sampling policy**
+        (the runtime's own ``temperature=0`` default). ``UNSET`` keeps the
+        streaming path's historical omission so the provider applies its own
+        default, while a caller-supplied value always reaches the wire on both
+        paths, including an explicit ``0``, which is a decision, not "unset".
+        ``None`` explicitly asks for no temperature on either path.
     max_tokens:
-        Max tokens forwarded to the LLM call.
+        Max tokens forwarded to the LLM call. ``None`` (the default) means
+        unset and is omitted rather than sent as null.
     native_tools_getter:
         Zero-argument callable that returns the current native tools list
         (or ``None``).  Called on every invocation so changes are reflected.
@@ -179,7 +217,7 @@ class LLMCaller:
         llm: LLM | None = None,
         model: str | None = None,
         provider: str = "anthropic",
-        temperature: float = 0,
+        temperature: float | None | _Unset = UNSET,
         max_tokens: int | None = None,
         native_tools_getter: Callable[[], list | None] | None = None,
         agent_getter: Callable[[], Any] | None = None,
@@ -195,6 +233,9 @@ class LLMCaller:
         self._llm = llm
         self._model = model
         self._provider = provider
+        #: Raw request control, intentionally *not* resolved here: the
+        #: distinction between "no policy" (:data:`UNSET`) and "the value 0" is
+        #: the whole point (I11), and resolving it at construction would lose it.
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._native_tools_getter = native_tools_getter or (lambda: None)
@@ -263,9 +304,11 @@ class LLMCaller:
         carrier as they arrive. Request controls (temperature, max_tokens,
         json_mode) are assembled by the same :meth:`_build_request_kwargs` used by
         the non-streaming path, so streaming and non-streaming send the same
-        provider-neutral policy and the adapters translate it per capability, save
-        for the runtime default temperature, which streaming omits (see
-        :meth:`_build_request_kwargs`).
+        provider-neutral policy and the adapters translate it per capability.
+        Temperature is resolved from caller *intent*: an unset control keeps the
+        historical omission (the provider's own sampling default applies), while
+        any explicitly supplied value, including ``0``, reaches the wire (see
+        :meth:`_resolve_temperature`).
 
         Retry policy: bounded re-issue **only while nothing has been emitted**.
         Once a chunk reaches the consumer, a failure is raised as-is — replaying
@@ -444,27 +487,51 @@ class LLMCaller:
         temperature restriction) and keep their existing unsupported-parameter
         degradation.
 
-        ``max_tokens``/``temperature`` are omitted when unset/None rather than
-        sent as null: providers treat an explicit null differently from an
-        absent key, and the adapters rely on presence checks.
+        ``max_tokens`` is omitted when ``None`` rather than sent as null: providers
+        treat an explicit null differently from an absent key, and the adapters
+        rely on presence checks.
 
-        ``streaming`` additionally omits the *runtime default* temperature. The
-        streaming path never put a temperature on the wire before, so every
-        provider applied its own sampling default; sending the runtime's ``0``
-        instead is not a policy the caller ever expressed, and it is a hard 400 on
-        families and deployments that reject sampling (o3/o4, Azure gpt-5
-        deployments not named ``gpt-5*``) and a silent behaviour change everywhere
-        else. A caller that explicitly asks for a non-default temperature still
-        gets it, subject to the same per-model restriction the non-streaming path
-        uses. The non-streaming path keeps forwarding the value unchanged: its
-        wire shape is unchanged by this PR.
+        Temperature is resolved from *intent*, not from the value
+        (:meth:`_resolve_temperature`): the runtimes construct their caller with
+        the same default whether or not sampling was ever requested, so a value
+        cannot express that distinction. The streaming path historically omitted
+        that runtime default so each provider applied its own sampling default;
+        sending the default instead is not a policy any caller expressed, and it
+        is a hard 400 on families and deployments that reject sampling (o3/o4,
+        Azure gpt-5 deployments not named ``gpt-5*``) and a silent behaviour
+        change everywhere else. An explicit value, including an explicit ``0``,
+        always reaches the wire on both paths, subject to the same per-model
+        restriction the non-streaming path uses. The non-streaming wire shape is
+        unchanged by this PR.
         """
         kwargs: dict[str, Any] = {"json_mode": self._json_mode}
         if self._max_tokens is not None:
             kwargs["max_tokens"] = self._max_tokens
-        if self._temperature is not None and not (streaming and self._temperature == DEFAULT_TEMPERATURE):
-            kwargs["temperature"] = self._temperature
+        temperature = self._resolve_temperature(streaming=streaming)
+        if temperature is not None:
+            kwargs["temperature"] = temperature
         return kwargs
+
+    def _resolve_temperature(self, *, streaming: bool) -> float | None:
+        """The temperature to put on the wire for this path, or ``None`` to omit.
+
+        The value alone cannot tell "the runtime's own default" from "the caller
+        asked for 0", so the constructor keeps the distinction and resolves it
+        here (I11):
+
+        * :data:`UNSET`: no sampling policy was ever expressed. Streaming keeps
+          its historical omission (the provider default applies); non-streaming
+          keeps its historical wire shape, which carried
+          :data:`DEFAULT_TEMPERATURE`.
+        * Any concrete value, including ``0`` and a non-zero float, is caller
+          intent and is forwarded unchanged on **both** paths.
+        * ``None`` explicitly asks for no sampling parameter, so it is omitted on
+          both paths.
+        """
+        temperature = self._temperature
+        if isinstance(temperature, _Unset):
+            return None if streaming else DEFAULT_TEMPERATURE
+        return temperature
 
     # ------------------------------------------------------------------
     # Deadline / cancellation
@@ -846,12 +913,58 @@ class LLMCaller:
                     error=str(e),
                 )
                 try:
-                    # reactive_compact is synchronous, CPU/IO-bound compaction guarded
-                    # by a threading lock. Calling it inline stalls the whole event loop
-                    # for the compaction and can block on a lock another thread holds.
-                    # Run it in a worker thread so the loop stays responsive; the
-                    # cross-thread arbitration is the same one the sync path relies on.
-                    await asyncio.to_thread(timeline.reactive_compact, attempt)
+                    # Await the timeline's own cancellation-capable compaction when it
+                    # has one. ``asyncio.to_thread`` cannot be stopped: when the
+                    # logical-request deadline or an owner cancellation ends the
+                    # await, the worker keeps running and later installs a whole new
+                    # projection (and stamps the compaction marker) on a timeline the
+                    # caller has already released. ``reactive_compact_async`` keeps
+                    # every mutation on this awaiting thread and joins any sync-only
+                    # summarizer before returning, so an abandoned await leaves no
+                    # late writer behind.
+                    compact_async = getattr(timeline, "reactive_compact_async", None)
+                    if compact_async is not None:
+                        await compact_async(attempt)
+                    else:
+                        # Foreign timeline without the async seam: its compaction is
+                        # synchronous and cannot be stopped, so the worker is joined
+                        # before a cancellation is re-raised instead of being
+                        # orphaned. The deadline may overrun by that callback's
+                        # remaining physical duration.
+                        task = asyncio.ensure_future(asyncio.to_thread(timeline.reactive_compact, attempt))
+                        try:
+                            await asyncio.shield(task)
+                        except asyncio.CancelledError:
+                            # The owner cancelled. ``shield`` keeps the worker
+                            # running, so join it here: it owns a mutation on a
+                            # timeline the caller has already released, and
+                            # abandoning it would let that write land late.
+                            # Its outcome is *not* this call's result, though:
+                            # the owner's cancellation is, so a worker failure
+                            # observed while joining is retrieved and discarded
+                            # rather than allowed to replace the cancellation
+                            # (``shield`` re-raises the worker's own exception
+                            # the moment the worker completes).
+                            while not task.done():
+                                try:
+                                    await asyncio.shield(task)
+                                except asyncio.CancelledError:
+                                    continue
+                                except BaseException:
+                                    # The worker failed while being joined. That is
+                                    # not the owner's outcome; the owner's
+                                    # cancellation must be what propagates, so the
+                                    # failure is drained and retrieved below rather
+                                    # than allowed to escape (``shield`` re-raises
+                                    # the worker's own exception the moment the
+                                    # worker completes).
+                                    break
+                            if not task.cancelled():
+                                try:
+                                    task.exception()  # retrieved, deliberately not raised
+                                except BaseException:
+                                    pass
+                            raise  # the owner's CancelledError, unchanged
                 except CompactCircuitOpenError:
                     raise
                 current_messages = self._rebuild_messages_after_compact(current_messages, messages_fn, attempt)
