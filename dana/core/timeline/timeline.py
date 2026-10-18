@@ -211,7 +211,11 @@ class TimelineEntry:
             entry_type=entry_type,
             content=data.get("content", ""),
             timestamp=datetime.fromisoformat(data["timestamp"]),
-            metadata=data.get("metadata", {}),
+            # A copy, never the caller's dict: a projection built from these entries
+            # writes its internal bookkeeping keys (``NATIVE_SOURCE_ENTRY_KEY``, the
+            # compression marker) into an entry's metadata, and installing that into
+            # the caller's decoded payload would mutate their data (I15).
+            metadata=dict(data.get("metadata") or {}),
             is_latest_user_message=data.get("is_latest_user_message", False),
             tool_call_id=data.get("tool_call_id"),
             tool_calls=data.get("tool_calls"),

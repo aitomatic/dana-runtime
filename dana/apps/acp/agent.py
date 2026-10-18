@@ -169,15 +169,23 @@ class DanaACPAgent:
         return self._repository
 
     async def aclose(self) -> None:
-        """Close session operations before their permission and journal stores."""
+        """Close session operations before their permission and journal stores.
+
+        Both registries are snapshotted before the first ``await``: closing a
+        session can re-enter this agent (session teardown releases MCP leases
+        and the journal), and iterating a live dict across an await would raise
+        ``RuntimeError: dictionary changed size during iteration``.
+        """
         first_error: Exception | None = None
-        for session in self._sessions.values():
+        sessions = list(self._sessions.values())
+        connections = list(self._grant_dbs.values())
+        for session in sessions:
             try:
                 await session.aclose()
             except Exception as exc:
                 first_error = first_error or exc
         self._sessions.clear()
-        for connection in self._grant_dbs.values():
+        for connection in connections:
             try:
                 await connection.close()
             except Exception as exc:
@@ -192,9 +200,17 @@ class DanaACPAgent:
         if first_error is not None:
             raise first_error
 
-    async def _configure_session_policy(self, session: AgentSession) -> None:
+    async def _configure_session_policy(self, session: AgentSession) -> aiosqlite.Connection | None:
+        """Wire the durable-grant evaluator for ``session``.
+
+        Returns the new per-session grant connection (``None`` when the
+        feature flag is off) WITHOUT registering it: ownership transfers to
+        the caller only after this call returns. A failure here closes the
+        half-built store and propagates, so a caller replacing an already
+        published session keeps the previous session and store intact.
+        """
         if not self._policy_grants_enabled:
-            return
+            return None
         from dana.core.policy.store_schema import POLICY_SQLITE_DDL
         from dana.core.policy.store_sqlite import SQLiteGrantStore
 
@@ -209,7 +225,7 @@ class DanaACPAgent:
         except BaseException:
             await grant_db.close()
             raise
-        self._grant_dbs[session.session_id] = grant_db
+        return grant_db
 
     @property
     def journal_authority_enabled(self) -> bool:
@@ -316,8 +332,13 @@ class DanaACPAgent:
         )
         # Set the current version to match the journal (SESSION_CREATED fact)
         session._current_version = init_facts[0].sequence
-        await self._configure_session_policy(session)
+        grant_db = await self._configure_session_policy(session)
+        # Publish the session and its grant store without an intervening await:
+        # teardown snapshots both registries, so they must not be observed with
+        # a session registered and its store still unowned.
         self._sessions[session_id] = session
+        if grant_db is not None:
+            self._grant_dbs[session_id] = grant_db
         logger.info("session created", session_id=session_id, cwd=cwd)
 
         # D4: Build model state from catalog (rollback: None when disabled)
@@ -547,14 +568,38 @@ class DanaACPAgent:
             agent_factory=self._agent_factory,
         )
         await session.load()
+        try:
+            new_grants = await self._configure_session_policy(session)
+        except BaseException:
+            # Policy configuration failed: the replacement never takes
+            # ownership. Release its half-loaded resources and re-raise the
+            # original failure; leave the previously published session and
+            # grant store intact, so a failed load cannot strand a closed
+            # session in the registry.
+            try:
+                await session.aclose()
+            except Exception:
+                logger.warning("failed to close unconfigured session", session_id=session_id, exc_info=True)
+            raise
+
+        # Publish the replacement and its grant store with no await in between,
+        # then release the superseded pair best-effort: a close failure must not
+        # undo a load whose facts the journal has already accepted.
         previous = self._sessions.get(session_id)
-        if previous is not None:
-            await previous.aclose()
         old_grants = self._grant_dbs.pop(session_id, None)
-        if old_grants is not None:
-            await old_grants.close()
-        await self._configure_session_policy(session)
         self._sessions[session_id] = session
+        if new_grants is not None:
+            self._grant_dbs[session_id] = new_grants
+        if previous is not None:
+            try:
+                await previous.aclose()
+            except Exception:
+                logger.warning("failed to close superseded session", session_id=session_id, exc_info=True)
+        if old_grants is not None:
+            try:
+                await old_grants.close()
+            except Exception:
+                logger.warning("failed to close superseded grant store", session_id=session_id, exc_info=True)
 
         # Replay host events as session_update notifications BEFORE returning.
         async for event in session.replay_host_events(0):
@@ -654,9 +699,12 @@ class DanaACPAgent:
             if terminal.fact_type is FactType.TURN_CANCELLED:
                 stop_reason = "cancelled"
             elif terminal.fact_type is FactType.TURN_ERROR:
-                # The ACP transport maps exceptions to JSON-RPC error responses.
-                # A failed model turn must not masquerade as successful end_turn.
-                raise RuntimeError(terminal.error or "Agent turn failed")
+                # ACP has no "error" stop_reason; end_turn signals the turn ended.
+                # The failure is already visible to the client as the single
+                # TURN_ERROR -> agent_message_chunk transcript notification
+                # (translation.host_event_to_acp_update), so the prompt completes
+                # successfully instead of failing the JSON-RPC request twice.
+                stop_reason = "end_turn"
 
         return PromptResponse(stop_reason=stop_reason)
 

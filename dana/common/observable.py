@@ -167,12 +167,23 @@ def _flush_bounded(flush: Callable[[], object], timeout: float) -> None:
     finished.wait(timeout)
 
 
+def _langsmith_cached_client() -> object:
+    """The client that the active ``@traceable`` runs are queued on.
+
+    ``RunTree.client`` lazily resolves through ``langsmith.run_trees.get_cached_client()``,
+    so that process-wide instance — not a freshly constructed ``Client()``, which is
+    empty and owns no runs — is the one holding the buffered traces this module must
+    deliver. Resolution happens inside the lifecycle worker.
+    """
+    from langsmith.run_trees import get_cached_client
+
+    return get_cached_client()
+
+
 def _flush_active_backend() -> None:
     """Resolve and flush the backend inside the protected lifecycle worker."""
     if LANGSMITH_ENABLED:
-        from langsmith import Client
-
-        Client().flush(timeout=_FLUSH_TIMEOUT_S)
+        _langsmith_cached_client().flush(timeout=_FLUSH_TIMEOUT_S)
     elif LANGFUSE_ENABLED and OBSERVER is not None:
         OBSERVER.flush()
 
@@ -182,12 +193,10 @@ def _shutdown_active_backend() -> None:
 
     Langfuse owns background exporter threads that `shutdown()` stops, so it
     must not simply be flushed. LangSmith keeps a process-wide run tree with no
-    equivalent teardown, so flushing is the whole release.
+    equivalent teardown, so flushing the cached client is the whole release.
     """
     if LANGSMITH_ENABLED:
-        from langsmith import Client
-
-        Client().flush(timeout=_FLUSH_TIMEOUT_S)
+        _langsmith_cached_client().flush(timeout=_FLUSH_TIMEOUT_S)
     elif LANGFUSE_ENABLED and OBSERVER is not None:
         OBSERVER.shutdown()
 

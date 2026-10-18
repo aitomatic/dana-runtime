@@ -266,8 +266,8 @@ dana/
 
 | Precedence | Trigger | Backend |
 |------------|---------|---------|
-| 1 (highest) | `LANGSMITH_TRACING=true` OR `DANA_LANGSMITH_ENABLED=true|1|yes` (+ `langsmith` installed) | LangSmith `@traceable` (background-thread batching, no per-call flush) |
-| 2 | `LANGFUSE_ENABLED=true|1|yes` (+ `langfuse` installed) | Langfuse `@observe` + per-call flush |
+| 1 (highest) | `LANGSMITH_TRACING=true` OR `DANA_LANGSMITH_ENABLED=true|1|yes` (+ `langsmith` installed) | LangSmith `@traceable` (background batching, shutdown flush of the client that owns the runs) |
+| 2 | `LANGFUSE_ENABLED=true|1|yes` (+ `langfuse` installed) | Langfuse `@observe` (background batching, shutdown flush) |
 | 3 (default) | neither set | no-op passthrough |
 
 **LangSmith env vars:** `LANGSMITH_TRACING` (enable, case-sensitive `true`), `DANA_LANGSMITH_ENABLED` (dana-namespace alias), `LANGSMITH_API_KEY` (required for emission), `LANGSMITH_PROJECT` / `LANGSMITH_ENDPOINT` (optional).

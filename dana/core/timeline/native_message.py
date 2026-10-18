@@ -192,7 +192,11 @@ class NativeMessage:
             content=data.get("content", ""),
             tool_calls=tool_calls,
             tool_call_id=data.get("tool_call_id"),
-            metadata=data.get("metadata", {}),
+            # A copy, never the caller's dict: the serializer writes its internal
+            # ``NATIVE_SOURCE_ENTRY_KEY`` backlink (a TimelineEntry object) into this
+            # mapping, and installing that into the caller's decoded payload would
+            # make a later ``json.dumps`` of their data fail (I15).
+            metadata=dict(data.get("metadata") or {}),
             timestamp=timestamp,
         )
 

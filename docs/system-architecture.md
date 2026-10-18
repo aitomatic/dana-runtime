@@ -349,10 +349,18 @@ Runtime (Abstract Interface)
 
 `LLMCaller` owns request retries and the logical-request deadline
 (`DANA_LLM_REQUEST_DEADLINE_SECONDS`, default 900 seconds; zero disables it).
-Each attempt receives the remaining budget as its SDK timeout; async calls
-and stream pulls are additionally bounded by that budget. Provider SDK retries
-are disabled. Streaming retries are allowed only before any chunk is emitted,
-not around an entire effect-bearing STAR cycle.
+An attempt is capped by both its provider timeout and the remaining request
+budget. The retry deadline applies until the first stream chunk; an established
+stream uses a fresh idle timeout for each pull rather than expiring solely
+because total stream duration exceeds the pre-first-chunk budget. SDK-owned
+retries are disabled. A stream retries only before any chunk has been emitted.
+
+**Retry ownership change:** STAR no longer automatically replays an entire
+Situation/Thought/Action/Result cycle. `LLMCaller` owns bounded provider-request
+retries. Replaying a full cycle could execute already completed tools again;
+request retries never replay those effects. Operators relying on the old
+whole-cycle retry behavior must now handle the recorded terminal failure or
+submit a new turn explicitly.
 
 Streaming completion carriers preserve provider-reported finish status,
 usage/cache/reasoning counters, response identity, and compatible protected
@@ -494,10 +502,25 @@ Timeline.add_entry(entry)
           └─ Continue conversation
 ```
 
-**Default Settings:**
-- `max_tokens`: 4096
-- `compression_threshold`: 0.8 (compress at 80% usage)
-- Compression reduces tokens to ~60% of original
+`CompressedTimeline` maintains a cached token contribution for each native
+message and folds only changed contributions into the total. Tool calls do not
+permanently force full-history retokenization. Shared mutable payloads keep
+dependency snapshots so in-place caller edits invalidate the affected message;
+an escaped public message reference also requires attribute-change checks.
+Retained dependency comparisons can still scale with mutable history size.
+This is incremental token estimation, not a constant-time guarantee for
+arbitrary caller-mutated histories.
+
+Runtime-context replacement, hydration, shrink, and compaction keep the message
+cache aligned with the live projection. Hydrating caller-owned dictionaries
+copies their metadata mapping before installing internal entry backlinks, so
+the caller's original payload remains JSON-serializable.
+
+The default compression trigger is 150000 tokens, resolved through
+`DANA_COMPACT_TRIGGER_TOKENS`. The context-window budget is separate from that
+trigger; an explicit `max_context_tokens` does not redefine when compression
+should run. Compression size depends on the retained entries and summary, not
+a guaranteed fixed reduction ratio.
 
 ### Compaction Parity Upgrades (Phases 1–4)
 
@@ -592,15 +615,18 @@ the repository it opens. ACP and CLI close sessions before host-owned storage.
 
 ## Concurrency Model
 
-- **Bounded admission**: `ToolExecutor` shares an admission controller with
-  nested execution. Leaf tools and nested tasks have separate capacity limits;
-  queued cancellation does not release a slot held by running work.
-- **Effect ordering**: Independent calls can run concurrently. Conflicting
-  declared effects retain call order, including file targets redirected by
-  interception before execution.
-- **Blocking tools**: Only explicitly eligible synchronous tools run in the
-  bounded offload pool. Other synchronous Python still runs on the event loop;
-  asynchronous APIs do not make arbitrary blocking work non-blocking.
+- **Bounded admission**: Permission decisions run before admission, so an
+  unanswered prompt holds no shared capacity. Leaf tools and nested tasks use
+  separate limits; `with_agents` query dispatches use the nested limit too.
+- **Effect ordering**: Conflicting declared effects retain call order, including
+  file targets redirected by interception. MCP `readOnlyHint=True` calls can
+  overlap; unannotated MCP calls serialize within their server, not globally.
+  Catalogs and session lifecycle hooks resolve against the invoking agent.
+- **Blocking tools**: Only synchronous callables explicitly marked
+  `@blocking_io` run in the bounded worker pool. Unmarked synchronous Python
+  stays on the event loop; it is not assumed thread-safe. Cancellation signals
+  cooperative waits and retains admission/effect ownership until physical work
+  exits. A non-cooperative callable can therefore delay cancellation.
 - **Nested progress**: A nested call can lend its held slot to a descendant to
   avoid self-deadlock. An ancestor cannot release that capacity while borrowed
   descendant work remains active.
@@ -609,6 +635,16 @@ the repository it opens. ACP and CLI close sessions before host-owned storage.
   `CancelledError`; `task_output(task_id)` then returns `Status: cancelled`
   rather than leaving an exited child permanently `running`. The existing
   session handle remains available for an explicit resume.
+- **MCP request identities**: stdio and HTTP transports pass a
+  `correlating_write_stream(write_stream)` wrapper to the supported
+  `ClientSession(read_stream, write_stream)` constructor. Context-local call
+  correlation records the SDK-assigned request ID without mutating SDK internals,
+  including overlapping calls to the same tool. Integrations constructing an MCP
+  SDK session directly must wrap their write stream to get this correlation.
+- **MCP dispatch boundary**: Harness names retain their server prefix for
+  discovery, permissions and effect ordering. The remote request uses the
+  server's unprefixed tool name. Session catalogs retain discovered read-only
+  annotations; nested transport contexts close in reverse acquisition order.
 
 ## Extension Points
 

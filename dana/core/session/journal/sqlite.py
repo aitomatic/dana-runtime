@@ -15,6 +15,7 @@ free at the index level.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 import json
@@ -100,6 +101,15 @@ class SQLiteJournalRepository:
 
     def __init__(self, db: aiosqlite.Connection) -> None:
         self._db = db
+        # I3: aiosqlite serializes individual statements, not transactional
+        # *units*. Two sessions sharing one connection would otherwise be able to
+        # interleave a BEGIN..ROLLBACK with another writer's statements, exposing
+        # uncommitted rows to a reader or losing part of a batch. Every statement
+        # this repository issues goes through this lock, so one transaction - and
+        # its rollback - is atomic with respect to every other operation on the
+        # same connection. Distinct connections (and external writers) are
+        # unaffected: SQLite's own file locking governs those.
+        self._lock = asyncio.Lock()
 
     @classmethod
     async def open(cls, path: str) -> SQLiteJournalRepository:
@@ -213,6 +223,7 @@ class SQLiteJournalRepository:
             )
 
     async def _require_session_row(self, scope: OwnerScope, session_id: str) -> aiosqlite.Row:
+        """Row lookup; callers hold ``self._lock`` (see :meth:`_locked`)."""
         row = await _fetchone(
             self._db,
             "SELECT * FROM session_journals WHERE owner_id=? AND workspace=? AND session_id=?",
@@ -237,41 +248,45 @@ class SQLiteJournalRepository:
         """
         scope = record.owner_scope
         # aiosqlite has no async context-manager transaction; manage BEGIN/COMMIT/ROLLBACK manually.
-        await self._db.execute("BEGIN IMMEDIATE")
-        try:
-            existing = await _fetchone(
-                self._db,
-                "SELECT session_id FROM session_journals WHERE owner_id=? AND workspace=? AND session_id=?",
-                (*self._scope_key(scope), record.session_id),
-            )
-            if existing is not None:
-                raise JournalError(f"session {record.session_id!r} already exists for {scope.owner_id!r}/{scope.workspace!r}")
+        # The connection lock makes the whole unit atomic against every other
+        # operation on this connection (I3).
+        async with self._lock:
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                existing = await _fetchone(
+                    self._db,
+                    "SELECT session_id FROM session_journals WHERE owner_id=? AND workspace=? AND session_id=?",
+                    (*self._scope_key(scope), record.session_id),
+                )
+                if existing is not None:
+                    raise JournalError(f"session {record.session_id!r} already exists for {scope.owner_id!r}/{scope.workspace!r}")
 
-            now = _now()
-            await self._db.execute(
-                """
-                INSERT INTO session_journals
-                    (owner_id, workspace, session_id, version, status, created_at, updated_at, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    scope.owner_id,
-                    scope.workspace,
-                    record.session_id,
-                    len(facts),
-                    SessionStatus.ACTIVE.value,
-                    _iso(now),
-                    _iso(now),
-                    _serialize_json(record.metadata),
-                ),
-            )
-            await self._insert_facts(self._db, scope, record.session_id, facts)
-            await self._db.commit()
-        except BaseException:
-            await self._db.execute("ROLLBACK")
-            raise
+                now = _now()
+                await self._db.execute(
+                    """
+                    INSERT INTO session_journals
+                        (owner_id, workspace, session_id, version, status, created_at, updated_at, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        scope.owner_id,
+                        scope.workspace,
+                        record.session_id,
+                        len(facts),
+                        SessionStatus.ACTIVE.value,
+                        _iso(now),
+                        _iso(now),
+                        _serialize_json(record.metadata),
+                    ),
+                )
+                await self._insert_facts(self._db, scope, record.session_id, facts)
+                await self._db.commit()
+            except BaseException:
+                await self._db.execute("ROLLBACK")
+                raise
 
-        return await self.load_session(scope, record.session_id)
+            # Read back inside the same lock: a nested locked load would deadlock.
+            return self._row_to_session(await self._require_session_row(scope, record.session_id))
 
     async def append(
         self,
@@ -283,124 +298,131 @@ class SQLiteJournalRepository:
     ) -> AppendResult:
         if not facts:
             raise ValueError("cannot append an empty batch of facts")
-        await self._db.execute("BEGIN IMMEDIATE")
-        try:
-            row = await _fetchone(
-                self._db,
-                "SELECT version FROM session_journals WHERE owner_id=? AND workspace=? AND session_id=?",
-                (*self._scope_key(scope), session_id),
-            )
-            if row is None:
-                # No row yet -> raise SessionNotFound, NOT a conflict (matches
-                # the owner-isolation contract: a missing session is missing,
-                # not a version skew).
-                raise SessionNotFound(scope, session_id)
-            actual_version = row["version"]
-            if actual_version != expected_version:
-                raise JournalConflict(session_id, expected_version, actual_version)
+        async with self._lock:
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = await _fetchone(
+                    self._db,
+                    "SELECT version FROM session_journals WHERE owner_id=? AND workspace=? AND session_id=?",
+                    (*self._scope_key(scope), session_id),
+                )
+                if row is None:
+                    # No row yet -> raise SessionNotFound, NOT a conflict (matches
+                    # the owner-isolation contract: a missing session is missing,
+                    # not a version skew).
+                    raise SessionNotFound(scope, session_id)
+                actual_version = row["version"]
+                if actual_version != expected_version:
+                    raise JournalConflict(session_id, expected_version, actual_version)
 
-            now = _now()
-            durable: list[JournalFact] = []
-            for offset, nf in enumerate(facts):
-                seq = expected_version + 1 + offset
-                durable.append(
-                    JournalFact(
-                        fact_id=str(uuid.uuid4()),
-                        owner_scope=scope,
-                        session_id=session_id,
-                        sequence=seq,
-                        fact_type=nf.fact_type,
-                        timestamp=now,
-                        correlation_id=nf.correlation_id,
-                        causation_id=nf.causation_id,
-                        schema_version=nf.schema_version,
-                        payload=nf.payload,
-                        protected_payload=nf.protected_payload,
-                        artifact_refs=nf.artifact_refs,
+                now = _now()
+                durable: list[JournalFact] = []
+                for offset, nf in enumerate(facts):
+                    seq = expected_version + 1 + offset
+                    durable.append(
+                        JournalFact(
+                            fact_id=str(uuid.uuid4()),
+                            owner_scope=scope,
+                            session_id=session_id,
+                            sequence=seq,
+                            fact_type=nf.fact_type,
+                            timestamp=now,
+                            correlation_id=nf.correlation_id,
+                            causation_id=nf.causation_id,
+                            schema_version=nf.schema_version,
+                            payload=nf.payload,
+                            protected_payload=nf.protected_payload,
+                            artifact_refs=nf.artifact_refs,
+                        )
                     )
-                )
-            await self._insert_facts(self._db, scope, session_id, durable)
+                await self._insert_facts(self._db, scope, session_id, durable)
 
-            new_version = expected_version + len(facts)
-            if metadata is not None:
-                await self._db.execute(
-                    "UPDATE session_journals SET version=?, updated_at=?, metadata=? WHERE owner_id=? AND workspace=? AND session_id=?",
-                    (new_version, _iso(now), _serialize_json(metadata), *self._scope_key(scope), session_id),
-                )
-            else:
-                await self._db.execute(
-                    "UPDATE session_journals SET version=?, updated_at=? WHERE owner_id=? AND workspace=? AND session_id=?",
-                    (new_version, _iso(now), *self._scope_key(scope), session_id),
-                )
-            await self._db.commit()
-        except BaseException:
-            await self._db.execute("ROLLBACK")
-            raise
+                new_version = expected_version + len(facts)
+                if metadata is not None:
+                    await self._db.execute(
+                        "UPDATE session_journals SET version=?, updated_at=?, metadata=? WHERE owner_id=? AND workspace=? AND session_id=?",
+                        (new_version, _iso(now), _serialize_json(metadata), *self._scope_key(scope), session_id),
+                    )
+                else:
+                    await self._db.execute(
+                        "UPDATE session_journals SET version=?, updated_at=? WHERE owner_id=? AND workspace=? AND session_id=?",
+                        (new_version, _iso(now), *self._scope_key(scope), session_id),
+                    )
+                await self._db.commit()
+            except BaseException:
+                await self._db.execute("ROLLBACK")
+                raise
 
-        return AppendResult(new_version=new_version, appended_facts=tuple(durable))
+            return AppendResult(new_version=new_version, appended_facts=tuple(durable))
 
     async def read_facts(self, scope: OwnerScope, session_id: str, after_sequence: int = 0) -> list[JournalFact]:
-        # Existence check first so SessionNotFound is raised for unknown sessions.
-        await self._require_session_row(scope, session_id)
-        rows = await _fetchall(
-            self._db,
-            "SELECT * FROM session_facts WHERE owner_id=? AND workspace=? AND session_id=? AND sequence > ? ORDER BY sequence ASC",
-            (*self._scope_key(scope), session_id, after_sequence),
-        )
-        return [self._row_to_fact(r) for r in rows]
+        async with self._lock:
+            # Existence check first so SessionNotFound is raised for unknown sessions.
+            await self._require_session_row(scope, session_id)
+            rows = await _fetchall(
+                self._db,
+                "SELECT * FROM session_facts WHERE owner_id=? AND workspace=? AND session_id=? AND sequence > ? ORDER BY sequence ASC",
+                (*self._scope_key(scope), session_id, after_sequence),
+            )
+            return [self._row_to_fact(r) for r in rows]
 
     async def load_session(self, scope: OwnerScope, session_id: str) -> SessionRecord:
-        row = await self._require_session_row(scope, session_id)
-        return self._row_to_session(row)
+        async with self._lock:
+            row = await self._require_session_row(scope, session_id)
+            return self._row_to_session(row)
 
     # ------------------------------------------------------------------
     # Protocol: list / archive / purge
     # ------------------------------------------------------------------
 
     async def list_sessions(self, scope: OwnerScope) -> list[SessionRecord]:
-        rows = await _fetchall(
-            self._db,
-            "SELECT * FROM session_journals WHERE owner_id=? AND workspace=? AND status != ? ORDER BY created_at ASC",
-            (scope.owner_id, scope.workspace, SessionStatus.DELETED.value),
-        )
-        return [self._row_to_session(r) for r in rows]
+        async with self._lock:
+            rows = await _fetchall(
+                self._db,
+                "SELECT * FROM session_journals WHERE owner_id=? AND workspace=? AND status != ? ORDER BY created_at ASC",
+                (scope.owner_id, scope.workspace, SessionStatus.DELETED.value),
+            )
+            return [self._row_to_session(r) for r in rows]
 
     async def archive_session(self, scope: OwnerScope, session_id: str) -> SessionRecord:
-        await self._db.execute("BEGIN IMMEDIATE")
-        try:
-            # Existence check first -> SessionNotFound for unknown sessions.
-            await self._require_session_row(scope, session_id)
-            await self._db.execute(
-                "UPDATE session_journals SET status=?, updated_at=? WHERE owner_id=? AND workspace=? AND session_id=?",
-                (SessionStatus.ARCHIVED.value, _iso(_now()), *self._scope_key(scope), session_id),
-            )
-            await self._db.commit()
-        except BaseException:
-            await self._db.execute("ROLLBACK")
-            raise
-        # Re-read to reflect the updated row in a single source of truth.
-        return await self.load_session(scope, session_id)
+        async with self._lock:
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                # Existence check first -> SessionNotFound for unknown sessions.
+                await self._require_session_row(scope, session_id)
+                await self._db.execute(
+                    "UPDATE session_journals SET status=?, updated_at=? WHERE owner_id=? AND workspace=? AND session_id=?",
+                    (SessionStatus.ARCHIVED.value, _iso(_now()), *self._scope_key(scope), session_id),
+                )
+                await self._db.commit()
+            except BaseException:
+                await self._db.execute("ROLLBACK")
+                raise
+            # Re-read inside the same lock to reflect the updated row in a single
+            # source of truth (a nested locked load would deadlock).
+            return self._row_to_session(await self._require_session_row(scope, session_id))
 
     async def purge_session(self, scope: OwnerScope, session_id: str) -> None:
-        await self._db.execute("BEGIN IMMEDIATE")
-        try:
-            # Existence check INSIDE the transaction so a concurrent purge
-            # between check and BEGIN cannot silently no-op.
-            await self._require_session_row(scope, session_id)
-            # Deleting the header row cascades to session_facts (FK ON DELETE
-            # CASCADE); clean checkpoints too (no FK on that table).
-            await self._db.execute(
-                "DELETE FROM projection_checkpoints WHERE owner_id=? AND workspace=? AND session_id=?",
-                (*self._scope_key(scope), session_id),
-            )
-            await self._db.execute(
-                "DELETE FROM session_journals WHERE owner_id=? AND workspace=? AND session_id=?",
-                (*self._scope_key(scope), session_id),
-            )
-            await self._db.commit()
-        except BaseException:
-            await self._db.execute("ROLLBACK")
-            raise
+        async with self._lock:
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                # Existence check INSIDE the transaction so a concurrent purge
+                # between check and BEGIN cannot silently no-op.
+                await self._require_session_row(scope, session_id)
+                # Deleting the header row cascades to session_facts (FK ON DELETE
+                # CASCADE); clean checkpoints too (no FK on that table).
+                await self._db.execute(
+                    "DELETE FROM projection_checkpoints WHERE owner_id=? AND workspace=? AND session_id=?",
+                    (*self._scope_key(scope), session_id),
+                )
+                await self._db.execute(
+                    "DELETE FROM session_journals WHERE owner_id=? AND workspace=? AND session_id=?",
+                    (*self._scope_key(scope), session_id),
+                )
+                await self._db.commit()
+            except BaseException:
+                await self._db.execute("ROLLBACK")
+                raise
 
     # ------------------------------------------------------------------
     # Protocol: projection checkpoints
@@ -418,52 +440,55 @@ class SQLiteJournalRepository:
         """
         now = _now()
         ts = checkpoint.updated_at if checkpoint.updated_at is not None else now
-        await self._db.execute("BEGIN IMMEDIATE")
-        try:
-            await self._db.execute(
-                """
-                INSERT INTO projection_checkpoints
-                    (owner_id, workspace, session_id, projection_name, last_sequence, updated_at, data)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(owner_id, workspace, session_id, projection_name) DO UPDATE SET
-                    last_sequence = excluded.last_sequence,
-                    updated_at    = excluded.updated_at,
-                    data          = excluded.data
-                WHERE excluded.last_sequence >= projection_checkpoints.last_sequence
-                """,
-                (
-                    scope.owner_id,
-                    scope.workspace,
-                    session_id,
-                    checkpoint.projection_name,
-                    checkpoint.last_sequence,
-                    _iso(ts),
-                    _serialize_json(checkpoint.data),
-                ),
-            )
-            await self._db.commit()
-        except BaseException:
-            await self._db.execute("ROLLBACK")
-            raise
+        async with self._lock:
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                await self._db.execute(
+                    """
+                    INSERT INTO projection_checkpoints
+                        (owner_id, workspace, session_id, projection_name, last_sequence, updated_at, data)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(owner_id, workspace, session_id, projection_name) DO UPDATE SET
+                        last_sequence = excluded.last_sequence,
+                        updated_at    = excluded.updated_at,
+                        data          = excluded.data
+                    WHERE excluded.last_sequence >= projection_checkpoints.last_sequence
+                    """,
+                    (
+                        scope.owner_id,
+                        scope.workspace,
+                        session_id,
+                        checkpoint.projection_name,
+                        checkpoint.last_sequence,
+                        _iso(ts),
+                        _serialize_json(checkpoint.data),
+                    ),
+                )
+                await self._db.commit()
+            except BaseException:
+                await self._db.execute("ROLLBACK")
+                raise
 
     async def load_projection_checkpoint(self, scope: OwnerScope, session_id: str, projection_name: str) -> ProjectionCheckpoint | None:
-        row = await _fetchone(
-            self._db,
-            "SELECT * FROM projection_checkpoints WHERE owner_id=? AND workspace=? AND session_id=? AND projection_name=?",
-            (*self._scope_key(scope), session_id, projection_name),
-        )
-        if row is None:
-            return None
-        return ProjectionCheckpoint(
-            projection_name=row["projection_name"],
-            last_sequence=row["last_sequence"],
-            data=_deserialize_json(row["data"]),
-            updated_at=_parse_dt(row["updated_at"]),
-        )
+        async with self._lock:
+            row = await _fetchone(
+                self._db,
+                "SELECT * FROM projection_checkpoints WHERE owner_id=? AND workspace=? AND session_id=? AND projection_name=?",
+                (*self._scope_key(scope), session_id, projection_name),
+            )
+            if row is None:
+                return None
+            return ProjectionCheckpoint(
+                projection_name=row["projection_name"],
+                last_sequence=row["last_sequence"],
+                data=_deserialize_json(row["data"]),
+                updated_at=_parse_dt(row["updated_at"]),
+            )
 
     # ------------------------------------------------------------------
     # Protocol: lifecycle
     # ------------------------------------------------------------------
 
     async def close(self) -> None:
-        await self._db.close()
+        async with self._lock:
+            await self._db.close()

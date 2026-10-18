@@ -76,10 +76,21 @@ def _effect_metadata_for(name: str, mcp_names: frozenset[str] | None = None) -> 
     """
     spec = _NATIVE_TOOL_EFFECTS.get(name)
     if spec is None:
-        # D7 follow-up 2: a registered MCP tool -> EXECUTE, non-sensitive.
         if mcp_names and name in mcp_names:
+            # D7 follow-up 2: a registered MCP tool -> EXECUTE, non-sensitive, so it
+            # flows to mode/grant/prompt instead of being hard-denied as unknown.
+            #
+            # The effect's TARGET is the server (I9): the server is the honest
+            # conflict domain. The harness knows nothing about a server's own
+            # resources, so two unannotated mutations of one server may collide
+            # while two different servers do not. A per-call *argument* target would
+            # be an unfounded guess for an unannotated server (a ``path`` key it
+            # ignores would look provably disjoint when it is not); a shared
+            # placeholder would over-serialize every server against every other.
+            # Read-only tools overlap through their own declared metadata instead
+            # (:func:`dana.core.mcp.dispatch_wrapper._mcp_effect_metadata`).
             return EffectMetadata(
-                effects=(Effect(kind=EffectKind.EXECUTE, target="mcp"),),
+                effects=(Effect(kind=EffectKind.EXECUTE, target=name.split(":", 1)[0]),),
                 is_sensitive=False,
             )
         # Unknown/unlisted tool -> fail-cautious (is_sensitive=True -> hard-deny).
@@ -110,6 +121,7 @@ def build_native_tool_catalog(
     *,
     version: int = 0,
     mcp_names: frozenset[str] | None = None,
+    mcp_effects: Mapping[str, EffectMetadata] | None = None,
 ) -> ToolCatalog:
     """Build a policy-classification catalog from the agent's native-tool schemas.
 
@@ -131,6 +143,8 @@ def build_native_tool_catalog(
         mcp_names: Namespaced MCP tool names (``server:tool``) to classify as
             EXECUTE / non-sensitive (D7 follow-up 2: per-MCP policy). Other
             unknown names stay fail-cautious.
+        mcp_effects: Server-declared effects for registered MCP names. Missing
+            declarations retain conservative per-server EXECUTE classification.
 
     Returns:
         A :class:`ToolCatalog` with one entry per native tool, classified for
@@ -147,6 +161,7 @@ def build_native_tool_catalog(
             continue
         seen.add(name)
         schema = dict(tool)
+        declared = mcp_effects.get(name) if mcp_effects and mcp_names and name in mcp_names else None
         entries.append(
             ToolCatalogEntry(
                 identity=ToolIdentity(name=name, source="native"),
@@ -155,7 +170,7 @@ def build_native_tool_catalog(
                 # execute an entry whose adapter is not callable, so a
                 # classification entry can never be dispatched as a tool.
                 adapter=None,
-                effects=_effect_metadata_for(name, mcp_names),
+                effects=declared or _effect_metadata_for(name, mcp_names),
             )
         )
     return ToolCatalog(entries, version=version)

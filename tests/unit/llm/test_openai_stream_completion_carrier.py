@@ -111,6 +111,7 @@ def _make_function_call_item(call_id="call_1", name="get_weather", arguments='{"
     item.call_id = call_id
     item.name = name
     item.arguments = arguments
+    item.status = None
     return item
 
 
@@ -388,14 +389,19 @@ class TestResponsesStreamFaultEvents:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("streaming", [False, True])
     @pytest.mark.parametrize(
-        ("status", "reason", "expected"),
+        ("status", "reason", "item_status", "expected"),
         [
-            ("incomplete", "max_output_tokens", "length"),
-            ("incomplete", "content_filter", "incomplete"),
-            ("completed", None, "tool_calls"),
+            ("incomplete", "max_output_tokens", "incomplete", "length"),
+            ("incomplete", "content_filter", "incomplete", "incomplete"),
+            ("incomplete", "max_output_tokens", "in_progress", "length"),
+            ("incomplete", "content_filter", "in_progress", "incomplete"),
+            ("completed", None, "in_progress", "incomplete"),
+            ("incomplete", "max_output_tokens", "completed", "tool_calls"),
+            ("completed", None, "completed", "tool_calls"),
+            ("completed", None, None, "tool_calls"),
         ],
     )
-    async def test_sdk_terminal_status_precedes_tool_calls(self, monkeypatch, streaming, status, reason, expected):
+    async def test_sdk_terminal_status_precedes_tool_calls(self, monkeypatch, streaming, status, reason, item_status, expected):
         monkeypatch.setenv("LLM_REASONING_REPLAY", "1")
         response = {
             "id": "resp_wire_1",
@@ -413,7 +419,7 @@ class TestResponsesStreamFaultEvents:
                     "call_id": "call_1",
                     "name": "get_weather",
                     "arguments": '{"city":"Tokyo"}',
-                    "status": status,
+                    "status": item_status,
                 },
             ],
             "usage": {

@@ -89,8 +89,17 @@ diagnostics are routed to stderr via `structlog`. Supported methods:
 | `session/new` | Creates a session row + `SESSION_CREATED` fact; returns a fresh `session_id`. |
 | `session/load` | Recovers interrupted turns, rehydrates `AgentSession`, replays host events as `session_update` notifications BEFORE returning `LoadSessionResponse`. |
 | `session/resume` | Unstable alias for `session/load`. |
-| `session/prompt` | Appends `TURN_STARTED` + `USER_CONTENT_FINAL`, streams chunks, terminalizes the turn with exactly one of `TURN_COMPLETED` / `TURN_CANCELLED` / `TURN_ERROR`. |
+| `session/prompt` | Appends `TURN_STARTED` + `USER_CONTENT_FINAL`, streams chunks, terminalizes the turn with exactly one of `TURN_COMPLETED` / `TURN_CANCELLED` / `TURN_ERROR`. A failed model turn emits one error message notification and returns `stopReason=end_turn`; it does not also become a JSON-RPC error. |
 | `session/cancel` | Sets the cancel event; the active turn terminates as `TURN_CANCELLED`. |
+
+### Permission grant lifetime
+
+The ACP adapter currently creates an in-memory SQLite grant store for each
+loaded session instance. An `allow_always` grant lasts only for that instance.
+`session/load`, `session/resume`, and process restart rebuild the policy store;
+they do not restore grants from the conversation journal. A later invocation
+may therefore require confirmation again. Journaled authorization decisions
+are audit records, not a durable permission grant store.
 
 ## Restart and recovery behavior
 

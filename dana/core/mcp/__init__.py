@@ -17,6 +17,7 @@ from dana.core.mcp.config import (
     load_mcp_config,
     load_mcp_config_from_dict,
 )
+from dana.core.mcp.correlation import CorrelatingSendStream, correlating_write_stream
 from dana.core.mcp.execution import MCPExecutionAdapter
 from dana.core.mcp.leases import LeaseState, MCPLease, MCPLeaseManager
 from dana.core.mcp.protocol import MCPHandshakeResult, discover_tools, perform_handshake
@@ -29,6 +30,7 @@ __all__ = [
     "MCPCatalogAdapter",
     "MCPCleanupHandler",
     "MCPConfig",
+    "CorrelatingSendStream",
     "MCPExecutionAdapter",
     "MCPHandshakeResult",
     "MCPLease",
@@ -36,6 +38,7 @@ __all__ = [
     "MCPServerConfig",
     "MCPRestoreHandler",
     "LeaseState",
+    "correlating_write_stream",
     "discover_tools",
     "filter_env_for_server",
     "is_mcp_enabled",

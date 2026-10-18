@@ -126,6 +126,24 @@ checkpoints fall back to journal replay; checkpoint failure cannot undo a
 committed turn. Backend checkpoint updates cannot replace a newer sequence
 with an older one.
 
+The terminal journal commit is the authority boundary. A subsequent incremental
+projection failure invalidates derived in-memory state for replay; it must not
+append a conflicting error terminal for an already committed outcome.
+Completed turns also retire their unfinished-turn projection buffers instead
+of carrying historical pending state into later checkpoints.
+
+Interruption observations are temporary context for the next model turn, not
+committed conversation messages. They expire after that turn and are excluded
+from persisted working-context snapshots.
+
+SQLite operations sharing one repository connection are serialized across the
+whole transaction, including cancellation rollback. Reads cannot accidentally
+observe another operation's uncommitted transaction on that connection.
+
+Cancelling the caller task propagates `CancelledError` after owned producer,
+tool, and required terminal-write cleanup. Explicit `session.cancel()` remains
+the host-facing request that yields a normal cancellation terminal event.
+
 Native compacted snapshots retain both the explicit summary and the oldest
 retained message carrying the same compression timestamp. Resume must not
 discard that summary and synthesize differently formatted provider context.

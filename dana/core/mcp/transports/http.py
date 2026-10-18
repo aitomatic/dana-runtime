@@ -15,6 +15,7 @@ import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from dana.core.mcp.correlation import correlating_write_stream
 from dana.core.mcp.protocol import MCPHandshakeResult, call_tool, discover_tools, perform_handshake
 
 
@@ -128,7 +129,7 @@ class MCPHttpTransport:
             self._url,
             http_client=http_client,
         ) as (read_stream, write_stream, _get_session_id):
-            async with ClientSession(read_stream, write_stream) as session:
+            async with ClientSession(read_stream, correlating_write_stream(write_stream)) as session:
                 self._session = session
                 try:
                     yield self

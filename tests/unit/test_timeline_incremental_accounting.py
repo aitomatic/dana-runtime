@@ -13,14 +13,15 @@ Two behaviors are pinned here:
    summarizer ran are retained, and a commit whose projection was replaced
    wholesale (hydration/load) is discarded instead of resurrecting stale history.
 
-3. **Mutable inputs are observed, at the honest cost of a recount.** Whenever
-   caller-mutable state is still shared with the model-facing projection — the
-   public ``native_messages`` getter, a live entry carrying a multimodal content
-   list or tool arguments, or a message object that escaped — the cached total is
-   no longer trusted and each estimate recomputes from live content. A plain
-   string-content, tool-less append stays fully incremental, and a projection
-   rebuilt from decoded journal entries that share nothing mutable restores
-   incrementality.
+3. **Mutable inputs are observed per message, not by re-scanning history.** The
+   timeline shares the caller's mutable content and tool-argument objects (the
+   public ``native_messages`` getter hands out the messages themselves). Each cached
+   message records a snapshot of the state its token count was computed from; a read
+   compares them and re-estimates only the messages that changed, folding their
+   deltas. So a tool-using history — the ordinary agent case — observes an in-place
+   argument edit without re-estimating the retained history, and a text-only history
+   that was never handed out pays nothing at all. A projection rebuilt from decoded
+   journal entries that shares nothing mutable restores the same incrementality.
 """
 
 from __future__ import annotations
@@ -63,16 +64,67 @@ def _user(content: str, *, ts: datetime | None = None) -> TimelineEntry:
 def _recount(tl: CompressedTimeline) -> int:
     """Independent oracle: a from-scratch recount of the live native list.
 
-    Uses the class implementation directly so it stays a true oracle even in the
-    tests that patch the bound method to count invocation.
+    Invokes the estimator as an unbound function so it stays a true oracle even in
+    the tests that patch the *instance* attribute to count invocation — a
+    class-qualified call would still dispatch through the patched method.
     """
-    return CompressedTimeline._estimate_native_messages_list_tokens(tl, tl._native_messages)
+    return sum(CompressedTimeline._estimate_native_message_tokens(tl, message) for message in tl._native_messages)
+
+
+class MessageEstimates:
+    """Count how many single-message estimates a timeline performs inside the block.
+
+    Patches the *instance* attribute the accounting uses, so it observes exactly the
+    per-message re-estimations a read triggers. The oracle (``_recount``) calls the
+    unbound function directly and is therefore not counted.
+    """
+
+    def __init__(self, tl: CompressedTimeline) -> None:
+        self._tl = tl
+        self._original = tl._estimate_native_message_tokens
+        self.count = 0
+
+    def __enter__(self) -> MessageEstimates:
+        def counting(message):
+            self.count += 1
+            return self._original(message)
+
+        self._tl._estimate_native_message_tokens = counting  # type: ignore[method-assign]
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._tl._estimate_native_message_tokens = self._original  # type: ignore[method-assign]
 
 
 def _fill(tl: CompressedTimeline, n: int, prefix: str = "message") -> None:
     """Append ``n`` plainly-sized user turns (long enough to cross a small trigger)."""
     for index in range(n):
         tl.add_entry(_user(f"{prefix} {index} " + "." * 60))
+
+
+def _tool_turn(tl: CompressedTimeline, index: int, *, result: str = "result body") -> dict:
+    """Append one real tool turn (call + result) as the agent loop produces it.
+
+    Returns the caller-held argument dict, which the timeline shares with the
+    message, so a test can mutate it in place exactly as a tool caller would.
+    """
+    arguments = {"query": f"site {index}", "limit": index + 1}
+    tl.add_entry(
+        TimelineEntry(
+            entry_type=TimelineEntryType.TOOL_CALL,
+            content="",
+            tool_calls=[{"id": f"call_{index}", "name": "search_assets", "arguments": arguments}],
+        )
+    )
+    tl.add_entry(TimelineEntry(entry_type=TimelineEntryType.RESOURCE_RESULT, content=result, tool_call_id=f"call_{index}"))
+    return arguments
+
+
+def _fill_tool_history(tl: CompressedTimeline, n: int) -> None:
+    """Append ``n`` tool turns, then a plain user turn: the shape of a real session."""
+    for index in range(n):
+        _tool_turn(tl, index)
+        tl.add_entry(_user(f"follow-up {index} " + "." * 40))
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +169,56 @@ def test_context_swap_keeps_total_equal_to_recount():
     assert sum(1 for m in tl.native_messages if m.metadata.get("ephemeral")) == 1
     # The new context is shorter, so the total must have moved down, not up.
     assert tl.get_native_token_estimate() < baseline + 100
+
+
+def test_temporary_entry_added_through_add_entry_is_retired_by_set_context():
+    """An entry marked ``ephemeral`` is temporary by contract, and its signal now
+    travels to the native mirror. When the next query opens (``set_context``), both
+    representations must drop it together — otherwise the note keeps being sent to
+    the model for the rest of the session while its entry is gone."""
+    tl = _make()
+    _fill(tl, 4)
+    note = TimelineEntry(
+        entry_type=TimelineEntryType.CONTEXT,
+        content="temporary runtime note",
+        metadata={"note": True},
+        ephemeral=True,
+    )
+    tl.add_entry(note)
+    assert any((m.metadata or {}).get("note") for m in tl.native_messages)
+    assert tl.get_native_token_estimate() == _recount(tl)
+
+    tl.set_context({"date": "2026-10-18"})
+
+    assert not any((m.metadata or {}).get("note") for m in tl.native_messages)
+    assert not any((e.metadata or {}).get("note") for e in tl.timeline)
+    # The runtime-context slot itself was replaced, not stacked.
+    assert sum(1 for m in tl.native_messages if m.role == "system") == 1
+    assert tl.get_native_token_estimate() == _recount(tl)
+
+
+def test_non_ephemeral_context_entry_native_leg_survives_set_context():
+    """A non-ephemeral CONTEXT entry is durable caller state, not the runtime
+    context slot ``set_context`` owns. Only the ephemeral ``system`` runtime-context
+    mirror is replaced, so the native leg of such an entry must survive: the
+    session's recovery-note reconciliation depends on it staying model-visible
+    across the ``set_context`` that runs before the recovery request. The inherited
+    entry filter is unchanged and still drops the entry leg; the reconcile owns
+    restoring it."""
+    tl = _make()
+    _fill(tl, 3)
+    durable = TimelineEntry(
+        entry_type=TimelineEntryType.CONTEXT,
+        content="previous turn was interrupted",
+        metadata={"dana_interruption_observation": True},
+    )
+    tl.add_entry(durable)
+    assert tl.get_native_token_estimate() == _recount(tl)
+
+    tl.set_context({"date": "2026-10-18"})
+
+    assert any((m.metadata or {}).get("dana_interruption_observation") for m in tl.native_messages)
+    assert tl.get_native_token_estimate() == _recount(tl)
 
 
 def test_clear_old_entries_keeps_total_equal_to_recount():
@@ -316,6 +418,164 @@ def test_plain_string_appends_stay_incremental():
     assert tl._native_aliasing_risk is False
 
 
+def test_tool_using_history_stays_incremental_across_many_turns():
+    """I14: a tool-using session — the ordinary agent case — must not re-estimate
+    retained history on every turn just because entries carry tool calls."""
+    tl = CompressedTimeline(max_tokens_until_compression=100000, max_recent_entries_to_keep=2)
+    _fill_tool_history(tl, 4)
+    # Warm read: the first estimate after a cold start legitimately recomputes once.
+    assert tl.get_native_token_estimate() == _recount(tl)
+
+    for index in range(20):
+        _tool_turn(tl, 100 + index)
+        with MessageEstimates(tl) as counter:
+            estimate = tl.get_native_token_estimate()
+            tl.needs_compression()
+        assert estimate == _recount(tl)
+        # A full-history rescan would show up as one estimate per retained message.
+        assert counter.count == 0, "a tool-using turn must not re-estimate the retained history"
+
+
+def test_tool_using_history_stays_incremental_when_one_argument_dict_is_edited():
+    """The caller-held argument dict of a tool call is mutated in place mid-session
+    (a tool caller refining its own arguments). Only that one message may be
+    retokenized; the rest of the tool-using history must not be re-estimated."""
+    tl = CompressedTimeline(max_tokens_until_compression=100000, max_recent_entries_to_keep=2)
+    held = _tool_turn(tl, 0)
+    _fill_tool_history(tl, 6)
+    assert tl.get_native_token_estimate() == _recount(tl)
+
+    held["query"] = "refined " + "q" * 500
+
+    with MessageEstimates(tl) as counter:
+        estimate = tl.get_native_token_estimate()
+
+    assert estimate == _recount(tl)
+    assert counter.count == 1, "exactly the edited message is re-estimated, not the history"
+    # A second read with no further edit does no work at all.
+    with MessageEstimates(tl) as counter:
+        estimate = tl.get_native_token_estimate()
+    assert estimate == _recount(tl)
+    assert counter.count == 0
+
+
+def test_escaped_text_history_rebinds_one_message_without_a_history_rescan():
+    """Once the message objects have escaped, every message carries a snapshot, but
+    the ordinary text-only ones stay a pointer compare: rebinding one message's
+    content must re-estimate exactly that message, not the retained history."""
+    tl = CompressedTimeline(max_tokens_until_compression=10**9, max_recent_entries_to_keep=2)
+    held = tl.native_messages  # escape the objects
+    for index in range(30):
+        held.append(NativeMessage(role="user", content=f"turn {index} " + "x" * 40))
+    assert tl.get_native_token_estimate() == _recount(tl)
+
+    with MessageEstimates(tl) as counter:
+        held[0].content = "rewritten " + "y" * 40
+        estimate = tl.get_native_token_estimate()
+
+    assert estimate == _recount(tl)
+    assert counter.count == 1
+
+
+def test_many_messages_after_an_in_place_edit_do_not_all_retokenize():
+    """A long tool history read after one edit folds one delta; the check itself
+    must not re-estimate the messages that did not change."""
+    tl = CompressedTimeline(max_tokens_until_compression=10**9, max_recent_entries_to_keep=2)
+    _fill_tool_history(tl, 40)
+    held = _tool_turn(tl, 999)
+    _fill_tool_history(tl, 40)
+    assert tl.get_native_token_estimate() == _recount(tl)
+
+    held["query"] = "changed " + "z" * 900
+
+    with MessageEstimates(tl) as counter:
+        estimate = tl.get_native_token_estimate()
+
+    assert estimate == _recount(tl)
+    assert counter.count == 1
+
+
+def test_first_native_getter_preserves_unreconciled_argument_mutation():
+    arguments = {"q": "a"}
+    tl = _make()
+    tl.add_entry(
+        TimelineEntry(
+            entry_type=TimelineEntryType.TOOL_CALL,
+            content="",
+            tool_calls=[{"id": "c", "name": "f", "arguments": arguments}],
+        )
+    )
+    previous = tl.get_native_token_estimate()
+    arguments["q"] = "x" * 800
+    _ = tl.native_messages
+    with MessageEstimates(tl) as estimates:
+        assert tl.get_native_token_estimate() == _recount(tl) > previous
+    assert estimates.count == 1
+
+
+def test_removal_reconciles_a_changed_message_before_dropping_its_cache():
+    now = datetime.now()
+    tl = _make()
+    tl.add_entry(_user("abcd", ts=now - timedelta(seconds=2)))
+    tl.add_entry(_user("x" * 400, ts=now))
+    tl.get_native_token_estimate()
+    tl.native_messages[0].content = "x" * 400
+    assert tl.clear_old_entries(now - timedelta(seconds=1)) == 1
+    assert tl.get_native_token_estimate() == _recount(tl) == 100
+
+
+def test_context_rebase_accounts_for_same_length_public_list_replacement():
+    tl = _make()
+    tl.add_entry(_user("abcd"))
+    tl.get_native_token_estimate()
+    tl.native_messages[0] = NativeMessage(role="user", content="x" * 400)
+    tl.set_context({"scope": "cache replacement"})
+    assert tl.get_native_token_estimate() == _recount(tl)
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "key"),
+    [(False, 0, "q"), (1, 1.0, "qqq"), (-0.0, 0.0, "qq"), ([{"q": False}], [{"q": 0}], "q")],
+)
+def test_equal_values_with_different_representations_reconcile_token_counts(before, after, key):
+    arguments = {key: before}
+    tl = _make()
+    tl.add_entry(
+        TimelineEntry(
+            entry_type=TimelineEntryType.TOOL_CALL,
+            content="",
+            tool_calls=[{"id": "c", "name": "f", "arguments": arguments}],
+        )
+    )
+    previous = tl.get_native_token_estimate()
+    arguments[key] = after
+    expected = _recount(tl)
+    assert expected != previous
+    with MessageEstimates(tl) as estimates:
+        assert tl.get_native_token_estimate() == expected
+    assert estimates.count == 1
+
+
+def test_tool_argument_list_payload_edit_is_observed_one_message_at_a_time():
+    """Arguments can nest a list; mutating it in place must also move exactly the
+    one message's estimate."""
+    nested = ["a"]
+    tl = CompressedTimeline(max_tokens_until_compression=10**9, max_recent_entries_to_keep=2)
+    tl.add_entry(
+        TimelineEntry(
+            entry_type=TimelineEntryType.TOOL_CALL,
+            content="",
+            tool_calls=[{"id": "c", "name": "f", "arguments": {"items": nested}}],
+        )
+    )
+    _fill_tool_history(tl, 5)
+    assert tl.get_native_token_estimate() == _recount(tl)
+
+    nested.extend(["b" * 400])
+
+    assert tl.get_native_token_estimate() == _recount(tl)
+
+
 def test_incrementality_resumes_after_loading_decoded_entries():
     """A projection built from decoded dicts is solely owned, so the sticky mark
     must be cleared and the ordinary turn must be incremental again."""
@@ -415,6 +675,72 @@ def test_hydration_and_native_load_install_coherent_totals():
     reloaded = _make()
     reloaded.load_from_entries(native)
     assert reloaded.get_native_token_estimate() == _recount(reloaded)
+
+
+# ---------------------------------------------------------------------------
+# 1b. The load boundary never installs timeline objects into caller data (I15)
+# ---------------------------------------------------------------------------
+
+
+def test_load_with_separate_native_storage_leaves_caller_payload_untouched():
+    """I15: hydrating from a caller's decoded entries/native messages must not write
+    the timeline's internal backlink (a ``TimelineEntry`` object) into their dicts,
+    or a later ``json.dumps`` of their data fails."""
+    entries = [{"timestamp": "2026-10-18T00:00:00", "type": "user_message", "content": "a", "metadata": {"k": "v"}}]
+    native = [{"role": "user", "content": "a", "timestamp": "2026-10-18T00:00:00", "metadata": {"k": "v"}}]
+
+    tl = CompressedTimeline(max_tokens_until_compression=10**6, max_recent_entries_to_keep=2)
+    tl.load_from_entries(entries, native_messages=native)
+
+    # The caller's own payloads keep exactly the keys they had, and stay serializable.
+    assert entries[0]["metadata"] == {"k": "v"}
+    assert native[0]["metadata"] == {"k": "v"}
+    assert json.dumps(entries)
+    assert json.dumps(native)
+
+    # The live projection still carries the internal backlink it needs for compaction.
+    assert tl.native_messages[0].metadata[NATIVE_SOURCE_ENTRY_KEY] is tl.timeline[0]
+
+
+def test_load_from_native_format_leaves_caller_payload_untouched():
+    """The native-format load path decodes and tags by the same rule; the caller's
+    dicts must be untouched and remain serializable."""
+    native = [{"role": "user", "content": "a", "timestamp": "2026-10-18T00:00:00", "metadata": {"k": "v"}}]
+
+    tl = CompressedTimeline(max_tokens_until_compression=10**6, max_recent_entries_to_keep=2)
+    tl.load_from_entries(native)
+
+    assert native[0]["metadata"] == {"k": "v"}
+    assert json.dumps(native)
+    assert tl.native_messages[0].metadata[NATIVE_SOURCE_ENTRY_KEY] is tl.timeline[0]
+
+
+def test_entry_from_dict_does_not_alias_the_caller_metadata_mapping():
+    """``TimelineEntry.from_dict`` must copy the metadata mapping, so a projection
+    built from decoded entries cannot reach back into the caller's dict."""
+    data = {"type": "user_message", "content": "a", "timestamp": "2026-10-18T00:00:00", "metadata": {"k": "v"}}
+
+    entry = TimelineEntry.from_dict(data)
+    entry.metadata["added"] = 1
+
+    assert data["metadata"] == {"k": "v"}
+    assert json.dumps(data)
+
+
+def test_caller_metadata_survives_a_snapshot_round_trip():
+    """The full journal-shaped round trip a session performs: decode entries, load
+    them, save a snapshot, and the caller's original decoded payload must still be
+    plain JSON."""
+    decoded = [
+        {"type": "user_message", "content": "hello", "timestamp": "2026-10-18T00:00:00", "metadata": {"reasoning_items": [{"id": "r"}]}},
+        {"type": "agent_response", "content": "hi", "timestamp": "2026-10-18T00:00:01", "metadata": {}},
+    ]
+
+    tl = CompressedTimeline(max_tokens_until_compression=10**6, max_recent_entries_to_keep=2)
+    tl.load_from_entries(decoded)
+
+    assert json.dumps(decoded), "the caller's decoded journal must still serialize"
+    assert all(NATIVE_SOURCE_ENTRY_KEY not in entry["metadata"] for entry in decoded)
 
 
 # ---------------------------------------------------------------------------

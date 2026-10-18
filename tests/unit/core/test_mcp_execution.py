@@ -17,6 +17,7 @@ from mcp.shared.message import SessionMessage
 import pytest
 
 from dana.core.mcp.cancellation import MCPCancellationTracker
+from dana.core.mcp.correlation import correlating_write_stream
 from dana.core.mcp.execution import MCPExecutionAdapter
 from dana.core.mcp.protocol import call_tool
 
@@ -160,7 +161,7 @@ async def _memory_mcp():
     incoming, reader = anyio.create_memory_object_stream(10)
     writer, outgoing = anyio.create_memory_object_stream(10)
     tracker = MCPCancellationTracker()
-    async with ClientSession(reader, writer) as session:
+    async with ClientSession(reader, correlating_write_stream(writer)) as session:
         session._tool_output_schemas["same"] = None
         transport = SimpleNamespace(session=session, call_tool=lambda name, args: call_tool(session, name, args))
         yield session, MCPExecutionAdapter(transport, tracker), tracker, incoming, outgoing

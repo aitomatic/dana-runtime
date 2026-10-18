@@ -225,6 +225,104 @@ class TestGeminiStream:
                 pass
 
 
+class TestGeminiStreamTeardown:
+    """S5: an abandoned SDK stream must be closed, both on cancel and on error."""
+
+    @pytest.mark.asyncio
+    async def test_cancellation_closes_the_sdk_stream(self, provider):
+        closed = {"n": 0}
+
+        class _SdkStream:
+            def __init__(self):
+                self._n = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self._n += 1
+                if self._n > 4:
+                    raise StopAsyncIteration
+                return _make_stream_chunk([_make_text_part(f"c{self._n}")])
+
+            async def aclose(self):
+                closed["n"] += 1
+
+        provider.client.aio.models.generate_content_stream = AsyncMock(return_value=_SdkStream())
+
+        agen = provider.stream([LLMMessage(role="user", content="hi")])
+        first = await agen.__anext__()
+        assert first.type == "text_delta"
+        await agen.aclose()
+
+        assert closed["n"] == 1, "a consumer that stops early must release the SDK stream"
+
+    @pytest.mark.asyncio
+    async def test_mid_stream_error_closes_the_sdk_stream(self, provider):
+        closed = {"n": 0}
+
+        class _SdkStream:
+            def __init__(self):
+                self._n = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self._n += 1
+                if self._n == 1:
+                    return _make_stream_chunk([_make_text_part("start")])
+                raise RuntimeError("Stream interrupted")
+
+            async def aclose(self):
+                closed["n"] += 1
+
+        provider.client.aio.models.generate_content_stream = AsyncMock(return_value=_SdkStream())
+
+        with pytest.raises(RuntimeError, match="Stream interrupted"):
+            async for _ in provider.stream([LLMMessage(role="user", content="hi")]):
+                pass
+
+        assert closed["n"] == 1, "teardown must not mask the error, but must still close"
+
+    @pytest.mark.asyncio
+    async def test_sync_close_shape_is_supported(self, provider):
+        """google-genai gives an async generator; a sync ``close()`` SDK shape works too."""
+        closed = {"n": 0}
+
+        class _SdkStream:
+            def __init__(self):
+                self._n = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self._n += 1
+                if self._n > 1:
+                    raise StopAsyncIteration
+                return _make_stream_chunk([_make_text_part("only")], finish_reason="STOP")
+
+            def close(self):
+                closed["n"] += 1
+
+        provider.client.aio.models.generate_content_stream = AsyncMock(return_value=_SdkStream())
+
+        chunks = [c async for c in provider.stream([LLMMessage(role="user", content="hi")])]
+
+        assert chunks[-1].type == "response"
+        assert closed["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_request_failure_before_a_stream_exists_is_not_retried_into_a_close(self, provider):
+        """No stream object: teardown must be a no-op, not an AttributeError."""
+        provider.client.aio.models.generate_content_stream = AsyncMock(side_effect=RuntimeError("connect failed"))
+
+        with pytest.raises(RuntimeError, match="connect failed"):
+            async for _ in provider.stream([LLMMessage(role="user", content="hi")]):
+                pass
+
+
 class TestGeminiSdkFinishReasons:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("streaming", [False, True])

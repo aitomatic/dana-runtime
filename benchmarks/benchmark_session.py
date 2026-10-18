@@ -11,9 +11,9 @@ declared allowlist raise.
 
 Usage
 -----
-    uv run --no-sync python scripts/benchmark_session.py --output results.json
-    uv run --no-sync python scripts/benchmark_session.py --mode isolated --output -
-    uv run --no-sync python scripts/benchmark_session.py --repetitions 100 --cases request_fidelity_compressed --output -
+    uv run --no-sync python benchmarks/benchmark_session.py --output results.json
+    uv run --no-sync python benchmarks/benchmark_session.py --mode isolated --output -
+    uv run --no-sync python benchmarks/benchmark_session.py --repetitions 100 --cases request_fidelity_compressed --output -
 
 What it measures
 ----------------
@@ -2742,7 +2742,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     GUARD.install()
     try:
         document: dict[str, Any] = {
-            "script": "scripts/benchmark_session.py",
+            "script": "benchmarks/benchmark_session.py",
             "script_version": SCRIPT_VERSION,
             "generated_utc": datetime.now(UTC).isoformat(),
             "environment": capture_environment(),

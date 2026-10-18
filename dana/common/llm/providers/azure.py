@@ -17,6 +17,12 @@ class AzureProvider(OpenAICompatibleProvider):
     # Older versions return HTTP 400 BadRequest for /openai/responses.
     _RESPONSES_API_MIN_DATE = "2025-03-01"
 
+    # Earliest api-version whose Chat Completions stream accepts
+    # ``stream_options={"include_usage": True}``. Older versions (including the
+    # default here) reject the unknown field with HTTP 400, and a malformed request
+    # is never retried, so the flag is not sent at all instead of being probed.
+    _STREAM_USAGE_MIN_DATE = "2024-08-01"
+
     # Env var operators use to dial reasoning effort for Azure deployments.
     # Valid values: "minimal" | "low" | "medium" | "high".
     _REASONING_EFFORT_ENV_VAR = "AZURE_THINKING_EFFORT"
@@ -40,6 +46,20 @@ class AzureProvider(OpenAICompatibleProvider):
         if not version or len(version) < 10:
             return False
         return version[:10] >= self._RESPONSES_API_MIN_DATE
+
+    def _supports_stream_usage(self) -> bool:
+        """Azure rejects ``stream_options`` before the 2024-08-01-preview versions.
+
+        The default ``api_version`` here (``2024-02-15-preview``) predates the field,
+        so a Chat Completions stream would 400 on every request and never be retried
+        (a malformed request is permanent by design). The version is the authoritative
+        wire contract, so it decides the request instead of a probe: old deployments
+        stream without a usage frame, new ones keep full accounting.
+        """
+        version = getattr(self, "api_version", None)
+        if not version or len(version) < 10:
+            return False
+        return version[:10] >= self._STREAM_USAGE_MIN_DATE
 
     def __init__(
         self, api_key: str | None = None, model: str = "gpt-35-turbo", base_url: str | None = None, api_version: str | None = None

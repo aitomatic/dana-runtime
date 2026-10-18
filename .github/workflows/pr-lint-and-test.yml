@@ -1,11 +1,10 @@
 # Lint + test on pull requests to protected branches
-# Skips live and deep tests — those require API keys and run locally
+# Skips live and deep tests: those require API keys and run locally.
 #
 # Two lanes:
-#   * PRs to develop + manual dispatch  → fast lane, no postgres service,
-#     postgres parametrizations deselected (-k "not postgres")
-#   * PRs to master                     → full lane, real postgres:16 service,
-#     session-journal contract exercised against both backends
+#   * PRs to develop + manual dispatch: fast feedback without PostgreSQL.
+#   * Every PR and manual dispatch: real postgres:16 service, including
+#     session-journal and checkpoint contracts against both backends.
 
 name: PR Lint & Test
 
@@ -55,8 +54,7 @@ jobs:
         run: uv run pytest tests/ -m "not live and not deep" -k "not postgres" -v --maxfail=10 --tb=short --durations=10
 
   lint-and-test-postgres:
-    # Full lane: only PRs into master get the real-database contract
-    if: github.event_name == 'pull_request' && github.base_ref == 'master'
+    # Required storage coverage on develop as well as master and manual runs.
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -101,3 +99,31 @@ jobs:
           DANA_USE_REAL_LLM: "false"
           DANA_TEST_POSTGRES_DSN: postgresql://postgres:postgres@localhost:5432/postgres
         run: uv run pytest tests/ -m "not live and not deep" -v --maxfail=10 --tb=short --durations=10
+
+      - name: Smoke benchmark entry points (no paid requests)
+        env:
+          DANA_MOCK_LLM: "true"
+          DANA_USE_REAL_LLM: "false"
+          LANGFUSE_ENABLED: "false"
+          LANGSMITH_TRACING: "false"
+          DANA_LANGSMITH_ENABLED: "0"
+        run: |
+          uv run --no-sync python benchmarks/benchmark_startup.py --repetitions 1 --output /tmp/benchmark-startup.json
+          uv run --no-sync python benchmarks/benchmark_session.py --mode isolated --cases fail_closed_guard,warm_no_tool_turns --repetitions 2 --output /tmp/benchmark-session.json
+          uv run --no-sync python benchmarks/benchmark_history_delta.py --repetitions 1 --output /tmp/benchmark-history.json
+          uv run --no-sync python benchmarks/benchmark_tools_history.py --lanes history --sizes 10 --repetitions 1 --output /tmp/benchmark-tools-history.json
+          uv run --no-sync python benchmarks/benchmark_live.py --help
+          uv run --no-sync python - <<'PY'
+          import json
+          from pathlib import Path
+          def result(name):
+              return json.loads(Path(f"/tmp/benchmark-{name}.json").read_text())
+          assert all(row["exit_code"] == 0 and row["help_present"] for row in result("startup")["rows"])
+          session = result("session")
+          assert all(case["status"] == "ok" for case in session["lanes"]["isolated"]["cases"].values())
+          assert not session["known_failures"], session["known_failures"]
+          assert session["lanes"]["isolated"]["cases"]["isolated/warm_no_tool_turns"]["observation"]["terminal_fact_types"] == ["TURN_COMPLETED"]
+          assert all(case["new_turn_context_correct"] and case["reopen_context_equal"] for case in result("history")["cases"])
+          assert not [failure for failure in result("tools-history")["known_failures"] if failure["severity"] == "defect"], result("tools-history")["known_failures"]
+          assert result("tools-history")["checks_summary"]["fail"] == 0, result("tools-history")["checks_summary"]
+          PY

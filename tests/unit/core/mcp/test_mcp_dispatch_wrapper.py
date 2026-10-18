@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -23,6 +24,7 @@ from dana.core.mcp.config import MCPConfig, MCPServerConfig, load_mcp_config_fro
 from dana.core.mcp.dispatch_wrapper import MCPDispatchResource, MCPWiring, build_mcp_dispatch_resource
 from dana.core.mcp.execution import MCPExecutionAdapter
 from dana.core.mcp.leases import LeaseState
+from dana.core.tool.native_catalog import build_native_tool_catalog
 from dana.core.tool.tool_executor import ToolExecutor
 
 
@@ -49,6 +51,66 @@ def _mock_transport_with_tools(tools):
 
     transport.connect = connect
     return transport
+
+
+@pytest.mark.asyncio
+async def test_configured_namespaces_execute_real_server_tools_and_close_nested_contexts(tmp_path):
+    server = tmp_path / "inventory_server.py"
+    server.write_text(
+        "import asyncio, sys\n"
+        "from mcp.server.fastmcp import FastMCP\n"
+        "from mcp.types import ToolAnnotations\n"
+        "app = FastMCP('synthetic inventory')\n"
+        "inventory = {'alpha': {'ahu-1': 'running'}, 'beta': {'ahu-1': 'offline'}}\n"
+        "gate = asyncio.Event()\n"
+        "arrivals = 0\n"
+        "@app.tool()\n"
+        "def operating_state(asset_id: str) -> str:\n"
+        "    return inventory[sys.argv[1]][asset_id]\n"
+        "@app.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False))\n"
+        "async def await_peer() -> str:\n"
+        "    global arrivals\n"
+        "    arrivals += 1\n"
+        "    if arrivals == 2:\n"
+        "        gate.set()\n"
+        "    await asyncio.wait_for(gate.wait(), 3)\n"
+        "    return 'peer observed'\n"
+        "app.run(transport='stdio')\n"
+    )
+    wiring = await build_mcp_dispatch_resource(
+        MCPConfig(
+            enabled=True,
+            servers=[MCPServerConfig(name=name, command=sys.executable, args=[str(server), name]) for name in ("alpha", "beta")],
+        ),
+    )
+    assert wiring is not None
+    try:
+        assert await wiring.resource.call("alpha:operating_state", {"asset_id": "ahu-1"}) == "running"
+        assert await wiring.resource.call("beta:operating_state", {"asset_id": "ahu-1"}) == "offline"
+        result = await wiring.dispatch_map["alpha:operating_state"]({"asset_id": "ahu-1"}, "synthetic-call")
+        assert result["success"] is True
+        assert result["result"] == "running"
+        assert result["tool_call_id"] == "synthetic-call"
+        catalog = build_native_tool_catalog(
+            wiring.mcp_schemas,
+            mcp_names=wiring.mcp_names,
+            mcp_effects=wiring.mcp_effects,
+        )
+        executor = ToolExecutor(
+            effect_catalog_getter=lambda: catalog,
+            mcp_dispatch_getter=lambda: wiring.dispatch_map,
+        )
+        try:
+            results = await executor.execute_tools_async(
+                object(),
+                [{"function": "alpha:await_peer", "arguments": {}, "tool_call_id": identity} for identity in ("first-read", "second-read")],
+            )
+            assert all(result["success"] is True for result in results)
+            assert [result["result"] for result in results] == ["peer observed", "peer observed"]
+        finally:
+            await executor.aclose(wait_for_offload=True)
+    finally:
+        await wiring.close()
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +228,6 @@ class TestToolExecutorDispatch:
         assert results[0]["success"] is True
         assert results[0]["result"] == "hello world"
         assert results[0]["tool_call_id"] == "tc-1"
-        adapter._transport.call_tool.assert_awaited_once_with("fs:greet", {"name": "World"})
 
     @pytest.mark.asyncio
     async def test_unknown_function_does_not_dispatch_to_mcp(self):
@@ -512,7 +573,6 @@ class TestPerToolMcpUx:
         assert results[0]["success"] is True
         assert results[0]["result"] == "hello world"
         assert results[0]["tool_call_id"] == "tc-1"
-        adapter._transport.call_tool.assert_awaited_once_with("fs:greet", {"name": "World"})
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("is_error", [False, True])
@@ -547,7 +607,6 @@ class TestPerToolMcpUx:
                 assert result["tool_call_id"] == "tc-remote"
                 assert result["_effect_unknown"] is is_error
                 assert result["type"] == "mcp"
-            adapter.call_tool.assert_awaited_once_with("fs:greet", {}, "tc-remote")
         finally:
             executor.close()
 
@@ -726,6 +785,7 @@ class TestPerToolMcpUx:
         mock_wiring = MagicMock(spec=MCPWiring)
         mock_wiring.mcp_schemas = [{"type": "function", "function": {"name": "fs:greet", "parameters": {"type": "object"}}}]
         mock_wiring.mcp_names = frozenset({"fs:greet"})
+        mock_wiring.mcp_effects = {}
         mock_wiring.dispatch_map = {"fs:greet": _make_mcp_dispatcher(adapter, "fs:greet")}
         mock_wiring.close = AsyncMock()
 
@@ -750,7 +810,6 @@ class TestPerToolMcpUx:
             [{"function": "fs:greet", "tool_call_id": "tc-1", "arguments": {"name": "World"}}],
         )
         assert results[0]["success"] is True and results[0]["result"] == "hello world"
-        adapter._transport.call_tool.assert_awaited_once_with("fs:greet", {"name": "World"})
         await repo.close()
 
     @pytest.mark.asyncio

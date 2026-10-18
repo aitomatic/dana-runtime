@@ -108,10 +108,11 @@ class TestStreamRetrySafety:
 
 
 class TestStreamRequestControls:
-    """Streaming must send the same caller policy the non-streaming path sends."""
+    """Streaming must send the same caller policy the non-streaming path sends,
+    except for the runtime default temperature, which streaming omits."""
 
     @pytest.mark.asyncio
-    async def test_stream_forwards_temperature_and_max_tokens(self):
+    async def test_stream_forwards_explicit_temperature_and_max_tokens(self):
         llm = _StreamingLLM(fail_after=0, exc=ProviderError("x"), succeed_on_attempt=1)
         caller = LLMCaller(
             llm=llm,
@@ -126,7 +127,7 @@ class TestStreamRequestControls:
             pass
 
         sent = llm.sent_kwargs[0]
-        assert sent["temperature"] == 0.35
+        assert sent["temperature"] == 0.35, "an explicit non-default temperature must reach the wire"
         assert sent["max_tokens"] == 777
         assert sent["json_mode"] is False
         assert llm.sent_tools[0] is None
@@ -142,6 +143,33 @@ class TestStreamRequestControls:
         sent = llm.sent_kwargs[0]
         assert "temperature" not in sent
         assert "max_tokens" not in sent
+
+    @pytest.mark.asyncio
+    async def test_runtime_default_temperature_is_not_sent_on_the_stream_path(self):
+        """I11: the runtime's own temperature=0 default must not be a wire policy.
+
+        o3/o4 on Responses and Azure gpt-5 deployments not named gpt-5* reject a
+        sampling parameter with a 400, and Anthropic/Gemini silently lose their
+        provider default. Only an explicit non-default value is a caller choice.
+        """
+        llm = _StreamingLLM(fail_after=0, exc=ProviderError("x"), succeed_on_attempt=1)
+        caller = LLMCaller(llm=llm, temperature=0)
+
+        async for _ in caller.call_llm_stream([LLMMessage(role="user", content="hi")]):
+            pass
+
+        assert "temperature" not in llm.sent_kwargs[0]
+
+    @pytest.mark.asyncio
+    async def test_default_temperature_still_reaches_the_nonstream_path(self):
+        """The non-streaming wire shape is unchanged by this PR."""
+        llm = MagicMock()
+        llm.chat_response_sync.return_value = _response()
+        caller = LLMCaller(llm=llm, temperature=0)
+
+        caller.call_llm([])
+
+        assert llm.chat_response_sync.call_args.kwargs["temperature"] == 0
 
 
 class TestBoundedRetryAndDeadline:
@@ -330,7 +358,12 @@ class TestActualOperationIsBudgetBound:
 
     @pytest.mark.asyncio
     async def test_stalled_stream_after_a_delta_times_out_without_replay(self):
-        """A stream that stalls mid-turn must time out, not hang or re-issue."""
+        """A stream that stops delivering mid-turn must time out and never be re-issued.
+
+        The wait after the first frame is the idle bound, not the request deadline
+        (a healthy but slow stream may legitimately run past it), so the bound is
+        pinned here instead of waiting out the default.
+        """
 
         class _StallingLLM:
             def __init__(self):
@@ -345,9 +378,10 @@ class TestActualOperationIsBudgetBound:
         caller = LLMCaller(llm=llm, stream_max_retries=3, deadline_seconds=0.25)
 
         seen: list[str] = []
-        with pytest.raises(LLMTimeoutError):
-            async for chunk in caller.call_llm_stream([LLMMessage(role="user", content="hi")]):
-                seen.append(chunk.content)
+        with patch.object(LLMCaller, "_stream_idle_timeout", return_value=0.1):
+            with pytest.raises(LLMTimeoutError):
+                async for chunk in caller.call_llm_stream([LLMMessage(role="user", content="hi")]):
+                    seen.append(chunk.content)
 
         assert seen == ["partial"]
         assert llm.attempts == 1, "output was already delivered, so it must not be replayed"
@@ -372,6 +406,114 @@ class TestActualOperationIsBudgetBound:
         with pytest.raises(LLMTimeoutError):
             async for _ in caller.call_llm_stream([LLMMessage(role="user", content="hi")]):
                 pass
+        assert time.monotonic() - start < 2.0
+
+
+class TestStreamBounds:
+    """I10/I12: one stalled attempt must stay retriable, a healthy stream must not
+    be cut off mid-turn."""
+
+    @pytest.mark.asyncio
+    async def test_stalled_attempt_is_capped_by_the_provider_timeout(self):
+        """A hung connection must not eat the whole 900s budget.
+
+        The per-attempt wait is min(remaining budget, provider timeout), so the
+        configured stream retry still has budget to run once the stalled attempt
+        is cut off.
+        """
+
+        class _HangingThenSucceedingLLM:
+            def __init__(self):
+                self.attempts = 0
+
+            async def stream(self, messages, tools=None, **kwargs):
+                self.attempts += 1
+                if self.attempts == 1:
+                    await asyncio.Event().wait()  # never yields a frame
+                yield LLMStreamChunk(type="text_delta", content="recovered")
+
+        llm = _HangingThenSucceedingLLM()
+        caller = LLMCaller(llm=llm, stream_max_retries=1, base_delay=0.0, deadline_seconds=5.0)
+
+        seen: list[str] = []
+        with patch.object(LLMCaller, "_provider_timeout", return_value=0.3):
+            async for chunk in caller.call_llm_stream([LLMMessage(role="user", content="hi")]):
+                seen.append(chunk.content)
+
+        assert seen == ["recovered"], "the stalled attempt must be cut off, not consume the budget"
+        assert llm.attempts == 2, "the retry must run inside the remaining budget"
+
+    def test_attempt_timeout_never_exceeds_the_provider_timeout(self):
+        """min(remaining, provider timeout); an exhausted budget is not inflated."""
+        caller = LLMCaller(llm=MagicMock(), deadline_seconds=900.0)
+
+        assert caller._provider_timeout(caller._llm) == float(LLMProvider.DEFAULT_TIMEOUT_SECONDS)
+        assert caller._attempt_timeout(0.0, caller._llm) is None, "disabled budget keeps the provider timeout"
+
+        deadline = time.monotonic() + 10_000.0
+        assert caller._attempt_timeout(deadline, caller._llm) == float(LLMProvider.DEFAULT_TIMEOUT_SECONDS)
+
+        soon = time.monotonic() + 5.0
+        remaining = caller._attempt_timeout(soon, caller._llm)
+        assert remaining is not None and 0 < remaining <= 5.0, "a short budget must not be rounded up"
+
+    @pytest.mark.asyncio
+    async def test_healthy_stream_outlives_the_request_deadline(self):
+        """After the first frame the deadline no longer applies: only idleness does."""
+        frames = 3
+
+        class _SlowButHealthyLLM:
+            async def stream(self, messages, tools=None, **kwargs):
+                # First frame lands inside the deadline, then each later gap is
+                # shorter than the idle bound while their sum far exceeds the
+                # logical-request deadline, which must not cut the stream off.
+                yield LLMStreamChunk(type="text_delta", content="f0")
+                for i in range(1, frames):
+                    await asyncio.sleep(0.05)
+                    yield LLMStreamChunk(type="text_delta", content=f"f{i}")
+                yield LLMStreamChunk(type="response", response=_response("".join(f"f{i}" for i in range(frames))))
+
+        caller = LLMCaller(llm=_SlowButHealthyLLM(), deadline_seconds=0.05)
+        start = time.monotonic()
+        chunks = [c async for c in caller.call_llm_stream([LLMMessage(role="user", content="hi")])]
+        elapsed = time.monotonic() - start
+
+        assert [c.content for c in chunks[:-1]] == ["f0", "f1", "f2"]
+        assert chunks[-1].type == "response"
+        assert elapsed > 0.05, "the stream legitimately ran past the deadline while making progress"
+
+    @pytest.mark.asyncio
+    async def test_stream_that_stops_delivering_after_the_deadline_still_times_out(self):
+        """Idle frames are bounded even when the request deadline has long passed."""
+
+        class _StallingLLM:
+            async def stream(self, messages, tools=None, **kwargs):
+                yield LLMStreamChunk(type="text_delta", content="first")
+                await asyncio.Event().wait()
+
+        caller = LLMCaller(llm=_StallingLLM(), stream_max_retries=0, deadline_seconds=0.05)
+        with patch.object(LLMCaller, "_stream_idle_timeout", return_value=0.1):
+            start = time.monotonic()
+            with pytest.raises(LLMTimeoutError):
+                async for _ in caller.call_llm_stream([LLMMessage(role="user", content="hi")]):
+                    pass
+        assert time.monotonic() - start < 2.0
+
+    @pytest.mark.asyncio
+    async def test_first_frame_is_bounded_even_with_the_budget_disabled(self):
+        """No deadline does not mean no bound: the first frame still cannot hang."""
+
+        class _NeverStartsLLM:
+            async def stream(self, messages, tools=None, **kwargs):
+                await asyncio.Event().wait()
+                yield  # pragma: no cover
+
+        caller = LLMCaller(llm=_NeverStartsLLM(), stream_max_retries=0, deadline_seconds=0)
+        start = time.monotonic()
+        with patch.object(LLMCaller, "_stream_idle_timeout", return_value=0.1):
+            with pytest.raises(LLMTimeoutError):
+                async for _ in caller.call_llm_stream([LLMMessage(role="user", content="hi")]):
+                    pass
         assert time.monotonic() - start < 2.0
 
     @pytest.mark.asyncio

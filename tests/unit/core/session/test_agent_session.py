@@ -654,10 +654,28 @@ async def test_unresolved_permission_prevents_effect_without_native_catalog(repo
     session._policy_evaluator = Evaluator()
     try:
         await _collect(session.prompt([TextBlock(text="attempt the mutation")]))
+        # The effect never happens, and no "started" fact is ever recorded.
         assert not effect_path.exists()
         facts = await repo.read_facts(scope, "sess-1")
         assert FactType.TOOL_STARTED not in [fact.fact_type for fact in facts]
-        assert _terminal_fact_types(facts) == [FactType.TURN_ERROR]
+        # I5: the refusal is recoverable. The denied call carries exactly one
+        # TOOL_FAILURE(policy_block) result and the turn completes, so the model
+        # can adapt instead of losing the turn to a TURN_ERROR.
+        failures = [fact for fact in facts if fact.fact_type is FactType.TOOL_FAILURE]
+        assert len(failures) == 1
+        # DENY surfaces the evaluator reason; NEEDS_PROMPT with no host callback
+        # fails closed on the interactive path. Both are a truthful refusal.
+        expected_reason = "permission required" if decision_name == "DENY" else "interactive permission is unavailable"
+        assert expected_reason in str(failures[0].payload["result"])
+        denied = [fact for fact in facts if fact.fact_type is FactType.TOOL_AUTHORIZED_OR_DENIED]
+        assert [fact.payload["authorized"] for fact in denied] == [False]
+        assert _terminal_fact_types(facts) == [FactType.TURN_COMPLETED]
+        # The model receives the truthful blocked outcome for its call id.
+        results = agent.results
+        assert len(results) == 1
+        assert results[0]["type"] == "policy_block"
+        assert results[0]["success"] is False
+        assert results[0]["tool_call_id"] == "unauthorized-effect"
     finally:
         await session.aclose()
         await executor.aclose()

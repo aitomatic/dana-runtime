@@ -17,6 +17,7 @@ from mcp.shared.message import SessionMessage
 import pytest
 
 from dana.core.mcp.cancellation import MCPCancellationTracker
+from dana.core.mcp.correlation import correlating_write_stream
 from dana.core.mcp.execution import MCPExecutionAdapter
 from dana.core.mcp.protocol import call_tool
 from dana.core.tool.catalog import ToolCatalog, ToolCatalogEntry, ToolIdentity
@@ -106,7 +107,7 @@ class TestExecutionEngineMCP:
                         )
                         return
 
-        async with ClientSession(reader, writer) as session:
+        async with ClientSession(reader, correlating_write_stream(writer)) as session:
             session._tool_output_schemas["filesystem:read_file"] = None
             transport = SimpleNamespace(session=session, call_tool=lambda name, args: call_tool(session, name, args))
             tracker = MCPCancellationTracker()
@@ -157,7 +158,7 @@ class TestExecutionEngineMCP:
             if use_sdk:
                 incoming, reader = anyio.create_memory_object_stream(10)
                 writer, outgoing = anyio.create_memory_object_stream(10)
-                session = await stack.enter_async_context(ClientSession(reader, writer))
+                session = await stack.enter_async_context(ClientSession(reader, correlating_write_stream(writer)))
                 session._tool_output_schemas["filesystem:read_file"] = None
 
                 async def remote():
@@ -213,7 +214,7 @@ class TestExecutionEngineMCP:
                 assert engine._in_flight == {}
                 assert not engine._cancel_tasks
                 assert tracker.tracked_count == tracker.cancelled_count == 0
-                assert adapter._pending_cancellations == {}
+                assert adapter.pending_cancellation_count == 0
             finally:
                 if server is not None:
                     server.cancel()

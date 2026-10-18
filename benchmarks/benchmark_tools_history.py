@@ -6,9 +6,9 @@ Three deliberately narrow lanes against real runtime objects (no runtime edits, 
 benchmark framework, no mocks of the objects under test):
 
 ``tools`` lane
-    Real ``ToolExecutor`` (dana/core/tool/tool_executor.py:42) with a deterministic
+    Real ``ToolExecutor`` (dana/core/tool/tool_executor.py) with a deterministic
     synthetic I/O resource registered through the ``@named_tool``-style registry
-    (``{tool_name: (obj, method_name)}`` - dana/core/runtime/base.py:430-457).
+    (``{tool_name: (obj, method_name)}`` in dana/core/runtime/base.py).
     Cases: independent synchronous and asynchronous I/O at N=1,3,8,32 through both
     executor entry points (``execute_tools`` and ``execute_tools_async``), an
     event-loop heartbeat, exact ``tool_call_id``/result checks, ordered conflicting
@@ -17,7 +17,7 @@ benchmark framework, no mocks of the objects under test):
 
 ``subagents`` lane
     Real nested-agent fan-out at N=1,4,16: the real ``TaskResource.task`` tool
-    (dana/core/resource/task_resource.py:195) dispatching real child ``STARAgent``
+    (dana/core/resource/task_resource.py) dispatching real child ``STARAgent``
     instances (production default runtime/codec, real local timeline repositories)
     through the real ``ToolExecutor`` async batch. Only the provider WIRE is
     substituted (a deterministic in-process ``LLMProvider``), so no network or
@@ -27,10 +27,10 @@ benchmark framework, no mocks of the objects under test):
     be inside their provider call at once.
 
 ``history`` lane
-    Real SQLite journal (dana/core/session/journal/sqlite.py:98), real
-    ``ConversationProjector`` (dana/core/session/projections/conversation.py:95) and
-    the real ``AgentSession`` prepare path (``load`` → ``_prepare_agent``,
-    dana/core/session/agent_session.py:409,771) at 10/100/1000/5000 prior turns.
+    Real SQLite journal (dana/core/session/journal/sqlite.py), real
+    ``ConversationProjector`` (dana/core/session/projections/conversation.py) and
+    the real ``AgentSession`` prepare path (``load`` -> ``_prepare_agent`` in
+    dana/core/session/agent_session.py) at 10/100/1000/5000 prior turns.
     Phases are measured separately: read+decode (``read_facts``), delta read
     (``after_sequence``), project, hydrate (``_populate_timeline``), prepare
     (``_prepare_agent``), and model working set
@@ -47,8 +47,8 @@ temporary directories are used; every temporary resource (SQLite connections,
 asyncio tasks, threads) is closed/removed explicitly and the cleanup is reported.
 
 Usage:
-    uv run --no-sync python scripts/benchmark_tools_history.py --output /tmp/bench.json --repetitions 100
-    uv run --no-sync python scripts/benchmark_tools_history.py --output /tmp/bench_sub.json --lanes subagents --repetitions 4
+    uv run --no-sync python benchmarks/benchmark_tools_history.py --output /tmp/bench.json --repetitions 100
+    uv run --no-sync python benchmarks/benchmark_tools_history.py --output /tmp/bench_sub.json --lanes subagents --repetitions 4
 """
 
 from __future__ import annotations
@@ -106,6 +106,7 @@ from dana.core.session.models import FactType, JournalFact, NewJournalFact, Owne
 from dana.core.session.projections.conversation import ConversationProjector  # noqa: E402
 from dana.core.timeline.compressed_timeline import CompressedTimeline  # noqa: E402
 from dana.core.timeline.timeline import Timeline  # noqa: E402
+from dana.core.tool.offload import blocking_io  # noqa: E402
 from dana.core.tool.tool_executor import ToolExecutor  # noqa: E402
 from dana.repositories.local_file_repository import LocalTimelineRepository  # noqa: E402
 from dana.repositories.repository_factory import RepositoryFactory, RepositoryType  # noqa: E402
@@ -279,9 +280,12 @@ class ToolIoFixture:
     ``sync_*`` methods block the calling thread (``time.sleep``); ``async_*``
     methods await (``asyncio.sleep``). ``*_append`` methods mutate shared state so
     ordering and permission-before-effect can be observed exactly.
+    Sync fixtures explicitly opt into worker execution. Their unknown effect
+    metadata remains conservative: this driver does not silently bypass effect
+    ordering to manufacture concurrent-tool gains.
 
     Methods carry Google-style docstrings because
-    ``Misc.parse_method_signature`` (dana/common/utils/misc.py:202) raises on
+    ``Misc.parse_method_signature`` (dana/common/utils/misc.py) raises on
     methods without an ``Args:`` section, which makes
     ``validate_and_cast_method_arguments`` return the arguments unchanged. Both
     shapes are exercised: the documented methods for the normal path, and
@@ -293,6 +297,7 @@ class ToolIoFixture:
     def __init__(self) -> None:
         self.effects: list[dict[str, Any]] = []
 
+    @blocking_io
     def sync_io(self, token: str, delay_ms: int = 0) -> dict[str, Any]:
         """Synthetic blocking I/O.
 
@@ -321,6 +326,7 @@ class ToolIoFixture:
             await asyncio.sleep(delay_ms / 1000.0)
         return {"token": token, "delay_ms": delay_ms, "impl": "async"}
 
+    @blocking_io
     def sync_append(self, index: int, delay_ms: int = 0) -> dict[str, Any]:
         """Append one ordered mutation to shared state, then return its position.
 
@@ -352,6 +358,7 @@ class ToolIoFixture:
         self.effects.append({"index": index, "impl": "async"})
         return {"index": index, "position": len(self.effects) - 1}
 
+    @blocking_io
     def sync_io_bare(self, token: str, delay_ms: Any = 0) -> dict[str, Any]:
         # Intentionally undocumented: no Args section for Misc.parse_method_signature.
         # Tolerates an uncoerced value so the observation is the received TYPE,
@@ -362,7 +369,7 @@ class ToolIoFixture:
 
 
 def _make_executor(fixture: ToolIoFixture) -> ToolExecutor:
-    """Real ToolExecutor wired to the fixture (registry shape per runtime/base.py:138-141)."""
+    """Real ToolExecutor wired to the fixture's production registry shape."""
     registry: dict[str, tuple[Any, str]] = {
         "bench_io_sync": (fixture, "sync_io"),
         "bench_io_async": (fixture, "async_io"),
@@ -1310,9 +1317,9 @@ async def _run_subagent_lane(args: argparse.Namespace, sizes: Sequence[int], tmp
             checks,
             "peak_simultaneous_live_children",
             "observation",
-            f"<= {n} (unbounded today: no shared subagent admission cap)",
+            f"<= {n}, subject to the configured nested admission limit",
             _summarize(peak_entries),
-            "admission evidence, not an assertion: N children are launched concurrently, so peak live-child concurrency tracks N",
+            "admission evidence, not an assertion: shared capacity may queue children; the peak records actual overlap",
         )
         observations = {
             "n": n,
@@ -1322,9 +1329,9 @@ async def _run_subagent_lane(args: argparse.Namespace, sizes: Sequence[int], tmp
             "wall_ms_median": _summarize(samples)["median"],
             "wall_ms_ideal_serial_ms": None,
             "admission_evidence": (
-                "no shared admission primitive exists on the Task path: every Task call constructs a child and awaits its full "
-                "STAR loop, so N calls in one ToolExecutor batch run concurrently. Peak simultaneous live children is the "
-                "observed admission width."
+                "Task calls share bounded nested admission. Each admitted call constructs its own child and awaits its full "
+                "STAR loop; queued calls do not create a child until capacity is available. Peak simultaneous live children "
+                "records the observed admission width."
             ),
         }
         cases.append(
@@ -1545,7 +1552,7 @@ async def _seed_session(
     turns: int,
     message_bytes: int,
 ) -> dict[str, Any]:
-    """Create the session + seed N completed turns (mirrors tests/unit/core/session/test_agent_session.py:100-140)."""
+    """Create the session and seed N completed turns through journal facts."""
     record = SessionRecord.new(session_id, scope)
     init_facts = [
         JournalFact(
@@ -1749,7 +1756,7 @@ async def _run_history_size(
                 agent_factory=lambda prepare_agent=prepare_agent: prepare_agent,
             )
             t0 = time.perf_counter()
-            await prepare_session.load()  # load() -> _prepare_agent() (agent_session.py:409,771)
+            await prepare_session.load()
             prepare_ms = (time.perf_counter() - t0) * 1000.0
 
             if rep == 0:
@@ -2124,7 +2131,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         "clock": CLOCK,
         "reproduction": {
             "argv": sys.argv,
-            "command": f"uv run --no-sync python scripts/benchmark_tools_history.py --output {args.output} --repetitions {args.repetitions}",
+            "command": f"uv run --no-sync python benchmarks/benchmark_tools_history.py --output {args.output} --repetitions {args.repetitions}",
             "paid_requests": False,
             "network": "none (no provider, no MCP, no geolocation; synthetic fixtures only)",
             "writes": ["--output path", "--temp-root/OS temp dir (removed unless --keep-temp)"],

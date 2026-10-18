@@ -289,8 +289,10 @@ class ConversationProjectionState:
         self._tool_requests: dict[tuple[str, str], Mapping[str, JSONValue]] = {}
         # Turns folded but not yet terminated (TURN_STARTED / USER_CONTENT_FINAL
         # seen, no TURN_COMPLETED/INTERRUPTED/ERROR/CANCELLED yet). Distinct from
-        # _turn_starts, which maps EVERY turn ever seen (terminal ones included)
-        # to where its messages begin.
+        # _turn_starts, which maps every *open* turn (and, transiently, the
+        # terminal turn being folded in this same batch - ``_retire_unfinished_turn``
+        # drops it as soon as that turn reaches its terminal) to where its
+        # messages begin.
         self._open_turns: set[str] = set()
         # Number of leading messages dropped by discard_closed_history. Kept so
         # index-based canonical positions stay meaningful across a prune: the
@@ -527,10 +529,13 @@ class ConversationProjectionState:
                 self._commit_native_turn(fact.correlation_id, native, start, pre_batch_count)
             elif text is not None:
                 self._messages.append(LLMMessage(role="assistant", content=text))
+            self._retire_unfinished_turn(fact.correlation_id)
             self._interruption_observation = None
         elif fact.fact_type is FactType.TURN_INTERRUPTED:
+            self._retire_unfinished_turn(fact.correlation_id)
             self._interruption_observation = _INTERRUPTED_OBSERVATION
         elif fact.fact_type in (FactType.TURN_ERROR, FactType.TURN_CANCELLED):
+            self._retire_unfinished_turn(fact.correlation_id)
             self._interruption_observation = None
         elif fact.fact_type is FactType.MODEL_CHANGED:
             provider = str(fact.payload.get("provider", ""))
@@ -571,6 +576,36 @@ class ConversationProjectionState:
         if added > 0:
             self._message_turns.extend([fact.correlation_id] * added)
             self._turn_message_counts[fact.correlation_id] = self._turn_message_counts.get(fact.correlation_id, 0) + added
+
+    def _retire_unfinished_turn(self, correlation_id: str) -> None:
+        """Drop per-turn bookkeeping for a turn that reached a terminal fact.
+
+        S6: a terminated (or superseded) turn leaves no unfinished state behind.
+        The pending final text, the protected native envelope, the turn start
+        index and every unresolved tool request of *that* turn are dropped, so a
+        long-lived session does not accumulate one dead entry per finished turn.
+        Legitimate interruption visibility is unaffected: it lives in
+        ``_interruption_observation`` (set by ``TURN_INTERRUPTED``, cleared by any
+        later terminal), not in the per-turn pending maps.
+
+        Only the terminal turn's own entries are removed: ``pending_final`` and
+        ``pending_native`` are keyed by correlation id, and an unresolved tool
+        request is keyed by ``(correlation_id, call_id)``, so a concurrent open
+        turn's bookkeeping is never touched. A tool request belonging to a
+        *superseded* turn (its request was folded but its terminal never arrived
+        while a later turn's messages were appended) is retired here too.
+
+        ``_message_turns`` / ``_turn_message_counts`` are deliberately left intact
+        for the terminal turn: they describe messages that are still part of the
+        canonical history, and ``_commit_native_turn`` relies on the per-turn
+        count to detect a shifted block. They are bounded by
+        :meth:`discard_closed_history`, like the rest of the message bookkeeping.
+        """
+        self._pending_final.pop(correlation_id, None)
+        self._pending_native.pop(correlation_id, None)
+        self._turn_starts.pop(correlation_id, None)
+        for key in [key for key in self._tool_requests if key[0] == correlation_id]:
+            del self._tool_requests[key]
 
     def _commit_native_turn(self, correlation_id: str, native: list[LLMMessage], start: int, pre_batch_count: int) -> None:
         """Replace a completing turn's projected messages with its native envelope.

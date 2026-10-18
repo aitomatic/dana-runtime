@@ -12,6 +12,7 @@ from typing import Any
 
 from mcp import ClientSession, StdioServerParameters, stdio_client
 
+from dana.core.mcp.correlation import correlating_write_stream
 from dana.core.mcp.protocol import MCPHandshakeResult, call_tool, discover_tools, perform_handshake
 
 
@@ -112,7 +113,7 @@ class MCPStdioTransport:
         Manages the subprocess lifecycle: spawn, communicate, terminate.
         """
         async with stdio_client(self._server_params) as (read_stream, write_stream):
-            async with ClientSession(read_stream, write_stream) as session:
+            async with ClientSession(read_stream, correlating_write_stream(write_stream)) as session:
                 self._session = session
                 try:
                     yield self

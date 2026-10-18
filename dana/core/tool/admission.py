@@ -183,6 +183,7 @@ class AdmissionController:
 
     def _pools_for_running_loop(self) -> dict[str, _Pool]:
         loop = asyncio.get_running_loop()
+        self._drop_closed_loops()
         entry = self._by_loop.get(id(loop))
         if entry is None or entry.loop is not loop or entry.loop.is_closed():
             entry = _LoopPools(
@@ -194,6 +195,32 @@ class AdmissionController:
             )
             self._by_loop[id(loop)] = entry
         return entry.pools
+
+    def _drop_closed_loops(self) -> None:
+        """Drop pool state for loops that have closed (S8).
+
+        Admission state is keyed by ``id(loop)``, so a finished loop's entry would
+        otherwise be retained forever: with a fresh loop in every test the mapping
+        (and each entry's semaphores) grows without bound. Cleanup runs on the next
+        acquisition *and* on :meth:`snapshot`, so a caller that only observes
+        (``snapshot``) also reclaims. Entry removal is safe precisely because the
+        loop is closed: no task on it can still be waiting for a permit, and no new
+        acquisition can arrive for it.
+        """
+        if not self._by_loop:
+            return
+        for key, entry in list(self._by_loop.items()):
+            if entry.loop.is_closed():
+                del self._by_loop[key]
+
+    @property
+    def tracked_loops(self) -> int:
+        """Number of per-loop pool entries still retained (observability, S8).
+
+        Closed loops are dropped lazily, so this reads as "entries since the last
+        reclamation"; :meth:`snapshot` reclaims first, making it exact.
+        """
+        return len(self._by_loop)
 
     def classify(self, function_name: str, arguments: dict[str, Any] | None = None) -> str:
         """Return the pool kind (``"nested"`` or ``"leaf"``) for a call."""
@@ -271,6 +298,7 @@ class AdmissionController:
         concurrency (test/telemetry friendly); ``peak_waiters`` shows how much
         work had to wait for a permit.
         """
+        self._drop_closed_loops()
         out: dict[str, Any] = {}
         for kind, limit in ((self.LEAF, self.leaf_limit), (self.NESTED, self.nested_limit)):
             in_flight = 0

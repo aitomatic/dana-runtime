@@ -324,11 +324,10 @@ class CompressionMixin:
 
             for nm in self._native_messages:
                 if nm.role == "tool" and nm.tool_call_id and nm.tool_call_id in stubbed_ids and nm.content != SHRINK_STUB_CONTENT:
-                    before = self._estimate_native_message_tokens(nm)
                     nm.content = SHRINK_STUB_CONTENT
                     after = self._estimate_native_message_tokens(nm)
                     marker_was_valid = self._token_marker_valid()
-                    self._fold_token_delta(after - before, marker_was_valid=marker_was_valid)
+                    self._apply_message_token_delta(nm, after, marker_was_valid=marker_was_valid)
 
             # Pair integrity safety net — tool_call_ids preserved so this is a no-op
             # in practice, but runs for defense in depth.

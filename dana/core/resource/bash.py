@@ -9,6 +9,8 @@ import asyncio
 from dataclasses import dataclass, field
 import os
 import subprocess
+import threading
+import time
 from typing import Any
 import uuid
 
@@ -16,6 +18,7 @@ from structlog import get_logger
 
 from dana.common.protocols.war import tool_use
 from dana.core.resource.base_resource import BaseResource
+from dana.core.tool.offload import blocking_io, current_physical_work
 
 
 logger = get_logger()
@@ -25,10 +28,23 @@ DEFAULT_TIMEOUT_MS = 120000  # 2 minutes
 MAX_TIMEOUT_MS = 600000  # 10 minutes
 MAX_OUTPUT_CHARS = 30000
 
+#: Slice of the blocking wait between cooperative-cancellation checks. The wait is
+#: served in slices so a cancelled dispatch stops waiting within a bounded time
+#: (rather than holding an admission permit for the full 10-minute maximum)
+#: *without* killing the background command, which is still the model's process.
+#: ``Popen.communicate`` preserves partial reads across a retry, so slicing is safe.
+WAIT_POLL_INTERVAL_S = 0.1
+
 
 @dataclass
 class BackgroundTask:
-    """Represents a background shell task."""
+    """Represents a background shell task.
+
+    State is shared between the event loop (background start) and the offload
+    worker threads that wait on it, so every field below is guarded by ``lock``.
+    The lock is *per task* (not one lock for the whole resource) so waiting on one
+    task never blocks polling another.
+    """
 
     task_id: str
     process: subprocess.Popen[str]
@@ -38,6 +54,14 @@ class BackgroundTask:
     stderr_buffer: list[str] = field(default_factory=list)
     completed: bool = False
     exit_code: int | None = None
+    #: Guards this task's mutable state (buffers, completed, exit_code) so a
+    #: blocking wait and a concurrent poll/kill cannot tear it (I7).
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    #: Serializes *waiters* only. Two threads calling ``communicate`` on one
+    #: ``Popen`` concurrently would split its output between them, so a second
+    #: waiter queues here; a killer is not a waiter, so ``kill_task`` can still
+    #: unblock a wait in progress.
+    wait_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class BashResource(BaseResource):
@@ -74,7 +98,16 @@ class BashResource(BaseResource):
         super().__init__(resource_type="bash", resource_id=resource_id, **kwargs)
         self._working_directory = working_directory or os.getcwd()
         self._background_tasks: dict[str, BackgroundTask] = {}
+        #: Guards the task registry (membership only; per-task state has its own
+        #: lock). Both are ``threading`` locks because blocking waits run on the
+        #: offload pool, not on the event loop thread.
+        self._tasks_lock = threading.Lock()
         self._env = os.environ.copy()
+
+    def _task_for(self, task_id: str) -> BackgroundTask | None:
+        """Look up a background task under the registry lock."""
+        with self._tasks_lock:
+            return self._background_tasks.get(task_id)
 
     @tool_use
     async def execute(
@@ -232,7 +265,8 @@ class BashResource(BaseResource):
                 command=command,
                 description=description,
             )
-            self._background_tasks[task_id] = task
+            with self._tasks_lock:
+                self._background_tasks[task_id] = task
 
             logger.info("bash_background_started", task_id=task_id, command=command[:100])
 
@@ -251,6 +285,7 @@ class BashResource(BaseResource):
             }
 
     @tool_use
+    @blocking_io
     def get_task_output(
         self,
         task_id: str,
@@ -263,7 +298,8 @@ class BashResource(BaseResource):
         Args:
             task_id: Task ID returned by execute() with run_in_background=True
             wait: If True, wait for task to complete. If False, return current output.
-            timeout: Max wait time in milliseconds (default 30000, max 600000)
+            timeout: Max wait time in milliseconds, including any queued waiter
+                (default 30000, max 600000)
 
         Returns:
             Dict with keys:
@@ -272,8 +308,11 @@ class BashResource(BaseResource):
             - stdout: Current or final stdout
             - stderr: Current or final stderr
             - exit_code: Exit code if completed, None if running
+            - cancelled: True (only when the wait itself was cancelled) — the
+              command keeps running, so poll again with ``wait=False``
         """
-        if task_id not in self._background_tasks:
+        task = self._task_for(task_id)
+        if task is None:
             return {
                 "success": False,
                 "status": "not_found",
@@ -282,81 +321,152 @@ class BashResource(BaseResource):
                 "exit_code": None,
             }
 
-        task = self._background_tasks[task_id]
+        with task.lock:
+            # Check if already completed
+            if task.completed:
+                return {
+                    "success": True,
+                    "status": "completed",
+                    "stdout": "".join(task.stdout_buffer),
+                    "stderr": "".join(task.stderr_buffer),
+                    "exit_code": task.exit_code,
+                }
 
-        # Check if already completed
-        if task.completed:
-            return {
-                "success": True,
-                "status": "completed",
-                "stdout": "".join(task.stdout_buffer),
-                "stderr": "".join(task.stderr_buffer),
-                "exit_code": task.exit_code,
-            }
+            # Check current status
+            poll_result = task.process.poll()
 
-        # Check current status
-        poll_result = task.process.poll()
-
-        if poll_result is not None:
-            # Process completed
-            stdout, stderr = task.process.communicate()
-            task.stdout_buffer.append(stdout)
-            task.stderr_buffer.append(stderr)
-            task.completed = True
-            task.exit_code = poll_result
-
-            logger.info("bash_background_completed", task_id=task_id, exit_code=poll_result)
-
-            return {
-                "success": True,
-                "status": "completed",
-                "stdout": "".join(task.stdout_buffer),
-                "stderr": "".join(task.stderr_buffer),
-                "exit_code": poll_result,
-            }
+        if poll_result is not None and not wait:
+            return self._finish_task(task, task_id, poll_result)
 
         if not wait:
-            return {
-                "success": True,
-                "status": "running",
-                "stdout": "".join(task.stdout_buffer),
-                "stderr": "".join(task.stderr_buffer),
-                "exit_code": None,
-            }
+            with task.lock:
+                return {
+                    "success": True,
+                    "status": "running",
+                    "stdout": "".join(task.stdout_buffer),
+                    "stderr": "".join(task.stderr_buffer),
+                    "exit_code": None,
+                }
 
-        # Wait for completion
+        # One deadline covers acquiring the waiter lock and draining the process.
         timeout_ms = timeout or 30000
         timeout_ms = min(timeout_ms, MAX_TIMEOUT_MS)
         timeout_seconds = timeout_ms / 1000
 
+        return self._wait_for_task(task, task_id, timeout_seconds)
+
+    def _wait_for_task(self, task: BackgroundTask, task_id: str, timeout_seconds: float) -> dict[str, Any]:
+        """Acquire the waiter lock and wait within one cancellable deadline.
+
+        Both lock acquisition and ``communicate`` use
+        :data:`WAIT_POLL_INTERVAL_S` slices. A queued waiter can therefore time
+        out or honour its own cancellation without waiting for another caller's
+        up-to-ten-minute process wait. Only the lock holder drains the pipes or
+        records output, so a timeout or cancellation never splits or duplicates
+        the command's output.
+
+        The background command is never killed here: abandoning a wait is not
+        abandoning the model's process. ``Popen.communicate`` accumulates partial
+        reads across timeout retries, so another waiter can finish them losslessly.
+        """
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        acquired = False
         try:
-            stdout, stderr = task.process.communicate(timeout=timeout_seconds)
-            task.stdout_buffer.append(stdout)
-            task.stderr_buffer.append(stderr)
-            task.completed = True
-            task.exit_code = task.process.returncode
+            while True:
+                claim = current_physical_work()
+                if claim is not None and claim.cancel.is_set():
+                    logger.info("bash_wait_cancelled", task_id=task_id)
+                    with task.lock:
+                        return {
+                            "success": True,
+                            "status": "running",
+                            "cancelled": True,
+                            "stdout": "".join(task.stdout_buffer),
+                            "stderr": "".join(task.stderr_buffer) + "\n(wait cancelled; command still running)",
+                            "exit_code": None,
+                        }
 
-            return {
-                "success": True,
-                "status": "completed",
-                "stdout": "".join(task.stdout_buffer),
-                "stderr": "".join(task.stderr_buffer),
-                "exit_code": task.exit_code,
-            }
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    with task.lock:
+                        return {
+                            "success": True,
+                            "status": "running",
+                            "stdout": "".join(task.stdout_buffer),
+                            "stderr": "".join(task.stderr_buffer) + f"\n(still running after {timeout_seconds}s wait)",
+                            "exit_code": None,
+                        }
 
-        except subprocess.TimeoutExpired:
-            return {
-                "success": True,
-                "status": "running",
-                "stdout": "".join(task.stdout_buffer),
-                "stderr": "".join(task.stderr_buffer) + f"\n(still running after {timeout_seconds}s wait)",
-                "exit_code": None,
-            }
+                if not acquired:
+                    acquired = task.wait_lock.acquire(timeout=min(WAIT_POLL_INTERVAL_S, remaining))
+                    if acquired:
+                        with task.lock:
+                            if task.completed:
+                                return {
+                                    "success": True,
+                                    "status": "completed",
+                                    "stdout": "".join(task.stdout_buffer),
+                                    "stderr": "".join(task.stderr_buffer),
+                                    "exit_code": task.exit_code,
+                                }
+                    # Recheck cancellation and the shared deadline after waiting
+                    # for the lock, before starting any process wait.
+                    continue
+
+                try:
+                    stdout, stderr = task.process.communicate(timeout=min(WAIT_POLL_INTERVAL_S, remaining))
+                except subprocess.TimeoutExpired:
+                    continue
+                with task.lock:
+                    task.stdout_buffer.append(stdout)
+                    task.stderr_buffer.append(stderr)
+                    task.completed = True
+                    task.exit_code = task.process.returncode
+                    exit_code = task.exit_code
+                logger.info("bash_background_completed", task_id=task_id, exit_code=exit_code)
+                return {
+                    "success": True,
+                    "status": "completed",
+                    "stdout": "".join(task.stdout_buffer),
+                    "stderr": "".join(task.stderr_buffer),
+                    "exit_code": exit_code,
+                }
+        finally:
+            if acquired:
+                task.wait_lock.release()
+
+    def _finish_task(self, task: BackgroundTask, task_id: str, exit_code: int) -> dict[str, Any]:
+        """Record a task the OS already reaped and return its final output.
+
+        Only one caller may drain the pipe, so the wait lock is taken first; the
+        "already completed" state is re-checked inside it in case a concurrent
+        waiter won the race (the second caller then reads the recorded buffers).
+        """
+        with task.wait_lock:
+            with task.lock:
+                if not task.completed:
+                    stdout, stderr = task.process.communicate()
+                    task.stdout_buffer.append(stdout)
+                    task.stderr_buffer.append(stderr)
+                    task.completed = True
+                    task.exit_code = exit_code
+                    logger.info("bash_background_completed", task_id=task_id, exit_code=exit_code)
+                return {
+                    "success": True,
+                    "status": "completed",
+                    "stdout": "".join(task.stdout_buffer),
+                    "stderr": "".join(task.stderr_buffer),
+                    "exit_code": task.exit_code,
+                }
 
     @tool_use
+    @blocking_io
     def kill_task(self, task_id: str) -> dict[str, Any]:
-        """
-        Terminate a running background task.
+        """Terminate a running background task.
+
+        Marked offload-eligible (I7): the SIGTERM wait can block for seconds, which
+        must not stall the event loop. Nothing loop-bound is touched — the process is
+        a plain ``subprocess.Popen`` and the task state is guarded by threading locks.
 
         Args:
             task_id: Task ID to terminate
@@ -364,25 +474,26 @@ class BashResource(BaseResource):
         Returns:
             Dict with success status and message
         """
-        if task_id not in self._background_tasks:
+        task = self._task_for(task_id)
+        if task is None:
             return {
                 "success": False,
                 "message": f"Task '{task_id}' not found",
             }
 
-        task = self._background_tasks[task_id]
-
-        if task.completed:
-            return {
-                "success": True,
-                "message": f"Task '{task_id}' already completed",
-            }
+        with task.lock:
+            if task.completed:
+                return {
+                    "success": True,
+                    "message": f"Task '{task_id}' already completed",
+                }
 
         try:
             task.process.terminate()
             task.process.wait(timeout=5)
-            task.completed = True
-            task.exit_code = -15  # SIGTERM
+            with task.lock:
+                task.completed = True
+                task.exit_code = -15  # SIGTERM
 
             logger.info("bash_task_killed", task_id=task_id)
 
@@ -392,8 +503,9 @@ class BashResource(BaseResource):
             }
         except subprocess.TimeoutExpired:
             task.process.kill()
-            task.completed = True
-            task.exit_code = -9  # SIGKILL
+            with task.lock:
+                task.completed = True
+                task.exit_code = -9  # SIGKILL
 
             return {
                 "success": True,
@@ -414,21 +526,24 @@ class BashResource(BaseResource):
             Dict with list of tasks and their statuses
         """
         tasks = []
-        for task_id, task in self._background_tasks.items():
-            # Update status
-            if not task.completed and task.process.poll() is not None:
-                task.completed = True
-                task.exit_code = task.process.returncode
+        with self._tasks_lock:
+            snapshot = list(self._background_tasks.items())
+        for task_id, task in snapshot:
+            with task.lock:
+                # Update status
+                if not task.completed and task.process.poll() is not None:
+                    task.completed = True
+                    task.exit_code = task.process.returncode
 
-            tasks.append(
-                {
-                    "task_id": task_id,
-                    "command": task.command[:50] + "..." if len(task.command) > 50 else task.command,
-                    "description": task.description,
-                    "status": "completed" if task.completed else "running",
-                    "exit_code": task.exit_code,
-                }
-            )
+                tasks.append(
+                    {
+                        "task_id": task_id,
+                        "command": task.command[:50] + "..." if len(task.command) > 50 else task.command,
+                        "description": task.description,
+                        "status": "completed" if task.completed else "running",
+                        "exit_code": task.exit_code,
+                    }
+                )
 
         return {
             "success": True,

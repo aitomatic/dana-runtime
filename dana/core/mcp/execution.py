@@ -17,47 +17,25 @@ Per ADR-006 (Effect-Based Operations and Permission Policy):
 This adapter wraps an MCP transport session and provides a callable that the
 execution engine can invoke as a cooperative tool adapter. It integrates with
 the MCPCancellationTracker for proper cancellation acknowledgement.
+
+Wire-id correlation lives in :mod:`dana.core.mcp.correlation`: the transports
+wrap their own send stream (a supported constructor argument of ``ClientSession``)
+so this adapter never reaches into the SDK session's private attributes.
 """
 
 from __future__ import annotations
 
-from contextvars import ContextVar
 import logging
 from typing import Any
 from uuid import uuid4
 
-from anyio.abc import ObjectSendStream
-from mcp import ClientSession
-from mcp.shared.message import SessionMessage
-from mcp.types import CancelledNotification, CancelledNotificationParams, JSONRPCRequest
+from mcp.types import CancelledNotification, CancelledNotificationParams
 
 from dana.core.mcp.cancellation import MCPCancellationTracker
+from dana.core.mcp.correlation import _active_mcp_call
 
 
 logger = logging.getLogger(__name__)
-
-_active_mcp_call: ContextVar[tuple[MCPExecutionAdapter, str] | None] = ContextVar("dana_active_mcp_call", default=None)
-
-
-class _CorrelatingSendStream(ObjectSendStream[SessionMessage]):
-    """Observe SDK-assigned wire IDs without guessing its private counter."""
-
-    def __init__(self, stream: ObjectSendStream[SessionMessage]) -> None:
-        self._stream = stream
-
-    async def send(self, item: SessionMessage) -> None:
-        await self._stream.send(item)
-        request = item.message.root
-        active = _active_mcp_call.get()
-        if active is not None and isinstance(request, JSONRPCRequest) and request.method == "tools/call":
-            adapter, tool_call_id = active
-            adapter._cancellation_tracker.record_request_id(tool_call_id, request.id)
-            if adapter._cancellation_tracker.is_cancelled(tool_call_id):
-                reason = adapter._pending_cancellations.pop(tool_call_id, "User requested cancellation")
-                await adapter.send_cancellation_notification(tool_call_id, request.id, reason)
-
-    async def aclose(self) -> None:
-        await self._stream.aclose()
 
 
 class MCPExecutionAdapter:
@@ -96,6 +74,23 @@ class MCPExecutionAdapter:
         """The cancellation tracker for this adapter."""
         return self._cancellation_tracker
 
+    def pending_cancellation_reason(self, tool_call_id: str) -> str:
+        """Reason recorded for a cancellation requested before the wire id was known.
+
+        Consumed once (popped): the notification that carries it is sent exactly
+        once, so the reason must not linger for a later call that reuses the id.
+        """
+        return self._pending_cancellations.pop(tool_call_id, "User requested cancellation")
+
+    @property
+    def pending_cancellation_count(self) -> int:
+        """Cancellations still waiting for their wire id to be observed.
+
+        Observability only: a non-zero count after every call settled means a
+        cancellation never reached the wire (no id was ever observed for it).
+        """
+        return len(self._pending_cancellations)
+
     async def call_tool(
         self,
         name: str,
@@ -128,12 +123,6 @@ class MCPExecutionAdapter:
         # tool_call_id, never by the tool name — concurrent same-name calls must
         # stay distinct).
         self._cancellation_tracker.track(tool_call_id, f"pending:{tool_call_id}")
-        session = getattr(self._transport, "session", None)
-        if isinstance(session, ClientSession) and not isinstance(session._write_stream, _CorrelatingSendStream):
-            # Both built-in transports use ClientSession. Observe the actual
-            # tools/call frame at its shared send boundary; task-local correlation
-            # keeps concurrent calls with the same tool name independent.
-            session._write_stream = _CorrelatingSendStream(session._write_stream)
         token = _active_mcp_call.set((self, tool_call_id))
 
         try:

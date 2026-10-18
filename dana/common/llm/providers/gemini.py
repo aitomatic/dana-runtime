@@ -24,6 +24,7 @@ from ..types import (
     is_multimodal_content,
     unsupported_placeholder,
 )
+from ._stream_teardown import close_stream
 
 
 logger = structlog.get_logger()
@@ -271,6 +272,7 @@ class GeminiProvider(LLMProvider):
         no usage/cache accounting at all and a truncated response was
         indistinguishable from a complete one.
         """
+        stream = None
         try:
             system_instruction, contents = self.prepare_messages(messages)
 
@@ -333,6 +335,14 @@ class GeminiProvider(LLMProvider):
         except Exception as e:
             logger.error("Gemini stream error", error=str(e))
             raise
+        finally:
+            # A plain ``async for`` never closes an abandoned SDK stream, so a
+            # consumer that stops early (cancellation, host-side break, mid-stream
+            # error) would leave the HTTP response open until GC. Same explicit
+            # release as the OpenAI-compatible path; best-effort, because teardown
+            # must not mask the real result of the turn.
+            if stream is not None:
+                await close_stream(stream)
 
     def _build_generate_config(self, system_instruction, tools, kwargs: dict):
         """Build the GenerateContentConfig shared by chat() and stream().

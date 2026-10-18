@@ -413,17 +413,26 @@ def test_langsmith_lifecycle_failures_are_type_only_and_off_thread(monkeypatch, 
 
     backend = types.ModuleType("langsmith")
     backend.traceable = lambda *a, **k: lambda f: f
+    run_trees = types.ModuleType("langsmith.run_trees")
     if failure_stage == "resolution":
 
-        def missing_client(name):
-            if name == "Client":
+        def missing_resolver(name):
+            if name == "get_cached_client":
                 fail()
             raise AttributeError(name)
 
-        backend.__getattr__ = missing_client
+        run_trees.__getattr__ = missing_resolver
     else:
-        backend.Client = Client
+
+        def get_cached_client(**kwargs):
+            if failure_stage == "construction":
+                fail()
+            return Client()
+
+        run_trees.get_cached_client = get_cached_client
+    backend.run_trees = run_trees
     monkeypatch.setitem(sys.modules, "langsmith", backend)
+    monkeypatch.setitem(sys.modules, "langsmith.run_trees", run_trees)
     obs = _reload_observable()
 
     with caplog.at_level("DEBUG", logger=obs.__name__):
@@ -442,6 +451,51 @@ def test_langsmith_lifecycle_failures_are_type_only_and_off_thread(monkeypatch, 
     assert secret not in caplog.text
 
 
+def test_langsmith_flush_targets_the_cached_tracing_client(monkeypatch, clean_env):
+    """Flush and shutdown must reach the client `@traceable` queued runs on.
+
+    ``RunTree.client`` resolves through ``langsmith.run_trees.get_cached_client()``,
+    so that instance holds the buffered runs. Building a fresh ``Client()`` instead
+    flushes nothing and silently drops the traces the process asked to deliver.
+    """
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    events = {"flushes": 0, "resolutions": 0}
+
+    class CachedClient:
+        def flush(self, **kwargs):
+            events["flushes"] += 1
+
+    cached = CachedClient()
+
+    class FreshClient:
+        def __init__(self):  # pragma: no cover - constructing one is the bug
+            raise AssertionError("lifecycle must not construct a fresh tracing client")
+
+    backend = types.ModuleType("langsmith")
+    backend.traceable = lambda *a, **k: lambda f: f
+    backend.Client = FreshClient
+    run_trees = types.ModuleType("langsmith.run_trees")
+
+    def get_cached_client(**kwargs):
+        events["resolutions"] += 1
+        return cached
+
+    run_trees.get_cached_client = get_cached_client
+    backend.run_trees = run_trees
+    monkeypatch.setitem(sys.modules, "langsmith", backend)
+    monkeypatch.setitem(sys.modules, "langsmith.run_trees", run_trees)
+    obs = _reload_observable()
+
+    assert obs.LANGSMITH_ENABLED is True
+
+    obs.flush_observability(timeout=0.5)
+    assert events == {"flushes": 1, "resolutions": 1}, "flush must hit the cached client exactly once"
+
+    obs.shutdown_observability(timeout=0.5)
+    assert events["flushes"] == 2, "shutdown must deliver the same cached client's buffered runs"
+    assert events["resolutions"] == 2
+
+
 def test_shutdown_bounds_langsmith_client_construction(monkeypatch, clean_env):
     """Client resolution/construction cannot block a process-boundary shutdown."""
     import time as _time
@@ -452,17 +506,22 @@ def test_shutdown_bounds_langsmith_client_construction(monkeypatch, clean_env):
     finished = threading.Event()
 
     class Client:
-        def __init__(self):
-            started.set()
-            release.wait(5)
-
         def flush(self, **kwargs):
             finished.set()
 
     backend = types.ModuleType("langsmith")
     backend.traceable = lambda *a, **k: lambda f: f
-    backend.Client = Client
+    run_trees = types.ModuleType("langsmith.run_trees")
+
+    def get_cached_client(**kwargs):
+        started.set()
+        release.wait(5)
+        return Client()
+
+    run_trees.get_cached_client = get_cached_client
+    backend.run_trees = run_trees
     monkeypatch.setitem(sys.modules, "langsmith", backend)
+    monkeypatch.setitem(sys.modules, "langsmith.run_trees", run_trees)
     obs = _reload_observable()
 
     try:

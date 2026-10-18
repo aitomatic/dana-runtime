@@ -7,9 +7,13 @@ ONLY place where the two meet, keeping ACP types out of STAR core.
 Chunk semantics: every ``ASSISTANT_CONTENT_CHUNK`` and ``USER_MESSAGE`` event
 maps to an ACP delta (the client accumulates). ``ASSISTANT_CONTENT_FINAL`` is
 NOT re-sent as a delta because the individual chunks already carried the text;
-sending the full text again would duplicate it on the client side. Lifecycle
-events (``TURN_*``, ``SESSION_*``) have no ACP update equivalent in D1 — the
-``PromptResponse`` / ``LoadSessionResponse`` itself signals completion.
+sending the full text again would duplicate it on the client side. Most
+lifecycle events (``TURN_STARTED``, ``TURN_COMPLETED``, ``TURN_CANCELLED``,
+``SESSION_*``) have no ACP update equivalent; the ``PromptResponse`` /
+``LoadSessionResponse`` itself signals completion. ``TURN_ERROR`` is the
+exception: it becomes one ``agent_message_chunk`` carrying the failure, giving
+a failed turn exactly one visible notification on a protocol response that
+still completes successfully.
 
 D2 adds tool lifecycle events: thought, tool-call, tool-update, result, and
 cancellation states. These are translated to ACP ``agent_thought_chunk``,
@@ -56,7 +60,8 @@ def host_event_to_acp_update(event: HostEvent) -> Any:
             return _multimodal_agent_chunk_to_acp(event)
         return update_agent_message_text(event.text or "")
     # ASSISTANT_CONTENT_FINAL: already streamed via chunks — skip to avoid duplication.
-    # TURN_*, SESSION_*: no ACP update in D1; the response signals completion.
+    # TURN_STARTED / TURN_COMPLETED / TURN_CANCELLED / SESSION_*: no ACP update;
+    # the response signals completion. TURN_ERROR is handled below.
 
     if event.event_type is HostEventType.TURN_ERROR:
         return update_agent_message_text(f"\nError: {event.metadata.get('error', 'Agent turn failed')}\n")

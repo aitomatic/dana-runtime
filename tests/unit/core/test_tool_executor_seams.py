@@ -11,7 +11,10 @@ from __future__ import annotations
 import asyncio
 import pathlib
 import tempfile
+import threading
+import time
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -23,11 +26,14 @@ from dana.core.resource.file_io_resource import FileIOResource
 from dana.core.resource.search_resource import SearchResource
 from dana.core.tool.admission import AdmissionController
 from dana.core.tool.catalog import ToolCatalog, ToolCatalogEntry, ToolIdentity
+from dana.core.tool.effect_ordering import plan_batch
 from dana.core.tool.offload import (
     BlockingIOPool,
     BlockingIOShutdown,
+    blocking_io,
     bound_blocking_io_pool,
     current_blocking_io_pool,
+    current_physical_work,
     get_default_blocking_io_pool,
     use_blocking_io_pool,
 )
@@ -618,3 +624,650 @@ class TestEffectOrderedScheduling:
         )
         assert seen == ["u1", "u2"], "unknown-effect calls kept the model's order"
         executor.close()
+
+    @pytest.mark.asyncio
+    async def test_mcp_effects_overlap_reads_and_order_unknown_mutations_per_server(self):
+        """I9: MCP scheduling uses the server's own declaration, not a guess.
+
+        A ``readOnlyHint=True`` tool may overlap another read-only tool of the same
+        server. Two *unannotated* tools of one server share an unknown mutation blast
+        radius and stay ordered; two different servers are independent and overlap.
+        A genuinely unclassified tool still keeps the model's order.
+        """
+        from dana.core.mcp.dispatch_wrapper import _mcp_effect_metadata
+        from dana.core.policy.effects import EffectKind
+
+        def tool(name: str, read_only: bool | None):
+            annotations = None if read_only is None else SimpleNamespace(readOnlyHint=read_only)
+            return SimpleNamespace(name=name, annotations=annotations)
+
+        # The server's declaration is what the executor consumes.
+        assert [e.kind for e in _mcp_effect_metadata(tool("peek", True), "srv").effects] == [EffectKind.READ]
+        same_server = _mcp_effect_metadata(tool("poke", None), "srv")
+        assert [e.target for e in same_server.effects] == ["srv"], "unannotated tool is not provably disjoint from its server"
+        assert same_server.is_sensitive is False, "an unannotated MCP tool is promptable, just ordered"
+
+        effects = {
+            "srv:peek": _mcp_effect_metadata(tool("peek", True), "srv"),
+            "srv:poke": _mcp_effect_metadata(tool("poke", None), "srv"),
+            "srv:shove": _mcp_effect_metadata(tool("shove", None), "srv"),
+            "other:poke": _mcp_effect_metadata(tool("poke", None), "other"),
+        }
+        executor = ToolExecutor(mcp_dispatch_getter=lambda: dict.fromkeys(effects, object()))
+        executor.set_mcp_effect_resolver(lambda: effects)
+
+        def waves(calls):
+            return plan_batch(
+                [{**c, "arguments": c.get("arguments", {})} for c in calls], None, metadata_resolver=executor._effect_metadata_for
+            ).waves
+
+        # Read-only tools of one server overlap.
+        assert waves(
+            [
+                {"function": "srv:peek", "arguments": {"token": "a"}},
+                {"function": "srv:peek", "arguments": {"token": "b"}},
+            ]
+        ) == [[0, 1]]
+        # Unannotated mutations of the SAME server stay ordered, even when their
+        # arguments happen to name different paths (the server may ignore them).
+        assert waves(
+            [
+                {"function": "srv:poke", "arguments": {"path": "/a"}},
+                {"function": "srv:shove", "arguments": {"path": "/b"}},
+            ]
+        ) == [[0], [1]]
+        # Different servers are independent.
+        assert waves(
+            [
+                {"function": "srv:poke", "arguments": {}},
+                {"function": "other:poke", "arguments": {}},
+            ]
+        ) == [[0, 1]]
+        # An unclassified tool is still sensitive and keeps the model's order.
+        assert waves(
+            [
+                {"function": "srv:peek", "arguments": {}},
+                {"function": "mystery", "arguments": {}},
+            ]
+        ) == [[0], [1]]
+        executor.close()
+
+    @pytest.mark.asyncio
+    async def test_independent_mcp_reads_run_concurrently_while_conflicting_writes_stay_ordered(self):
+        """I9 + acceptance: real dispatch overlaps independent MCP reads, orders
+        conflicting mutations of one server, and keeps harness ids distinct.
+
+        Scheduling is only honest if it is the *same* metadata the executor
+        schedules with (``_effect_metadata_for``), so this drives real dispatches
+        through the wired dispatch map and observes actual overlap.
+        """
+        from dana.core.mcp.dispatch_wrapper import _mcp_effect_metadata
+
+        def tool(name: str, read_only: bool | None):
+            annotations = None if read_only is None else SimpleNamespace(readOnlyHint=read_only)
+            return SimpleNamespace(name=name, annotations=annotations)
+
+        effects = {
+            "srv:peek": _mcp_effect_metadata(tool("peek", True), "srv"),
+            "srv:poke": _mcp_effect_metadata(tool("poke", None), "srv"),
+            "other:peek": _mcp_effect_metadata(tool("peek", True), "other"),
+        }
+        running: list[str] = []
+        overlap: list[str] = []
+        order: list[str] = []
+
+        def _dispatcher(name: str):
+            async def dispatch(arguments: dict[str, Any], tool_call_id: Any = None) -> dict[str, Any]:
+                running.append(name)
+                if len(running) > 1:
+                    overlap.append("+".join(sorted(running)))
+                try:
+                    await asyncio.sleep(0.02)
+                finally:
+                    running.remove(name)
+                order.append(name)
+                return {"success": True, "result": tool_call_id, "tool_call_id": tool_call_id}
+
+            return dispatch
+
+        executor = ToolExecutor(mcp_dispatch_getter=lambda: {name: _dispatcher(name) for name in effects})
+        executor.set_mcp_effect_resolver(lambda: effects)
+        try:
+            results = await executor.execute_tools_async(
+                object(),
+                [
+                    {"function": "srv:peek", "arguments": {"token": "a"}, "tool_call_id": "tc-a"},
+                    {"function": "other:peek", "arguments": {"token": "b"}, "tool_call_id": "tc-b"},
+                    {"function": "srv:poke", "arguments": {}, "tool_call_id": "tc-c"},
+                    {"function": "srv:poke", "arguments": {}, "tool_call_id": "tc-d"},
+                ],
+            )
+        finally:
+            executor.close()
+
+        assert overlap == ["other:peek+srv:peek"], "independent read-only MCP calls did not overlap"
+        # Conflicting mutations of one server are serialized in model order, and
+        # the ordered writes come after the reads they may conflict with.
+        assert order.index("srv:poke") > order.index("srv:peek")
+        assert [results[i]["tool_call_id"] for i in range(4)] == ["tc-a", "tc-b", "tc-c", "tc-d"]
+        assert [r["result"] for r in results] == ["tc-a", "tc-b", "tc-c", "tc-d"], "harness ids drifted between dispatch and result"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool_name", ["lookup__query", "lookup:query", "lookup:aquery"])
+    async def test_query_shaped_resource_alias_obeys_the_leaf_limit(self, tool_name):
+        from dana.common.protocols.war import named_tool
+        from dana.core.agent.base_agent import BaseAgent
+        from dana.core.resource.base_resource import BaseResource
+        from dana.core.runtime.default import DefaultRuntime
+
+        class LookupResource(BaseResource):
+            def __init__(self):
+                super().__init__(resource_id="lookup", auto_register=False)
+                self.active = 0
+                self.peak = 0
+
+            @named_tool(tool_name)
+            async def query(self, value: str) -> str:
+                """Read one lookup value."""
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+                try:
+                    await asyncio.sleep(0.01)
+                    return value
+                finally:
+                    self.active -= 1
+
+        resource = LookupResource()
+        agent = BaseAgent(auto_register=False).with_resources(resource)
+        runtime = DefaultRuntime()
+        controller = AdmissionController(leaf_limit=1, nested_limit=4)
+        catalog = ToolCatalog([ToolCatalogEntry(ToolIdentity(tool_name), {}, None, effects=EffectMetadata((Effect(EffectKind.READ),)))])
+        executor = ToolExecutor(
+            admission=controller,
+            agent_tool_name_registry_getter=runtime._tool_name_registry_for,
+            effect_catalog_getter=lambda: catalog,
+        )
+        try:
+            results = await asyncio.wait_for(
+                executor.execute_tools_async(
+                    agent,
+                    [{"function": tool_name, "arguments": {"value": str(i)}, "tool_call_id": f"lookup-{i}"} for i in range(4)],
+                ),
+                3,
+            )
+            assert [result["result"] for result in results] == ["0", "1", "2", "3"]
+            assert [result["tool_call_id"] for result in results] == [f"lookup-{i}" for i in range(4)]
+            assert resource.peak == 1, "an ordinary resource query bypassed the leaf limit"
+            assert controller.snapshot()["leaf"]["peak_in_flight"] == 1
+            assert controller.snapshot()["nested"]["peak_in_flight"] == 0
+        finally:
+            executor.close()
+            runtime._tool_executor.close()
+
+    @pytest.mark.asyncio
+    async def test_registered_agent_chain_borrows_nested_capacity_and_admits_its_leaf(self):
+        from dana.common.protocols.war import named_tool
+        from dana.core.agent.base_agent import BaseAgent
+        from dana.core.resource.base_resource import BaseResource
+        from dana.core.runtime.default import DefaultRuntime
+
+        observed: list[str] = []
+
+        class LeafResource(BaseResource):
+            @named_tool("LeafRead")
+            async def read(self) -> str:
+                """Perform the descendant's actual leaf tool."""
+                observed.append("leaf effect")
+                return "leaf result"
+
+        class DelegatingAgent(BaseAgent):
+            @named_tool("delegate__query")
+            async def query(self, message: str = "") -> str:
+                """Delegate to the next agent or run the leaf resource."""
+                name = "delegate__query" if self.available_agents else "LeafRead"
+                results = await executor.execute_tools_async(self, [{"function": name, "arguments": {}, "tool_call_id": self.agent_type}])
+                assert results[0]["success"] is True
+                return results[0]["result"]
+
+        leaf = DelegatingAgent(agent_type="leaf", auto_register=False).with_resources(
+            LeafResource(resource_id="leaf-reader", auto_register=False)
+        )
+        middle = DelegatingAgent(agent_type="middle", auto_register=False).with_agents(leaf)
+        root = BaseAgent(agent_type="root", auto_register=False).with_agents(middle)
+        runtime = DefaultRuntime()
+        controller = AdmissionController(leaf_limit=1, nested_limit=1)
+        executor = ToolExecutor(admission=controller, agent_tool_name_registry_getter=runtime._tool_name_registry_for)
+        try:
+            results = await asyncio.wait_for(
+                executor.execute_tools_async(root, [{"function": "delegate__query", "arguments": {}, "tool_call_id": "root-middle"}]),
+                3,
+            )
+            assert results[0]["result"] == "leaf result"
+            assert observed == ["leaf effect"]
+            snapshot = controller.snapshot()
+            assert snapshot["leaf"]["peak_in_flight"] == 1
+            assert snapshot["nested"]["peak_in_flight"] == 1
+            assert all(pool["in_flight"] == 0 for pool in snapshot.values())
+        finally:
+            executor.close()
+            runtime._tool_executor.close()
+
+    @pytest.mark.asyncio
+    async def test_sub_agent_query_is_nested_admission_and_does_not_deadlock(self):
+        """C1: a parent's sub-agent dispatch must not hold a leaf slot.
+
+        A sub-agent tool is named ``<agent_type>__query`` (with ``-``/``.`` becoming
+        ``_``), the shape the runtime's own schema builder emits. Treated as *leaf*
+        work, the parent awaiting its child holds a leaf slot the child's own tool
+        calls need, so a chain saturates ``leaf_limit`` and never completes.
+        """
+
+        class SubAgent:
+            agent_type = "math-agent"
+
+            async def query(self, message: str = "") -> str:
+                return "child"
+
+        class Agent:
+            def __init__(self):
+                self.available_agents = [SubAgent()]
+                self.available_resources = []
+                self.available_workflows = []
+
+        agent = Agent()
+        controller = AdmissionController(leaf_limit=2, nested_limit=2)
+        executor = ToolExecutor(admission=controller)
+
+        async def leaf_work(arguments):
+            await asyncio.sleep(0.01)
+            return "leaf-done"
+
+        async def child_query(arguments):
+            # The child runs the parent's executor: its tool call needs a leaf slot
+            # while the parent is still awaiting this dispatch.
+            return await executor._dispatch_single_call_async(agent, "Read", {"file_path": "/tmp/x"}, tool_call_id="child-leaf")
+
+        executor._tool_catalog = ToolCatalog(
+            [
+                ToolCatalogEntry(ToolIdentity("math_agent__query"), {}, child_query),
+                ToolCatalogEntry(ToolIdentity("Read"), {}, leaf_work, effects=EffectMetadata((Effect(EffectKind.READ),))),
+            ]
+        )
+        try:
+            results = await asyncio.wait_for(
+                executor.execute_tools_async(agent, [{"function": "math_agent__query", "arguments": {}, "tool_call_id": "root"}]),
+                3,
+            )
+            assert results[0]["success"] is True
+            assert results[0].get("_admission") == "nested", "sub-agent dispatch used the nested pool"
+            assert controller.snapshot()["leaf"]["in_flight"] == 0
+            assert controller.snapshot()["nested"]["in_flight"] == 0
+        finally:
+            executor.close()
+
+
+class TestExecutionPolicyHooks:
+    """I5/I6: authorization resolves outside admission; a returned denial is recoverable.
+
+    A ``blocked``/authorized decision must be reached *before* a permit is taken, so
+    a queue of interactive prompts can never starve the tool budget, and a refusal
+    the session *returns* must leave the turn alive for the model to adapt.
+    """
+
+    @staticmethod
+    def _executor(controller: AdmissionController) -> ToolExecutor:
+        async def body(arguments):
+            return "ran"
+
+        executor = ToolExecutor(admission=controller)
+        executor._tool_catalog = ToolCatalog(
+            [
+                ToolCatalogEntry(ToolIdentity("Safe"), {}, body, effects=EffectMetadata((Effect(EffectKind.READ),))),
+                ToolCatalogEntry(ToolIdentity("Risky"), {}, body, effects=EffectMetadata((Effect(EffectKind.EXECUTE),))),
+            ]
+        )
+        return executor
+
+    @pytest.mark.asyncio
+    async def test_authorize_runs_before_admission_and_returned_denial_is_recoverable(self):
+        controller = AdmissionController(leaf_limit=1, nested_limit=1)
+        executor = self._executor(controller)
+        seen: list[tuple[str, int]] = []
+
+        async def authorize(call, block_reason):
+            # The hook awaits while no permit may be held: with a limit of one, a
+            # hook that held it would deadlock the very next call's authorization.
+            seen.append((call["function"], controller.snapshot()["leaf"]["in_flight"]))
+            if call["function"] == "Risky":
+                return {"block": True, "reason": "denied by the operator"}
+            return None
+
+        executor.set_execution_hooks(authorize=authorize)
+        results = await asyncio.wait_for(
+            executor.execute_tools_async(
+                object(),
+                [
+                    {"function": "Safe", "arguments": {}, "tool_call_id": "s"},
+                    {"function": "Risky", "arguments": {}, "tool_call_id": "r"},
+                ],
+            ),
+            5,
+        )
+        assert seen == [("Safe", 0), ("Risky", 0)], "authorization ran while a permit was held"
+        assert results[0]["success"] is True
+        assert results[1]["type"] == "policy_block", "a returned denial is an adapt-able tool result"
+        assert results[1]["success"] is False
+        assert "denied by the operator" in results[1]["result"]
+        assert controller.snapshot()["leaf"]["in_flight"] == 0
+        executor.close()
+
+    @pytest.mark.asyncio
+    async def test_returned_denial_from_the_before_hook_is_recoverable_too(self):
+        controller = AdmissionController(leaf_limit=1, nested_limit=1)
+        executor = self._executor(controller)
+
+        async def before(call, block_reason):
+            return {"block": True, "reason": "queue policy refused"} if call["function"] == "Risky" else None
+
+        executor.set_execution_hooks(before=before)
+        results = await executor.execute_tools_async(object(), [{"function": "Risky", "arguments": {}, "tool_call_id": "r"}])
+        assert results[0]["type"] == "policy_block"
+        assert "queue policy refused" in results[0]["result"]
+        executor.close()
+
+    @pytest.mark.asyncio
+    async def test_cancellation_during_authorization_records_a_no_effect_terminal(self):
+        """I6: a cancelled decision still yields exactly one truthful terminal fact."""
+        executor = self._executor(AdmissionController(leaf_limit=1))
+        terminals: list[dict] = []
+
+        async def authorize(call, block_reason):
+            raise asyncio.CancelledError
+
+        async def after(call, result):
+            terminals.append(result)
+
+        executor.set_execution_hooks(authorize=authorize, after=after)
+        with pytest.raises(asyncio.CancelledError):
+            await executor.execute_tools_async(object(), [{"function": "Safe", "arguments": {}, "tool_call_id": "s"}])
+        assert len(terminals) == 1, "a cancelled authorization must record its terminal fact once"
+        assert terminals[0]["_cancelled"] is True
+        assert "_effect_unknown" not in terminals[0], "nothing was dispatched, so the effect is known to be none"
+        executor.close()
+
+    @pytest.mark.asyncio
+    async def test_raised_authorization_failure_stays_fatal(self):
+        executor = self._executor(AdmissionController(leaf_limit=1))
+
+        async def authorize(call, block_reason):
+            raise RuntimeError("durable append failed")
+
+        executor.set_execution_hooks(authorize=authorize)
+        with pytest.raises(RuntimeError, match="durable append failed"):
+            await executor.execute_tools_async(object(), [{"function": "Safe", "arguments": {}, "tool_call_id": "s"}])
+        executor.close()
+
+
+class TestOwnerScopedExecutionHooks:
+    """A runtime/executor shared by two live sessions must resolve each call's
+    durable-journal hooks from the *invoking* agent.
+
+    The hooks are a session's journal boundary: wiring them globally lets the
+    second session's ``prompt`` overwrite the first's, so the first session's
+    in-flight tool journals requested/authorized/started/terminal facts into the
+    wrong owner's turn even though the effect catalog is already owner-aware.
+    """
+
+    @pytest.mark.asyncio
+    async def test_two_agents_on_one_executor_keep_their_own_hooks(self):
+        executor = self._executor()
+
+        class Owner:
+            pass
+
+        first, second = Owner(), Owner()
+        seen: list[tuple[str, str]] = []
+
+        async def authorize_first(call, block_reason):
+            seen.append(("first", call["function"]))
+            return {"block": True, "reason": "first denied"} if call["function"] == "Risky" else None
+
+        async def authorize_second(call, block_reason):
+            seen.append(("second", call["function"]))
+
+        executor.set_execution_hooks(authorize=authorize_first, agent=first)
+        executor.set_execution_hooks(authorize=authorize_second, agent=second)
+
+        # Each owner's call is decided by its own hook, concurrently.
+        results = await asyncio.gather(
+            executor.execute_tools_async(first, [{"function": "Risky", "arguments": {}, "tool_call_id": "a"}]),
+            executor.execute_tools_async(second, [{"function": "Risky", "arguments": {}, "tool_call_id": "b"}]),
+        )
+        assert sorted(seen) == [("first", "Risky"), ("second", "Risky")], "hooks did not resolve per invoking agent"
+        assert results[0][0]["type"] == "policy_block", "the first owner's denial was lost"
+        assert "first denied" in results[0][0]["result"]
+
+        # Clearing one owner leaves the other's hooks (and the global path) intact.
+        executor.set_execution_hooks(agent=first)
+        global_seen: list[str] = []
+        executor.set_execution_hooks(authorize=lambda call, reason: global_seen.append("global"))
+        results = await asyncio.gather(
+            executor.execute_tools_async(first, [{"function": "Safe", "arguments": {}, "tool_call_id": "c"}]),
+            executor.execute_tools_async(second, [{"function": "Safe", "arguments": {}, "tool_call_id": "d"}]),
+        )
+        assert [r[0]["success"] for r in results] == [True, True]
+        assert global_seen == ["global"], "the cleared owner fell back to the global hooks, not the sibling's"
+        executor.close()
+
+    @pytest.mark.asyncio
+    async def test_unknown_agent_uses_the_global_legacy_hooks(self):
+        """Every pre-existing caller (no ``agent=``) keeps today's behavior."""
+        executor = self._executor()
+        seen: list[str] = []
+
+        async def after(call, result):
+            seen.append(call["tool_call_id"])
+
+        executor.set_execution_hooks(after=after)
+        await executor.execute_tools_async(object(), [{"function": "Safe", "arguments": {}, "tool_call_id": "g"}])
+        assert seen == ["g"]
+        executor.close()
+
+    @staticmethod
+    def _executor() -> ToolExecutor:
+        async def body(arguments):
+            return "ran"
+
+        executor = ToolExecutor()
+        executor._tool_catalog = ToolCatalog(
+            [
+                ToolCatalogEntry(ToolIdentity("Safe"), {}, body, effects=EffectMetadata((Effect(EffectKind.READ),))),
+                ToolCatalogEntry(ToolIdentity("Risky"), {}, body, effects=EffectMetadata((Effect(EffectKind.EXECUTE),))),
+            ]
+        )
+        return executor
+
+
+class TestOffloadEligibilityAndOwnership:
+    """I7/I8: only explicitly eligible sync work is offloaded, and a cancelled
+    dispatch keeps ownership of the physical work until it really stopped."""
+
+    @pytest.mark.asyncio
+    async def test_only_explicitly_marked_sync_callables_leave_the_loop(self):
+        executor = ToolExecutor()
+        loop_thread = threading.get_ident()
+        seen: dict[str, bool] = {}
+
+        @blocking_io
+        def marked(arguments):
+            seen["marked"] = threading.get_ident() != loop_thread
+            return "marked"
+
+        def unmarked(arguments):
+            seen["unmarked"] = threading.get_ident() != loop_thread
+            return "unmarked"
+
+        executor._tool_catalog = ToolCatalog(
+            [ToolCatalogEntry(ToolIdentity("Marked"), {}, marked), ToolCatalogEntry(ToolIdentity("Unmarked"), {}, unmarked)]
+        )
+        results = await executor.execute_tools_async(
+            object(),
+            [
+                {"function": "Marked", "arguments": {}, "tool_call_id": "m"},
+                {"function": "Unmarked", "arguments": {}, "tool_call_id": "u"},
+            ],
+        )
+        assert [r["success"] for r in results] == [True, True]
+        assert seen == {"marked": True, "unmarked": False}, "unmarked sync work must stay on the calling thread"
+        executor.close()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_dispatch_waits_for_the_physical_work_to_stop(self):
+        controller = AdmissionController(leaf_limit=1)
+        executor = ToolExecutor(admission=controller)
+        entered, exited = threading.Event(), threading.Event()
+
+        @blocking_io
+        def blocking_body(arguments):
+            entered.set()
+            claim = current_physical_work()
+            assert claim is not None, "an eligible offload must publish its ownership claim"
+            for _ in range(300):  # cooperatively cancellable work
+                if claim.cancel.is_set():
+                    break
+                time.sleep(0.01)
+            exited.set()
+            return "returned"
+
+        executor._tool_catalog = ToolCatalog([ToolCatalogEntry(ToolIdentity("Slow"), {}, blocking_body)])
+        call = asyncio.create_task(executor.execute_tools_async(object(), [{"function": "Slow", "arguments": {}, "tool_call_id": "s"}]))
+        assert await asyncio.to_thread(entered.wait, 5), "the offload never entered a worker"
+        assert controller.snapshot()["leaf"]["in_flight"] == 1, "the dispatch ran without holding its permit"
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(call), 5)
+        assert exited.is_set(), "the dispatch returned before the physical work stopped"
+        assert controller.snapshot()["leaf"]["in_flight"] == 0, "the permit outlived the work it covered"
+        executor.close(wait_for_offload=True)
+
+    @pytest.mark.asyncio
+    async def test_repeated_cancellation_retains_capacity_and_terminal_ownership_until_worker_exit(self):
+        """An uncooperative worker can outlive a status timeout, not its owner."""
+        controller = AdmissionController(leaf_limit=1)
+        entered, release, exited = threading.Event(), threading.Event(), threading.Event()
+        following_authorized = asyncio.Event()
+        following_started = asyncio.Event()
+        terminal: list[tuple[str, bool, bool]] = []
+
+        @blocking_io
+        def uncooperative(arguments):
+            entered.set()
+            try:
+                assert release.wait(15), "the test never released its physical worker"
+                return "physical result"
+            finally:
+                exited.set()
+
+        async def following(arguments):
+            assert exited.is_set(), "a following effect overlapped an abandoned worker"
+            following_started.set()
+            return "following result"
+
+        executor = ToolExecutor(
+            admission=controller,
+            tool_catalog=ToolCatalog(
+                [
+                    ToolCatalogEntry(ToolIdentity("Physical"), {}, uncooperative),
+                    ToolCatalogEntry(ToolIdentity("Following"), {}, following),
+                ]
+            ),
+        )
+
+        def authorize(call, reason):
+            if call["tool_call_id"] == "following":
+                following_authorized.set()
+
+        def after(call, result):
+            terminal.append((call["tool_call_id"], exited.is_set(), result.get("_effect_unknown", False)))
+
+        executor.set_execution_hooks(authorize=authorize, after=after)
+        physical = asyncio.create_task(
+            executor.execute_tools_async(object(), [{"function": "Physical", "arguments": {}, "tool_call_id": "physical"}])
+        )
+        tasks = [physical]
+        try:
+            assert await asyncio.to_thread(entered.wait, 3), "the physical worker never started"
+            follower = asyncio.create_task(
+                executor.execute_tools_async(object(), [{"function": "Following", "arguments": {}, "tool_call_id": "following"}])
+            )
+            tasks.append(follower)
+            await asyncio.wait_for(following_authorized.wait(), 3)
+            physical.cancel()
+            await asyncio.sleep(0.05)
+            physical.cancel()
+            # Cross the former five-second ownership cutoff while the worker is
+            # explicitly gated, rather than mocking a timeout implementation.
+            await asyncio.sleep(5.2)
+            assert not physical.done(), "cancellation was acknowledged while the physical effect was still active"
+            assert not exited.is_set()
+            assert not following_started.is_set()
+            assert terminal == [], "a terminal hook committed while its worker was still running"
+            assert controller.snapshot()["leaf"]["in_flight"] == 1
+
+            physical.cancel()
+            await asyncio.sleep(0.05)
+            assert not physical.done(), "re-cancellation abandoned the physical claim"
+            assert not following_started.is_set()
+            assert terminal == []
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(physical), 3)
+            results = await asyncio.wait_for(follower, 3)
+            assert results[0]["result"] == "following result"
+            assert set(terminal) == {("physical", True, True), ("following", True, False)}
+            assert controller.snapshot()["leaf"]["in_flight"] == 0
+        finally:
+            release.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 3)
+            await executor.aclose(wait_for_offload=True)
+
+    @pytest.mark.asyncio
+    async def test_unmarked_sync_callable_records_no_offload_claim(self):
+        """A call the executor cannot offload truthfully reports no physical claim."""
+        executor = ToolExecutor()
+        observed: list[object] = []
+
+        def inline(arguments):
+            observed.append(current_physical_work())
+            return "inline"
+
+        executor._tool_catalog = ToolCatalog([ToolCatalogEntry(ToolIdentity("Inline"), {}, inline)])
+        await executor.execute_tools_async(object(), [{"function": "Inline", "arguments": {}, "tool_call_id": "i"}])
+        assert observed == [None], "an inline call must not see a claim it does not own"
+        executor.close()
+
+
+class TestAdmissionLoopRetention:
+    """S8: a closed loop's admission state must not be retained forever."""
+
+    @pytest.mark.asyncio
+    async def test_closed_loop_pools_are_reclaimed(self):
+        controller = AdmissionController(leaf_limit=2)
+
+        async def touch():
+            permit = await controller.acquire_kind(controller.LEAF)
+            permit.release()
+
+        await touch()
+        assert controller.tracked_loops == 1
+        # Repeated acquisitions (e.g. one per test) must not accumulate entries:
+        # closed loops are reclaimed, so exactly one live entry is retained.
+        await touch()
+        await touch()
+        snapshot = controller.snapshot()
+        assert controller.tracked_loops == 1, "closed loop entries accumulated"
+        assert snapshot["leaf"]["in_flight"] == 0
+        assert controller.snapshot()["nested"]["in_flight"] == 0

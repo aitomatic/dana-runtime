@@ -1,7 +1,6 @@
 """OpenAI-compatible provider base class for OpenAI and Azure."""
 
 import hashlib
-import inspect
 import json
 import os
 from typing import Any
@@ -24,6 +23,7 @@ from ..types import (
     read_media_as_base64,
     unsupported_placeholder,
 )
+from ._stream_teardown import close_stream
 
 
 logger = structlog.get_logger()
@@ -163,16 +163,50 @@ def _responses_tool_calls(function_call_items: list[Any]) -> list:
     ]
 
 
-def _responses_finish_reason(response: Any, has_tool_calls: bool) -> str:
+def _tool_calls_completed(function_call_items: list[Any]) -> bool:
+    """True when every ``function_call`` item carries complete arguments.
+
+    Only an absent status (older payloads) or ``"completed"`` establishes
+    executable arguments. In-progress and incomplete calls are not executable.
+    """
+    return bool(function_call_items) and all(getattr(item, "status", None) in (None, "completed") for item in function_call_items)
+
+
+def _truncation_reason(response: Any) -> str | None:
+    """The Chat-Completions-style label for a truncated Responses terminal.
+
+    ``None`` when the terminal did not report truncation (or is absent on older
+    payloads). ``max_output_tokens`` maps to ``length``; any other cut-off reason
+    (content filter, ...) keeps the distinct ``incomplete`` label so a consumer
+    cannot mistake a refusal for an ordinary length limit.
+    """
+    if getattr(response, "status", None) != "incomplete":
+        return None
+    details = getattr(response, "incomplete_details", None)
+    reason = getattr(details, "reason", None) if details else None
+    return "length" if reason == "max_output_tokens" else "incomplete"
+
+
+def _responses_finish_reason(response: Any, function_call_items: list[Any]) -> str:
     """Map Responses API status to a Chat-Completions-style finish_reason so
-    callers don't need to know which path was used."""
-    if getattr(response, "status", None) == "incomplete":
-        details = getattr(response, "incomplete_details", None)
-        reason = getattr(details, "reason", None) if details else None
-        return "length" if reason == "max_output_tokens" else "incomplete"
-    if has_tool_calls:
-        return "tool_calls"
-    return "stop"
+    callers don't need to know which path was used.
+
+    The ``function_call`` items decide first, because they are what the host may act
+    on: a call the provider marked complete (or left status-less) carries complete
+    arguments and is executable, so the turn reports ``tool_calls`` even when the
+    terminal status is ``incomplete`` — reporting a truncation label there makes the
+    host drop a turn the model finished on purpose. A call explicitly marked
+    ``incomplete`` has truncated arguments and must never be executed, so it keeps
+    the truncation label.
+
+    With no calls, a truncation terminal keeps its ``length``/``incomplete`` label and
+    anything else is a normal ``stop``.
+    """
+    truncated = _truncation_reason(response)
+    has_calls = bool(function_call_items)
+    if has_calls:
+        return "tool_calls" if _tool_calls_completed(function_call_items) else (truncated or "incomplete")
+    return truncated or "stop"
 
 
 def _responses_usage(response: Any) -> tuple[dict[str, int] | None, int | None]:
@@ -768,7 +802,7 @@ class OpenAICompatibleProvider(LLMProvider):
 
         tool_calls_list: list = _responses_tool_calls(function_call_items)
 
-        resp_finish_reason = _responses_finish_reason(response, bool(tool_calls_list))
+        resp_finish_reason = _responses_finish_reason(response, function_call_items)
         resp_usage, reasoning_tokens = _responses_usage(response)
 
         return LLMResponse(
@@ -828,6 +862,21 @@ class OpenAICompatibleProvider(LLMProvider):
 
     # --- Streaming methods (Phases 2-4) ---
 
+    def _supports_stream_usage(self) -> bool:
+        """Whether this endpoint accepts ``stream_options={"include_usage": True}``.
+
+        Chat Completions streams on OpenAI and on current Azure ``api-version``
+        values accept it; older Azure versions reject the unknown field with a 400.
+        The base (OpenAI-compatible) answer is yes and Azure overrides by version,
+        so the request-side policy is decided by an explicit capability instead of a
+        speculative retry: a 400 for a malformed request is never retried, and
+        re-issuing a stream would duplicate output already delivered.
+
+        Callers may still opt in or out per request: an explicit ``stream_options``
+        passed through ``kwargs`` wins (the request is then sent as given).
+        """
+        return True
+
     async def _stream_chat_completions(self, messages: list[LLMMessage], tools: list | None = None, **kwargs):
         """Stream via client.chat.completions.create(stream=True).
 
@@ -840,7 +889,8 @@ class OpenAICompatibleProvider(LLMProvider):
         json_mode ``response_format`` and the same ``MODEL_RESTRICTIONS`` rename /
         removal apply. ``stream_options={"include_usage": True}`` is required for
         the API to send the usage accounting at all — without it the streaming path
-        had no token/cache counters while the non-streaming path did.
+        had no token/cache counters while the non-streaming path did — but it is
+        only sent when the endpoint supports it (:meth:`_supports_stream_usage`).
         """
         timeout = kwargs.get("timeout")
         _, openai_messages = self.prepare_messages(messages)
@@ -857,11 +907,12 @@ class OpenAICompatibleProvider(LLMProvider):
         if kwargs.get("json_mode", False):
             request_kwargs["response_format"] = {"type": "json_object"}
 
-        # Ask for the final usage frame. Caller-supplied stream_options win (e.g. to
-        # opt out against a proxy that rejects the field).
-        stream_options = dict(request_kwargs.pop("stream_options", None) or {})
-        stream_options.setdefault("include_usage", True)
-        request_kwargs["stream_options"] = stream_options
+        # Ask for the final usage frame when the endpoint accepts it. Caller-supplied
+        # stream_options win (e.g. to opt out against a proxy that rejects the field).
+        if "stream_options" in request_kwargs or self._supports_stream_usage():
+            stream_options = dict(request_kwargs.pop("stream_options", None) or {})
+            stream_options.setdefault("include_usage", True)
+            request_kwargs["stream_options"] = stream_options
 
         response = await self.client.chat.completions.create(
             **request_kwargs,
@@ -971,15 +1022,7 @@ class OpenAICompatibleProvider(LLMProvider):
         the response open until garbage collection. Failures are logged, never
         raised, so teardown cannot mask the real result of the turn.
         """
-        closer = getattr(stream, "close", None)
-        if closer is None:
-            return
-        try:
-            result = closer()
-            if inspect.isawaitable(result):
-                await result
-        except Exception as e:  # pragma: no cover - teardown must not raise
-            logger.warning("stream_close_failed", error_type=type(e).__name__)
+        await close_stream(stream)
 
     @staticmethod
     def _parsed_tool_call(tc: dict) -> dict:
@@ -1268,7 +1311,7 @@ class OpenAICompatibleProvider(LLMProvider):
             content="".join(content_parts),
             model=getattr(completion, "model", None) or self.model,
             usage=usage,
-            finish_reason=_responses_finish_reason(completion, bool(tool_calls)),
+            finish_reason=_responses_finish_reason(completion, function_call_items),
             tool_calls=tool_calls or None,
             reasoning_tokens=reasoning_tokens,
             reasoning_content="".join(reasoning_parts) or None,

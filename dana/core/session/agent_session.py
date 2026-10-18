@@ -29,6 +29,7 @@ import contextlib
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import inspect
 import json
 import os
 import time
@@ -52,6 +53,72 @@ logger = structlog.get_logger()
 
 # The three fact types that close a turn. Exactly one of these terminates a turn.
 _TERMINAL_FACT_TYPES = frozenset({FactType.TURN_COMPLETED, FactType.TURN_CANCELLED, FactType.TURN_ERROR})
+_TOOL_TERMINAL_FACT_TYPES = frozenset(
+    {
+        FactType.TOOL_RESULT,
+        FactType.TOOL_FAILURE,
+        FactType.TOOL_ACKNOWLEDGED,
+        FactType.TOOL_TIMED_OUT,
+        FactType.TOOL_EFFECT_UNKNOWN,
+    }
+)
+_TOOL_FACT_TYPES = _TOOL_TERMINAL_FACT_TYPES | {
+    FactType.TOOL_REQUESTED,
+    FactType.TOOL_AUTHORIZED_OR_DENIED,
+    FactType.TOOL_STARTED,
+    FactType.TOOL_PROGRESS,
+    FactType.TOOL_CANCELLATION_REQUESTED,
+}
+
+# Metadata marker carried by the single derived interruption note injected
+# into the working timeline (I2). The note is derived state: it is re-derived
+# from the fold state on every reconciliation and retired as soon as the
+# projected observation clears, so it is never persisted in a checkpoint and
+# never duplicated across reopen cycles.
+_INTERRUPTION_NOTE_KEY = "dana_interruption_observation"
+
+
+def _supports_agent_scoped_hooks(executor: Any) -> bool:
+    """Whether ``executor.set_execution_hooks`` accepts an ``agent=`` registration.
+
+    The session's durable hooks close over one turn (owner scope, correlation id,
+    journal target), so a runtime/executor shared by several overlapping sessions
+    must resolve them from the *invoking* agent instead of letting the last
+    session to start a turn overwrite the previous one. That per-agent contract is
+    detected on the executor's own signature; an executor without it keeps the
+    legacy process-global hooks, which remain correct for the one-session-per-
+    runtime shape every in-tree host uses.
+    """
+    installer = getattr(executor, "set_execution_hooks", None)
+    if installer is None:
+        return False
+    try:
+        return "agent" in inspect.signature(installer).parameters
+    except (TypeError, ValueError):  # pragma: no cover - exotic callable
+        return False
+
+
+def _install_execution_hooks(
+    executor: Any,
+    agent: Any,
+    *,
+    before: Any,
+    after: Any,
+    authorize: Any | None,
+) -> None:
+    """Install this session's tool-lifecycle hooks, owner-scoped when possible."""
+    if _supports_agent_scoped_hooks(executor):
+        executor.set_execution_hooks(before=before, after=after, authorize=authorize, agent=agent)
+    else:
+        executor.set_execution_hooks(before=before, after=after, authorize=authorize)
+
+
+def _clear_execution_hooks(executor: Any, agent: Any) -> None:
+    """Retire this session's hooks without disturbing another session's."""
+    if _supports_agent_scoped_hooks(executor):
+        executor.set_execution_hooks(agent=agent)
+    else:
+        executor.set_execution_hooks()
 
 
 def default_agent_factory() -> Any:
@@ -210,6 +277,16 @@ class AgentSession:
         self._lock = asyncio.Lock()
         self._append_lock = asyncio.Lock()
         self._cancel_event: asyncio.Event | None = None
+        # I4: set only by cancel(); distinguishes an explicit session cancel from
+        # the caller's own task cancellation. Reset per turn.
+        self._turn_cancel_requested = False
+        # Record tool lifecycle ownership at commit, before an interrupted hook
+        # can propagate cancellation and trigger pending-tool reconciliation.
+        self._tool_commit_observer: Callable[[Sequence[JournalFact], bool], None] | None = None
+        # I4: fact types of the most recently committed batch. Lets the
+        # cancellation handler tell whether a durable batch that was interrupted
+        # by the caller's cancellation already carried this turn's terminal.
+        self._committed_batch_types: tuple[FactType, ...] = ()
         self._stream_step: asyncio.Task | None = None
         self._agent: Any = None
         self._closed = False
@@ -432,6 +509,12 @@ class AgentSession:
         """
         if self._cancel_event is None:
             raise RuntimeError("cancel() called with no active turn; call prompt() first and consume it concurrently")
+        # I4: remember that *this* cancellation was host-requested. The prompt
+        # loop uses it to tell an explicit session cancel (the caller keeps
+        # iterating and observes TURN_CANCELLED) from the caller's own task being
+        # cancelled (asyncio.timeout / TaskGroup / teardown), which must
+        # propagate after the durable terminal.
+        self._turn_cancel_requested = True
         self._cancel_event.set()
         if self._last_terminal is None and self._stream_step is not None:
             self._stream_step.cancel()
@@ -468,6 +551,8 @@ class AgentSession:
             if self._closed:
                 raise RuntimeError("Session is closed")
             self._cancel_event = asyncio.Event()
+            self._turn_cancel_requested = False
+            self._committed_batch_types = ()
             self._last_terminal = None
             correlation_id = str(uuid4())
             user_text = " ".join(b.text for b in blocks)
@@ -497,7 +582,34 @@ class AgentSession:
                 # The live agent may mutate its working set until a terminal
                 # outcome. Failed/cancelled turns must reconcile from facts.
                 self._needs_hydration = True
-            except BaseException:
+            except BaseException as exc:
+                # I4: the caller's task can be cancelled while THIS batch is already
+                # committing. The batch is durable either way, so it must not be
+                # duplicated; but if it was the turn-start batch, the turn now has
+                # no terminal at all, so one TURN_CANCELLED is appended to keep the
+                # "exactly one terminal per turn" invariant (a failure here simply
+                # leaves the turn to the reopen recovery path, never masking the
+                # cancellation).
+                if isinstance(exc, asyncio.CancelledError) and FactType.TURN_STARTED in self._committed_batch_types:
+                    try:
+                        cancel_result = await self._append_facts(
+                            [
+                                NewJournalFact(
+                                    fact_type=FactType.TURN_CANCELLED,
+                                    correlation_id=correlation_id,
+                                    causation_id=correlation_id,
+                                    payload={"partial_text": "", "provider_responses": []},
+                                )
+                            ]
+                        )
+                        self._current_version = cancel_result.new_version
+                    except BaseException:
+                        logger.warning(
+                            "failed to terminalize an interrupted turn start",
+                            session_id=self._session_id,
+                            correlation_id=correlation_id,
+                            exc_info=True,
+                        )
                 self._cancel_event = None
                 raise
 
@@ -529,6 +641,43 @@ class AgentSession:
             tool_events_ready = asyncio.Event()
             executor = getattr(getattr(self._agent, "_runtime", None), "_tool_executor", None)
 
+            def _record_tool_commits(facts: Sequence[JournalFact], cancelled: bool) -> None:
+                """Account for durable outcomes before cancellation leaves a hook."""
+                for fact in facts:
+                    if fact.correlation_id != correlation_id or fact.fact_type not in _TOOL_FACT_TYPES:
+                        continue
+                    call_id = fact.payload.get("tool_call_id")
+                    if not call_id:
+                        continue
+                    if fact.fact_type is FactType.TOOL_REQUESTED:
+                        requested_tools[call_id] = None
+                    elif fact.fact_type is FactType.TOOL_STARTED:
+                        started_tools.add(call_id)
+                    elif fact.fact_type in _TOOL_TERMINAL_FACT_TYPES:
+                        terminal_tools.add(call_id)
+                    if cancelled:
+                        # The helper will raise instead of returning its event.
+                        # Keep the committed event visible to an explicit-cancel
+                        # consumer, which remains alive to receive TURN_CANCELLED.
+                        event = self._host_event_projector.project([fact])[0]
+                        if fact.fact_type is FactType.TOOL_REQUESTED:
+                            event = HostEvent(
+                                event_type=event.event_type,
+                                sequence=event.sequence,
+                                correlation_id=event.correlation_id,
+                                timestamp=event.timestamp,
+                                metadata={
+                                    "tool_call_id": call_id,
+                                    "tool_name": fact.payload["tool_name"],
+                                    "kind": fact.payload.get("kind"),
+                                    "raw_input": fact.payload["arguments"],
+                                },
+                            )
+                        tool_events.append(event)
+                        tool_events_ready.set()
+
+            self._tool_commit_observer = _record_tool_commits
+
             async def _request_tool(call: dict[str, Any]) -> str:
                 call_id = call.get("tool_call_id") or call.get("id")
                 if not call_id:
@@ -542,7 +691,6 @@ class AgentSession:
                             call.get("arguments", call.get("input", {})),
                         )
                     )
-                    requested_tools[call_id] = None
                     tool_events_ready.set()
                 return call_id
 
@@ -563,7 +711,6 @@ class AgentSession:
                         call_id, correlation_id, terminal_type, result=result.get("result", result), error=result.get("error")
                     )
                 )
-                terminal_tools.add(call_id)
                 tool_events_ready.set()
 
             async def _finish_pending_tools(cancelled: bool) -> None:
@@ -577,7 +724,16 @@ class AgentSession:
                         result["_cancelled"] = True
                     await _tool_terminal({"tool_call_id": call_id}, result)
 
-            async def _before_tool(call: dict[str, Any], block_reason: str | None) -> None:
+            async def _authorize_tool(call: dict[str, Any], block_reason: str | None) -> dict[str, Any] | None:
+                """I5/I6: journal requested + the permission decision BEFORE admission.
+
+                Returns a recoverable block verdict when the call must not be
+                dispatched, so the executor turns it into a normal ``policy_block``
+                tool result and the turn continues. Journal/effect failures still
+                propagate (the durable boundary must never be swallowed). No
+                admission permit is held here, so a queue of permission prompts
+                cannot starve the tool budget.
+                """
                 call_id = await _request_tool(call)
                 decision = await self._evaluate_tool_permission(call) if block_reason is None else None
                 reason = block_reason or (decision.get("reason") if decision else None)
@@ -591,26 +747,49 @@ class AgentSession:
                     )
                 )
                 tool_events_ready.set()
-                if reason is not None:
-                    if block_reason is None:
-                        await _tool_terminal(call, {"success": False, "error": reason, "error_code": "policy_block"})
-                        raise PermissionError(reason)
-                    return
+                if reason is None:
+                    return None
+                # Denied by the bus (block_reason set) or by policy. The executor
+                # records the policy_block terminal through the ``after`` hook, so
+                # this hook only reports the verdict; ``_tool_terminal`` stays
+                # idempotent if the executor also calls it.
+                return {"block": True, "reason": reason}
+
+            async def _before_tool(call: dict[str, Any], block_reason: str | None) -> dict[str, Any] | None:
+                """Admission-owned seam: journal TOOL_STARTED and re-check cancellation.
+
+                Runs after the permit is acquired, immediately before dispatch. A
+                block reason reaching this hook means the EventBus blocked the call
+                (``authorize`` already journaled requested/denied); nothing started
+                is recorded and the call is not dispatched.
+                """
+                call_id = await _request_tool(call)
+                if block_reason is not None:
+                    return {"block": True, "reason": block_reason}
                 if self._cancel_event is not None and self._cancel_event.is_set():
                     await _tool_terminal(call, {"success": False, "_cancelled": True, "error": "Cancelled before dispatch"})
                     raise asyncio.CancelledError
                 tool_events.append(await self.journal_tool_started(call_id, correlation_id))
-                started_tools.add(call_id)
                 tool_events_ready.set()
                 if self._cancel_event is not None and self._cancel_event.is_set():
                     await _tool_terminal(call, {"success": False, "_cancelled": True, "error": "Cancelled before dispatch"})
                     raise asyncio.CancelledError
+                return None
 
             if executor is not None and hasattr(executor, "set_execution_hooks"):
                 # Authoritative hooks propagate journal/policy failures. The
                 # best-effort bus must not own permission or effect durability.
+                # The executor owns the three-hook contract
+                # (authorize -> admission -> before -> after); every hook is wired
+                # so requested/authorized, started and terminal facts stay durable.
                 self._unregister_policy_hook()
-                executor.set_execution_hooks(_before_tool, _tool_terminal)
+                _install_execution_hooks(
+                    executor,
+                    self._agent,
+                    before=_before_tool,
+                    after=_tool_terminal,
+                    authorize=_authorize_tool,
+                )
 
             async def _flush_pending() -> None:
                 nonlocal chunk_index, chunk_buffer_bytes, last_flush
@@ -831,8 +1010,58 @@ class AgentSession:
                 return
 
             except (asyncio.CancelledError, GeneratorExit) as cancellation:
+                # Only cancellation of the prompt consumer belongs to its caller.
+                # cancel() cancels the owned stream step and its tool tasks, not
+                # this task. The event alone cannot distinguish simultaneous
+                # explicit and caller cancellation.
+                consumer = asyncio.current_task()
+                caller_cancelled = consumer is not None and consumer.cancelling() > 0
                 if self._last_terminal is not None:
+                    if caller_cancelled:
+                        raise
                     return
+                if caller_cancelled or not self._turn_cancel_requested:
+                    # _append_facts resolved any interrupted commit and recorded
+                    # its version, so a durable terminal must not be duplicated.
+                    if self._last_terminal is None and not any(
+                        fact_type in _TERMINAL_FACT_TYPES for fact_type in self._committed_batch_types
+                    ):
+                        # The committed batch was not a terminal (start/user/tool/
+                        # chunk), so the turn is still owed exactly one. Append it
+                        # here; a further cancellation simply leaves the turn to the
+                        # reopen recovery path (recover_interrupted_turns).
+                        try:
+                            if chunk_buffer:
+                                await self._flush_chunks(correlation_id, chunk_buffer, chunk_index)
+                            partial = "".join(accumulated)
+                            await _finish_pending_tools(cancelled=True)
+                            cancel_result = await self._append_facts(
+                                [
+                                    NewJournalFact(
+                                        fact_type=FactType.TURN_CANCELLED,
+                                        correlation_id=correlation_id,
+                                        causation_id=correlation_id,
+                                        payload={"partial_text": partial, "provider_responses": provider_responses},
+                                    )
+                                ]
+                            )
+                            self._current_version = cancel_result.new_version
+                            self._last_terminal = TurnTerminal(
+                                fact_type=FactType.TURN_CANCELLED,
+                                sequence=cancel_result.appended_facts[0].sequence,
+                                text=partial,
+                            )
+                        except BaseException:
+                            logger.warning(
+                                "failed to append cancellation terminal for a caller cancellation",
+                                session_id=self._session_id,
+                                correlation_id=correlation_id,
+                                exc_info=True,
+                            )
+                    # The caller's cancellation is the reason this turn ended: it
+                    # must propagate (never reported as a normal return), after the
+                    # durable boundary is settled.
+                    raise
                 # Cancellation requested via cancel(). Persist any buffered
                 # partial text, then a single TURN_CANCELLED terminal.
                 try:
@@ -850,6 +1079,21 @@ class AgentSession:
                     ]
                     cancel_result = await self._append_facts(cancel_facts)
                     self._current_version = cancel_result.new_version
+                except asyncio.CancelledError:
+                    # A second, unrelated cancellation (host teardown) landed while
+                    # the cancellation terminal was durable-pending. The batch is
+                    # committed at most once: if it committed, this turn already has
+                    # its single terminal; if the append itself was cancelled, the
+                    # turn is left open and the reopen recovery path
+                    # (``recover_interrupted_turns``) terminalizes it. Either way a
+                    # second terminal must never be appended, and the caller's
+                    # cancellation must still propagate.
+                    logger.warning(
+                        "cancellation terminal interrupted",
+                        session_id=self._session_id,
+                        correlation_id=correlation_id,
+                    )
+                    raise
                 except Exception:
                     # Don't swallow the original cancellation: log the
                     # terminal-append failure and re-raise CancelledError so
@@ -868,6 +1112,18 @@ class AgentSession:
                 )
                 if isinstance(cancellation, GeneratorExit):
                     return
+                # I4: `cancel()` (explicit session cancel) owns the outcome and
+                # the caller keeps iterating to observe the TURN_CANCELLED event.
+                # A cancellation that did NOT come from `cancel()` is the caller's
+                # own task being cancelled (asyncio.timeout / TaskGroup / a host
+                # shutting the turn down): the durable terminal above is already
+                # committed, so the CancelledError is now propagated instead of
+                # being reported as a normal return.
+                requested = self._turn_cancel_requested
+                if not requested:
+                    # The event stream ends here; the durable outcome is already
+                    # recorded and observable via last_terminal / replay.
+                    raise
                 while tool_events:
                     yield tool_events.popleft()
                 yield HostEvent(
@@ -946,8 +1202,9 @@ class AgentSession:
                 )
                 return
             finally:
+                self._tool_commit_observer = None
                 if executor is not None and hasattr(executor, "set_execution_hooks"):
-                    executor.set_execution_hooks()
+                    _clear_execution_hooks(executor, self._agent)
                 if self._agent is not None:
                     self._agent._session_cancel_event = None
                 self._cancel_event = None
@@ -980,8 +1237,28 @@ class AgentSession:
                         result = operation.result()
                         break
             self._current_version = result.new_version
-            self._advance_conversation(result.appended_facts)
-            if cancelled and self._cancel_event is None:
+            self._committed_batch_types = tuple(fact.fact_type for fact in result.appended_facts)
+            if self._tool_commit_observer is not None:
+                self._tool_commit_observer(result.appended_facts, cancelled)
+            try:
+                self._advance_conversation(result.appended_facts)
+            except Exception:
+                # C3: the batch is already durable. A failure in the derived fold
+                # (e.g. a malformed protected payload or a projection bug) must
+                # never surface as a second terminal for a turn that already
+                # committed one. Drop the derived cache and rebuild it from the
+                # authoritative journal on the next request instead.
+                self._invalidate_conversation_cache()
+                logger.warning(
+                    "conversation fold failed after commit",
+                    session_id=self._session_id,
+                    version=self._current_version,
+                    exc_info=True,
+                )
+            if cancelled:
+                # This may be the prompt consumer, its owned stream step, or a
+                # tool task. Preserve cancellation here; prompt() classifies the
+                # consumer's own cancellation separately from session.cancel().
                 raise asyncio.CancelledError
             return result
 
@@ -1023,16 +1300,27 @@ class AgentSession:
         if executor is None or not hasattr(executor, "set_execution_hooks"):
             self._register_policy_hook()
 
+    def _invalidate_conversation_cache(self) -> None:
+        """Drop every derived projection artifact and force a journal rebuild.
+
+        Used on a post-commit fold failure (C3) and on any other derived-state
+        failure: the Session Journal is authoritative, so the next request
+        reconstructs the working context from facts rather than trusting a
+        half-updated state or a stale checkpoint.
+        """
+        self._conversation_state = None
+        self._working_context = None
+        self._working_format = None
+        self._hydrated_tail_count = 0
+        self._needs_hydration = True
+
     def _advance_conversation(self, facts: Sequence[JournalFact]) -> None:
         """Fold definitively committed local facts under the append lock."""
         state = self._conversation_state
         if state is None:
             return
         if state.provider_key != self._current_provider:
-            self._conversation_state = None
-            self._working_context = None
-            self._hydrated_tail_count = 0
-            self._needs_hydration = True
+            self._invalidate_conversation_cache()
             return
         state.apply(facts)
 
@@ -1095,6 +1383,7 @@ class AgentSession:
                 append=True,
             )
             self._hydrated_tail_count = state.message_count
+        self._reconcile_interruption_note(state.interruption_observation)
         if self._working_context is None and not state.open_correlation_ids:
             self._capture_working_context()
 
@@ -1114,7 +1403,12 @@ class AgentSession:
             [
                 entry.to_dict()
                 for entry in entries
-                if not getattr(entry, "ephemeral", False) and not getattr(entry, "metadata", {}).get("ephemeral")
+                if not getattr(entry, "ephemeral", False)
+                and not (getattr(entry, "metadata", None) or {}).get("ephemeral")
+                # I2: the interruption note is derived state, re-injected on the
+                # next reconciliation when the observation is still current.
+                # Persisting it would freeze a stale instruction into the cache.
+                and not (getattr(entry, "metadata", None) or {}).get(_INTERRUPTION_NOTE_KEY)
             ]
         )
         self._working_format = "native" if native is not None else "entries"
@@ -1238,6 +1532,66 @@ class AgentSession:
             # terminal outcome. Reopen can always reconstruct from facts.
             logger.warning("conversation checkpoint write failed", session_id=self._session_id)
 
+    def _reconcile_interruption_note(self, observation: str | None) -> None:
+        """Hold exactly one model-visible interruption note while it is current.
+
+        I2: the note is derived state, not history. It is injected once when the
+        fold reports an interruption observation (so the model is told not to
+        assume unfinished effects completed), and retired as soon as that
+        observation clears - which a later completed/errored/cancelled turn, or
+        the recovery turn's own terminal fact, does. Reopening a session
+        therefore never re-injects or duplicates it, and it is never persisted in
+        the derived working-context checkpoint.
+
+        The scan is authoritative rather than flag-based, so a projection that
+        dropped the note on its own (``Timeline.set_context`` replaces every
+        CONTEXT entry on each prompt build) is repaired on the next request while
+        the observation is still current.
+        """
+        timeline = getattr(self._agent, "_timeline", None)
+        if timeline is None:
+            return
+        native = getattr(timeline, "_native_messages", None)
+        if native is None:
+            native = getattr(timeline, "native_messages", None)
+        entries = getattr(timeline, "timeline", None)
+        if entries is None and native is None:
+            return
+
+        def _is_note(item: Any) -> bool:
+            return bool((getattr(item, "metadata", None) or {}).get(_INTERRUPTION_NOTE_KEY))
+
+        present = (entries is not None and any(_is_note(entry) for entry in entries)) or (
+            native is not None and any(_is_note(message) for message in native)
+        )
+        if present and observation:
+            return
+        if present:
+            if entries is not None:
+                entries[:] = [entry for entry in entries if not _is_note(entry)]
+            if native is not None:
+                native[:] = [message for message in native if not _is_note(message)]
+            return
+        if not observation:
+            return
+
+        from dana.core.timeline.timeline import TimelineEntry, TimelineEntryType
+
+        note = TimelineEntry(
+            entry_type=TimelineEntryType.CONTEXT,
+            content=observation,
+            metadata={_INTERRUPTION_NOTE_KEY: True},
+        )
+        add_entry = getattr(timeline, "add_entry", None)
+        if callable(add_entry):
+            # CompressedTimeline.add_entry keeps the entries list and the native
+            # mirror in step for one entry.
+            add_entry(note)
+        elif entries is not None:
+            entries.append(note)
+        else:
+            native.append(note)
+
     async def _checkpoint_completed_turn(self) -> None:
         """Publish derived context only after the final journal batch commits."""
         try:
@@ -1260,13 +1614,11 @@ class AgentSession:
                         ),
                         append=True,
                     )
+            self._reconcile_interruption_note(state.interruption_observation)
             self._capture_working_context()
             await self._save_conversation_checkpoint()
         except Exception:
-            self._conversation_state = None
-            self._working_context = None
-            self._hydrated_tail_count = 0
-            self._needs_hydration = True
+            self._invalidate_conversation_cache()
             logger.warning("committed turn context cache unavailable", session_id=self._session_id)
 
     async def _wire_mcp_tools(self, agent: Any) -> None:
@@ -1338,6 +1690,13 @@ class AgentSession:
                     await self.dispose_mcp()
                 finally:
                     self._unregister_policy_hook()
+                    # I9: clear this session's owner-scoped scheduling artifacts
+                    # (effect-order catalog + MCP effect map) from the agent that
+                    # carries them. Setting is the same operation that published
+                    # them, so it is a no-op for an agent that was never prepared.
+                    if self._agent is not None:
+                        self._agent._session_effect_catalog = None
+                        self._agent._session_mcp_effects = None
                     if self._owns_repository:
                         await self._repository.close()
 
@@ -1409,8 +1768,30 @@ class AgentSession:
             list(native_tools),
             version=self._catalog_version,
             mcp_names=mcp_names,
+            mcp_effects=getattr(wiring, "mcp_effects", None) if wiring is not None else None,
         )
         self._catalog_key = key
+        if tool_executor is not None:
+            # I9: publish this session's scheduling artifacts ON THE AGENT that
+            # owns them, and wire one owner-aware getter per executor. A
+            # runtime/executor can be shared by several overlapping sessions, so
+            # both the effect catalog and the MCP effect map are resolved from the
+            # *invoking* agent (the same rule the tool-name registry uses) - a
+            # session-scoped mapping would let the last writer win and schedule
+            # another session's calls against the wrong metadata. A getter that
+            # resolves to None degrades to the executor's own conservative
+            # fallbacks (native table / per-server EXECUTE ordering).
+            self._agent._session_effect_catalog = self._tool_catalog
+            # ``mcp_effects`` is optional on the wiring contract: a test double or
+            # an older wiring object simply has none, which leaves the executor's
+            # per-server ordering in charge.
+            self._agent._session_mcp_effects = dict(getattr(wiring, "mcp_effects", None) or {}) if wiring is not None else None
+            if hasattr(tool_executor, "set_effect_catalog_getter"):
+                tool_executor.set_effect_catalog_getter(lambda agent: getattr(agent, "_session_effect_catalog", None))
+            if hasattr(tool_executor, "set_mcp_effect_resolver"):
+                tool_executor.set_mcp_effect_resolver(
+                    lambda agent=None: getattr(agent, "_session_mcp_effects", None) if agent is not None else None
+                )
 
     def _register_policy_hook(self) -> None:
         """Subscribe the TOOL_CALL permission hook on the agent's EventBus.
@@ -1512,8 +1893,6 @@ class AgentSession:
         if entries is None:
             return
         restored = []
-        if view.interruption_observation:
-            restored.append(TimelineEntry(entry_type=TimelineEntryType.CONTEXT, content=view.interruption_observation))
         for msg in view.messages:
             if msg.role == "user":
                 entry_type = TimelineEntryType.USER_MESSAGE

@@ -21,6 +21,7 @@ from dana.common.llm.types import (
     ConfigurationError,
     LLMError,
     LLMMessage,
+    LLMProvider,
     LLMResponse,
     LLMStreamChunk,
     LLMTimeoutError,
@@ -48,9 +49,17 @@ REQUEST_DEADLINE_ENV = "DANA_LLM_REQUEST_DEADLINE_SECONDS"
 # the full retry sequence while still capping a wedged connection.
 DEFAULT_REQUEST_DEADLINE_SECONDS = 900.0
 
-# Smallest slice of the budget worth handing to a provider attempt. A remainder
-# below this is treated as already exhausted (see ``_attempt_timeout``).
-MIN_ATTEMPT_TIMEOUT_SECONDS = 0.05
+# Idle bound between streamed frames. The logical-request budget only gates the
+# wait for an attempt's *first* frame: a stream that keeps delivering may
+# legitimately run past the deadline, while a connection that stops delivering is
+# dead. Each later frame wait is therefore bounded by this constant instead, i.e.
+# the provider SDK's own per-attempt timeout (360s).
+STREAM_IDLE_TIMEOUT_SECONDS = 360.0
+
+# Sampling temperature the runtimes configure by default (``AgentRuntime``'s
+# ``temperature=0``). The streaming path omits it so the provider's own default
+# applies; see :meth:`LLMCaller._build_request_kwargs`.
+DEFAULT_TEMPERATURE = 0.0
 
 # Keywords that indicate a transient (retriable) provider error.
 # "connection" matches openai.APIConnectionError → wrapped as ProviderError("...: Connection error.").
@@ -254,25 +263,28 @@ class LLMCaller:
         carrier as they arrive. Request controls (temperature, max_tokens,
         json_mode) are assembled by the same :meth:`_build_request_kwargs` used by
         the non-streaming path, so streaming and non-streaming send the same
-        provider-neutral policy and the adapters translate it per capability.
+        provider-neutral policy and the adapters translate it per capability, save
+        for the runtime default temperature, which streaming omits (see
+        :meth:`_build_request_kwargs`).
 
         Retry policy: bounded re-issue **only while nothing has been emitted**.
         Once a chunk reaches the consumer, a failure is raised as-is — replaying
         would duplicate output the host has already rendered. No provider
         failover: a second provider would restart a partially-delivered turn.
 
-        Budget: the same logical-request deadline as the non-streaming path. Each
-        frame wait — including the first, where a stalled connection is otherwise
-        invisible — is bounded by the remaining budget, using the *overall*
-        deadline rather than a per-frame slice so a healthy long stream is never
-        cut off mid-turn. A stalled stream therefore surfaces as
-        :class:`LLMTimeoutError` and the underlying response is closed without any
-        partial output being replayed.
+        Budget: the logical-request deadline bounds the wait for the *first*
+        frame, where a stalled connection is otherwise invisible. Once frames are
+        flowing, each subsequent wait is bounded by
+        :data:`STREAM_IDLE_TIMEOUT_SECONDS` (or the provider's own stricter
+        timeout) instead, so a healthy long stream is never cut off mid-turn while
+        a stream that stops delivering still fails as a typed
+        :class:`LLMTimeoutError`. The provider stream is closed on every exit path
+        and nothing already emitted is replayed.
         """
         agent = self._agent_getter()
         agent_kwargs = self._agent_kwargs(agent)
         tools = self._native_tools_getter() or None
-        request_kwargs = self._build_request_kwargs()
+        request_kwargs = self._build_request_kwargs(streaming=True)
         deadline = self._new_deadline()
 
         last_exc: Exception | None = None
@@ -282,9 +294,31 @@ class LLMCaller:
             stream: AsyncIterator[LLMStreamChunk] | None = None
             try:
                 llm = self._resolve_llm()
-                stream = llm.stream(messages, tools=tools, timeout=self._attempt_timeout(deadline), **request_kwargs, **agent_kwargs)
+                stream = llm.stream(
+                    messages,
+                    tools=tools,
+                    timeout=self._attempt_timeout(deadline, llm),
+                    **request_kwargs,
+                    **agent_kwargs,
+                )
+                first_frame = True
                 while True:
-                    chunk = await self._next_chunk(stream, deadline, self._provider)
+                    if first_frame:
+                        # The first frame is where a stalled connection is invisible to
+                        # the transport timeout, so it is bounded by the same
+                        # per-attempt ceiling the provider was handed: the smaller of
+                        # the remaining budget and the provider's own timeout. Capping
+                        # at the latter keeps one hung connection from consuming the
+                        # whole budget before the configured retry can run, and also
+                        # covers the budget-disabled case, where it repeats the bound
+                        # the SDK applies on the wire.
+                        frame_timeout = self._attempt_timeout(deadline, llm) or self._stream_idle_timeout(llm)
+                    else:
+                        # Frames are flowing: the turn is alive, so only idleness counts
+                        # and the request deadline no longer applies.
+                        frame_timeout = self._stream_idle_timeout(llm)
+                    chunk = await self._next_chunk(stream, frame_timeout, self._provider)
+                    first_frame = False
                     emitted = True
                     yield chunk
             except (GeneratorExit, asyncio.CancelledError):
@@ -325,31 +359,29 @@ class LLMCaller:
         if last_exc is not None:
             raise last_exc
 
-    async def _next_chunk(self, stream: Any, deadline: float, provider_label: str) -> LLMStreamChunk:
-        """Await the next stream frame, bounded by the remaining request budget.
+    async def _next_chunk(self, stream: Any, timeout: float | None, provider_label: str) -> LLMStreamChunk:
+        """Await the next stream frame, bounded by ``timeout`` seconds.
 
-        A provider that accepts the request and then stalls (never sends the first
-        byte, or stops mid-stream) would otherwise hang the turn indefinitely: the
-        transport timeout only starts once the response headers arrive. Racing the
-        frame against the remaining budget converts that into a typed
-        :class:`LLMTimeoutError`, and the underlying response is closed before the
-        error propagates so the connection is not leaked and nothing already
-        emitted is replayed.
-
-        Uses the overall deadline rather than a per-frame timeout so a healthy but
-        slow stream is not cut off between chunks.
+        The caller passes the remaining logical-request budget for the *first*
+        frame — a provider that accepts the request and then stalls before sending
+        anything would otherwise hang the turn indefinitely, because the transport
+        timeout only starts once the response headers arrive. Later frames are
+        awaited with the fixed idle bound instead (``timeout=None``), so a healthy
+        but slow stream is not cut off between chunks while a stream that stops
+        delivering is still detected. Either way the failure is a typed
+        :class:`LLMTimeoutError` and the underlying response is closed before
+        propagating, so nothing already emitted is replayed.
         """
-        remaining = self._budget_left(deadline)
-        if remaining == float("inf"):
+        if timeout is None:
             return await stream.__anext__()
         try:
             # ``asyncio.timeout`` (3.11+) cancels the pending ``__anext__`` directly,
             # unlike wrapping it in a Task, and converts expiry into TimeoutError.
-            async with asyncio.timeout(remaining):
+            async with asyncio.timeout(timeout):
                 return await stream.__anext__()
         except TimeoutError as e:
             await self._aclose_stream(stream)
-            raise LLMTimeoutError(f"{provider_label}: stream deadline exceeded waiting for the next chunk") from e
+            raise LLMTimeoutError(f"{provider_label}: stream idle timeout exceeded waiting for the next chunk") from e
         except asyncio.CancelledError:
             # Owner cancellation: release the connection before unwinding.
             await self._aclose_stream(stream)
@@ -401,7 +433,7 @@ class LLMCaller:
             return {}
         return {"agent_id": agent.object_id, "agent_type": agent.agent_type}
 
-    def _build_request_kwargs(self) -> dict[str, Any]:
+    def _build_request_kwargs(self, *, streaming: bool = False) -> dict[str, Any]:
         """Single assembly point for provider-neutral request controls.
 
         Both :meth:`call_llm_stream` and the non-streaming invocations read the
@@ -415,11 +447,22 @@ class LLMCaller:
         ``max_tokens``/``temperature`` are omitted when unset/None rather than
         sent as null: providers treat an explicit null differently from an
         absent key, and the adapters rely on presence checks.
+
+        ``streaming`` additionally omits the *runtime default* temperature. The
+        streaming path never put a temperature on the wire before, so every
+        provider applied its own sampling default; sending the runtime's ``0``
+        instead is not a policy the caller ever expressed, and it is a hard 400 on
+        families and deployments that reject sampling (o3/o4, Azure gpt-5
+        deployments not named ``gpt-5*``) and a silent behaviour change everywhere
+        else. A caller that explicitly asks for a non-default temperature still
+        gets it, subject to the same per-model restriction the non-streaming path
+        uses. The non-streaming path keeps forwarding the value unchanged: its
+        wire shape is unchanged by this PR.
         """
         kwargs: dict[str, Any] = {"json_mode": self._json_mode}
         if self._max_tokens is not None:
             kwargs["max_tokens"] = self._max_tokens
-        if self._temperature is not None:
+        if self._temperature is not None and not (streaming and self._temperature == DEFAULT_TEMPERATURE):
             kwargs["temperature"] = self._temperature
         return kwargs
 
@@ -453,19 +496,50 @@ class LLMCaller:
             return float("inf")
         return deadline - time.monotonic()
 
-    def _attempt_timeout(self, deadline: float) -> float | None:
-        """Per-attempt ceiling derived from the shared logical-request budget.
+    def _provider_timeout(self, llm: LLM | None) -> float:
+        """The provider's own configured per-attempt ceiling.
+
+        Each provider class advertises :attr:`LLMProvider.DEFAULT_TIMEOUT_SECONDS`
+        and hands it to its SDK/HTTP client. Reading it here keeps one attempt from
+        being handed a budget so large that a single hung connection consumes the
+        whole request before any configured retry can run.
+        """
+        provider = getattr(llm, "provider", None) if llm is not None else None
+        configured = getattr(provider, "DEFAULT_TIMEOUT_SECONDS", None)
+        if not isinstance(configured, (int, float)) or configured <= 0:
+            return float(LLMProvider.DEFAULT_TIMEOUT_SECONDS)
+        return float(configured)
+
+    def _attempt_timeout(self, deadline: float, llm: LLM | None = None) -> float | None:
+        """Per-attempt ceiling: the smaller of the budget left and the provider's own.
 
         This is the value handed to the awaited provider operation, so the budget
         bounds the actual call rather than only the backoff between calls. Returns
         ``None`` when the budget is disabled (``deadline <= 0``) so the provider
-        keeps its own timeout. A positive remainder is clamped to at least
-        :data:`MIN_ATTEMPT_TIMEOUT_SECONDS`: an attempt with less time than that is
-        already over, and starting it would burn a round trip only to report failure.
+        keeps its own timeout.
+
+        Capping at the provider's configured timeout is what keeps a stalled
+        attempt retriable: handed the whole remaining budget (900s by default), one
+        hung connection would outlive the request deadline and no configured retry
+        could ever run. An exhausted remainder is returned as-is — the caller
+        refuses to start such an attempt in the first place
+        (:meth:`_raise_if_deadline_exhausted`), so it is never inflated into a
+        timeout the budget cannot pay for.
         """
         if deadline <= 0:
             return None
-        return max(MIN_ATTEMPT_TIMEOUT_SECONDS, self._budget_left(deadline))
+        return min(self._budget_left(deadline), self._provider_timeout(llm))
+
+    def _stream_idle_timeout(self, llm: LLM | None = None) -> float:
+        """Bound on the wait for one *later* stream frame.
+
+        The logical-request budget gates only the first frame (a stalled connection
+        is otherwise invisible). After that, a stream that keeps delivering may run
+        as long as it likes — the caller is making progress — while one that stops
+        delivering is dead. The provider's configured timeout wins when it is
+        stricter than :data:`STREAM_IDLE_TIMEOUT_SECONDS`.
+        """
+        return min(STREAM_IDLE_TIMEOUT_SECONDS, self._provider_timeout(llm))
 
     def _backoff_delay(self, attempt: int) -> float:
         """Exponential backoff capped by ``retry_max_delay`` (never negative)."""
@@ -513,7 +587,7 @@ class LLMCaller:
             for attempt in range(self._max_retries + 1):
                 self._raise_if_deadline_exhausted(deadline, provider_label)
                 try:
-                    return self._invoke_llm_sync(llm, messages, messages_fn, timeout=self._attempt_timeout(deadline))
+                    return self._invoke_llm_sync(llm, messages, messages_fn, timeout=self._attempt_timeout(deadline, llm))
                 except Exception as exc:
                     if not self._is_transient_error(exc):
                         raise
@@ -568,7 +642,7 @@ class LLMCaller:
                 self._raise_if_deadline_exhausted(deadline, provider_label)
                 try:
                     return await self._await_within_budget(
-                        lambda llm=llm: self._invoke_llm_async(llm, messages, messages_fn, timeout=self._attempt_timeout(deadline)),
+                        lambda llm=llm: self._invoke_llm_async(llm, messages, messages_fn, timeout=self._attempt_timeout(deadline, llm)),
                         deadline,
                         provider_label,
                     )

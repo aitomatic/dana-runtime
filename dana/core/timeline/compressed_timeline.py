@@ -14,6 +14,7 @@ Key features:
 from __future__ import annotations
 
 from collections.abc import Callable
+import copy
 from dataclasses import dataclass
 from datetime import datetime
 import json
@@ -52,6 +53,11 @@ if TYPE_CHECKING:
 
 logger = get_logger()
 
+# Sentinel recorded as a message's dependency snapshot when a shared payload
+# cannot be copied for later comparison. Such a message is re-estimated on every
+# read (bounded to that message), which is exact and never a whole-history scan.
+_UNSNAPSHOTABLE = object()
+
 # Re-export type alias so existing imports still work
 # (e.g. `from dana.core.agent.compressed_timeline import NativeMessageRole`)
 __all__ = [
@@ -66,6 +72,26 @@ __all__ = [
     "CompressionMixin",
     "TimelineSerializerMixin",
 ]
+
+
+def _same_token_dependency(live: Any, snapshot: Any) -> bool:
+    """Compare counted payloads without conflating equal, differently rendered values."""
+    if live is snapshot:
+        return True
+    if type(live) is not type(snapshot):
+        return False
+    if isinstance(live, dict):
+        return len(live) == len(snapshot) and all(
+            _same_token_dependency(key, old_key) and _same_token_dependency(value, old_value)
+            for (key, value), (old_key, old_value) in zip(live.items(), snapshot.items(), strict=True)
+        )
+    if isinstance(live, (list, tuple)):
+        return len(live) == len(snapshot) and all(
+            _same_token_dependency(value, old_value) for value, old_value in zip(live, snapshot, strict=True)
+        )
+    if isinstance(live, (str, bytes, int, bool, type(None))):
+        return live == snapshot
+    return repr(live) == repr(snapshot)
 
 
 @dataclass
@@ -234,15 +260,35 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
         self._native_token_source: list[NativeMessage] | None = None
         self._native_token_len: int = 0
 
+        # Per-message token cache backing the incremental total: one entry per
+        # message in the list the total was computed for, as
+        # ``(message, dependency_snapshot | None, tokens)``. The snapshot is what a
+        # read compares to observe a caller's in-place edit of a shared payload or a
+        # rebound counted attribute, so only the messages that actually changed are
+        # re-estimated. See ``_refresh_aliased_token_caches``.
+        self._token_message_caches: list[tuple[NativeMessage, Any, int]] = []
+
+        # True once a caller has been handed the live message *objects* (the
+        # ``native_messages`` getter). A held object lets the caller rebind even a
+        # counted attribute that was immutable, so while this is set every cached
+        # message carries a dependency snapshot. Distinct from
+        # ``_native_aliasing_risk``, which is also set when only the caller's
+        # ``add_entry`` payload objects are shared: those are covered by the
+        # snapshot on the message that holds them, without widening the check to
+        # messages that hold nothing a caller can reach.
+        self._message_objects_escaped: bool = False
+
         # True once the model-facing native state has been handed to a caller that
         # can mutate it in place — through the ``native_messages`` getter, or by
         # handing ``add_entry`` content/tool-argument objects it still owns. Such a
-        # change (even a same-length content edit, or a nested tool-argument dict
-        # edit) cannot be observed from the list or from the message objects, and
-        # escaped message objects survive into new lists (compaction, hydration and
+        # change (a same-length content edit, or a nested tool-argument dict edit)
+        # cannot be observed from the list or from the message objects, and escaped
+        # message objects survive into new lists (compaction, hydration and
         # ``load_from_entries`` reuse the very same ``NativeMessage`` instances).
-        # While this is set, the cached total is not trusted and reads recompute.
-        # It is sticky for the timeline instance, and is only cleared by building a
+        # This flag is the conservative read signal used by the install/ownership
+        # predicates; the per-message dependency snapshots are what actually observe
+        # a caller's edit, so it never forces a re-scan of retained history by itself.
+        # It is sticky for the timeline instance and is only cleared by building a
         # projection this timeline rebuilt without sharing caller-mutable state
         # (see ``_install_built_projection``).
         self._native_aliasing_risk: bool = False
@@ -326,24 +372,33 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
     # total is what ``needs_compression()`` compares against the trigger. That
     # total is maintained incrementally:
     #
-    #   * appends and in-place content replacements fold an exact delta
-    #     (``_fold_token_delta``),
+    #   * appends, in-place content replacements, and caller edits fold exact
+    #     per-message deltas (``_fold_token_delta``, ``_refresh_aliased_token_caches``),
     #   * hydration, load, and compaction-replacement install a whole new list
     #     and recompute once (``_install_model_state``).
     #
-    # The cached total is trusted only while its marker still describes the live
-    # list *and* the model-facing state has never been aliased: same list object,
-    # same length, and ``_native_aliasing_risk`` clear. A list this size can be
-    # mutated in place by a caller holding one of its messages, and those message
-    # objects survive into later lists, so once the state has escaped the cached
-    # total is not trusted and reads recompute. Direct rebinding or trimming of
-    # ``_native_messages`` fails the marker and recomputes the same way. A stale
-    # cached value is never returned.
+    # The marker (source list identity + length) catches rebinding and trimming.
+    # An edit a caller makes in place is caught per message instead: each cache
+    # entry remembers the payload state its token count was computed from, and a
+    # read re-checks only the messages that have such a dependency, re-estimating
+    # (and folding) exactly those that changed. That covers both supported edit
+    # routes — the payload objects ``add_entry`` shares (a multimodal content list,
+    # tool-call argument dicts) and a message object taken through the public
+    # ``native_messages`` getter — so a tool-using history, the ordinary case,
+    # observes an in-place argument edit without re-estimating the retained history.
+    # Mutable dependencies require recursive, representation-sensitive comparison.
+    # Verification cost scales with retained mutable payload size, even when no
+    # message needs a new token estimate.
 
     def _token_marker_valid(self) -> bool:
-        """True when the cached token total still describes the live native list."""
-        if self._native_aliasing_risk:
-            return False
+        """True when the cached token total still describes the live native list.
+
+        The marker is the cheap structural check — same list object, same length,
+        and every cached message still at its own index (see
+        ``_refresh_aliased_token_caches``). An escaped projection is *not* part of
+        this check: escaped edits are observed per message by the dependency
+        snapshots, so escaping never forces a full-history recomputation.
+        """
         return self._native_token_source is self._native_messages and self._native_token_len == len(self._native_messages)
 
     def _anchor_token_marker(self) -> None:
@@ -365,37 +420,221 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
         self._native_token_total = max(0, self._native_token_total + delta)
         self._anchor_token_marker()
 
+    def _apply_message_token_delta(self, message: NativeMessage, fresh_tokens: int, *, marker_was_valid: bool) -> None:
+        """Record that ``message`` now costs ``fresh_tokens``, folding the delta.
+
+        Used by mutators that change one message's counted content in place outside
+        the append path (cheap-shrink stubbing). The cache entry is updated in the
+        same step as the total, so a later read does not re-detect the same change
+        and fold it a second time.
+        """
+        if not marker_was_valid:
+            return
+        for index, (cached, _deps, tokens) in enumerate(self._token_message_caches):
+            if cached is message:
+                self._native_token_total = max(0, self._native_token_total + fresh_tokens - tokens)
+                self._token_message_caches[index] = (message, self._capture_message_dependencies(message), fresh_tokens)
+                self._anchor_token_marker()
+                return
+        # Not in the cache (a cold list): fold from zero, the read will reconcile.
+        self._native_token_total = max(0, self._native_token_total + fresh_tokens)
+        self._anchor_token_marker()
+
+    def _dependency_sources(self, message: NativeMessage) -> list[Any]:
+        """The live values a message's token count is computed from.
+
+        Mirrors ``_estimate_native_message_tokens``: the content, and for each tool
+        call its id, name and arguments mapping. These are exactly the values a
+        caller can change in place on a message the timeline shares with them.
+        """
+        sources: list[Any] = [message.content]
+        if message.tool_calls:
+            sources.append(len(message.tool_calls))
+            for call in message.tool_calls:
+                sources.extend((call.id, call.name, call.arguments))
+        return sources
+
+    def _message_needs_dependency_check(self, message: NativeMessage) -> bool:
+        """True when ``message`` carries state a check on read must verify.
+
+        A message whose counted payloads are all immutable is skipped: nothing a
+        caller does to their own bindings can change it (the fast path for ordinary
+        text-only history). A message with a shared mutable payload — the content
+        list of a multimodal turn, or tool-call arguments — is checked. Once a caller
+        holds the message *objects* themselves, a counted attribute can be rebound,
+        so every message is checked then.
+        """
+        if self._message_objects_escaped:
+            return True
+        return self._is_caller_owned_value(message.content) or bool(message.tool_calls)
+
+    def _capture_message_dependencies(self, message: NativeMessage) -> Any:
+        """Snapshot the dependency state of ``message`` for later comparison.
+
+        A fixed-length tuple mirrors ``_dependency_sources``. Comparisons recurse
+        through mutable payloads and therefore scale with their size;
+        ``None`` is stored when the message needs no check at all. Each slot
+        holds a private copy of a mutable payload (so an in-place edit of the caller's
+        object compares unequal) or the value itself for an immutable one (so an
+        unchanged string or id compares by identity rather than by text).
+        ``_UNSNAPSHOTABLE`` marks a tuple holding at least one payload that could not
+        be copied: that message is re-estimated on every read — bounded to it, never
+        a whole-history scan.
+        """
+        if not self._message_needs_dependency_check(message):
+            return None
+        uncopyable = False
+        captured: list[Any] = []
+        for value in self._dependency_sources(message):
+            if self._is_caller_owned_value(value):
+                try:
+                    captured.append(copy.deepcopy(value))
+                except Exception:
+                    logger.debug("message payload could not be snapshotted; re-estimating it per read", exc_info=True)
+                    captured.append(value)
+                    uncopyable = True
+            else:
+                captured.append(value)
+        return _UNSNAPSHOTABLE if uncopyable else tuple(captured)
+
+    def _record_message_token_cache(self, message: NativeMessage, tokens: int) -> None:
+        """Record one message's token count and dependency snapshot."""
+        self._token_message_caches.append((message, self._capture_message_dependencies(message), tokens))
+
+    def _mark_projection_escaped(self) -> None:
+        """Record that the live message objects have escaped to a caller.
+
+        The public ``native_messages`` getter hands out the message objects
+        themselves, so from now on any one of them can have a counted attribute
+        rebound — including a ``content`` that was an immutable ``str``. Every
+        cached message is re-armed with a dependency snapshot here, once per escape
+        event; the per-read cost stays a compare per message, never a re-estimation
+        of retained history.
+        """
+        with self._state_lock:
+            self._native_aliasing_risk = True
+            if self._message_objects_escaped:
+                return
+            self._message_objects_escaped = True
+            self._token_message_caches = [
+                (message, deps if deps is not None else self._capture_message_dependencies(message), tokens)
+                for message, deps, tokens in self._token_message_caches
+            ]
+
+    def _dependencies_changed(self, message: NativeMessage, deps: Any) -> bool:
+        """True when a message's live dependency state no longer matches its snapshot.
+
+        Immutable dependencies use identity when unchanged; mutable payloads use
+        type-sensitive comparisons because equal values such as False and 0 have
+        different counted representations.
+        """
+        if deps is _UNSNAPSHOTABLE:
+            return True
+        if not message.tool_calls:
+            # Fast path: content is the only dependency. A ``str`` compares by
+            # identity when unchanged, so the ordinary text-only message allocates
+            # nothing on read; a shared content list compares by value.
+            if len(deps) != 1:
+                return True
+            snapshot = deps[0]
+            return not _same_token_dependency(message.content, snapshot)
+        sources = self._dependency_sources(message)
+        if len(sources) != len(deps):
+            return True
+        for live, snapshot in zip(sources, deps, strict=True):
+            if live is snapshot:
+                continue
+            if not _same_token_dependency(live, snapshot):
+                return True
+        return False
+
+    def _refresh_aliased_token_caches(self) -> None:
+        """Fold per-message deltas for the messages a caller changed.
+
+        One pass over the cache: a message still at its own index whose dependencies
+        still match is skipped; one that moved, was replaced, or whose shared payload
+        was edited is re-estimated on its own and its delta folded. So an edited
+        message costs one message estimate, and the retained history is never
+        re-estimated as a whole. A text-only history that has never escaped holds no
+        dependency snapshots and does no work beyond this pointer pass.
+        """
+        live = self._native_messages
+        for index, (message, deps, tokens) in enumerate(self._token_message_caches):
+            live_message = live[index]
+            if live_message is message and (deps is None or not self._dependencies_changed(message, deps)):
+                continue
+            fresh = self._estimate_native_message_tokens(live_message)
+            self._native_token_total = max(0, self._native_token_total + fresh - tokens)
+            self._token_message_caches[index] = (live_message, self._capture_message_dependencies(live_message), fresh)
+
     def _recompute_token_total(self) -> None:
-        """Recompute the cached token total from the live native list (one scan)."""
-        self._native_token_total = self._estimate_native_messages_list_tokens(self._native_messages)
+        """Recompute the cached token total from the live native list (one scan).
+
+        Records each message's token count and dependency snapshot in the same
+        pass, so a later read only checks the messages that actually depend on
+        caller-mutable state.
+        """
+        total = 0
+        caches: list[tuple[NativeMessage, Any, int]] = []
+        for message in self._native_messages:
+            tokens = self._estimate_native_message_tokens(message)
+            total += tokens
+            caches.append((message, self._capture_message_dependencies(message), tokens))
+        self._native_token_total = total
+        self._token_message_caches = caches
         self._anchor_token_marker()
 
     def get_native_token_estimate(self) -> int:
         """Estimated tokens of the retained model working set.
 
-        Returns the incrementally maintained total when its marker is still
-        valid, otherwise recomputes once and re-anchors. This is the entry point
-        for the compression trigger: it never rescans retained history on the
-        ordinary append-only path.
+        Returns the incrementally maintained total when its marker still describes
+        the live list, folding the deltas of the messages whose shared payload or
+        dependency a caller changed since the last read; otherwise recomputes once
+        and re-anchors. This is the entry point for the compression trigger: the
+        ordinary append-only turn — including a tool-using one — re-estimates at
+        most the messages that changed, never the retained history.
         """
         with self._state_lock:
             if not self._token_marker_valid():
                 self._recompute_token_total()
+            else:
+                self._refresh_aliased_token_caches()
             return self._native_token_total
+
+    def _rebase_token_caches(self) -> None:
+        """Re-align the per-message cache with ``_native_messages`` after a rebind.
+
+        Used by the mutators that replace the list rather than append to it
+        (``set_context``, ``clear_old_entries``). Entries for messages still live
+        are kept as they are; only messages the cache does not know yet are
+        tokenized. This is an O(len(list)) identity pass with no estimation of the
+        retained history, so it does not reintroduce a per-turn recount.
+        """
+        by_id = {id(message): (message, deps, tokens) for message, deps, tokens in self._token_message_caches}
+        rebased: list[tuple[NativeMessage, Any, int]] = []
+        for message in self._native_messages:
+            cached = by_id.get(id(message))
+            if cached is None:
+                cached = (message, self._capture_message_dependencies(message), self._estimate_native_message_tokens(message))
+            rebased.append(cached)
+        self._token_message_caches = rebased
+        self._native_token_total = sum(tokens for _message, _deps, tokens in rebased)
 
     def _install_model_state(self, entries: list[TimelineEntry], messages: list[NativeMessage]) -> None:
         """Replace both model-facing representations as a single projection swap.
 
         Used by hydration/load and by compaction commit. Both lists are replaced
         together so ``timeline`` and ``_native_messages`` cannot drift apart, the
-        token total is recomputed exactly once, and ``_compaction_generation`` is
-        bumped so any compaction plan captured against the previous projection
-        refuses to commit over the new one.
+        token total and the per-message cache are recomputed exactly once, and
+        ``_compaction_generation`` is bumped so any compaction plan captured
+        against the previous projection refuses to commit over the new one.
 
-        This sets — never clears — the aliasing-risk flag: compaction reuses the
-        very same ``NativeMessage`` objects it retained, and a caller may hold
-        references to them from the list that was just replaced, so the new
-        projection is not provably unaliased. See ``_install_built_projection``.
+        The aliasing-risk flag is set — never cleared — when a message still shares
+        caller-mutable state: compaction reuses the very same ``NativeMessage``
+        objects it retained, and a caller may hold references to them from the list
+        that was just replaced, so any counted attribute of theirs may be rebound.
+        Setting it widens the per-read dependency check to every message
+        (``_message_needs_dependency_check``); it does not cost a history rescan.
         """
         with self._state_lock:
             self.timeline = entries
@@ -417,7 +656,9 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
         caller-mutable object (see ``_projection_shares_caller_state``) — a plain
         string-content entry is safe, a multimodal content list or tool arguments
         are not, whether they were handed over as live entry objects or as a dict
-        this timeline decoded (the decoded nested objects are the caller's).
+        this timeline decoded (the decoded nested objects are the caller's). A clear
+        flag narrows the per-read dependency check back to messages that actually
+        hold a shared payload (``_message_needs_dependency_check``).
 
         Used by hydration and load, where the projection is rebuilt from a
         journal read instead of mutated in place.
@@ -431,6 +672,9 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
             self._native_messages = fresh_messages
             self._pending_compression_plan = None
             self._native_aliasing_risk = shares_caller_state
+            # Freshly built message objects are not held by any caller, so only a
+            # shared caller entry can keep the per-message check armed.
+            self._message_objects_escaped = shares_caller_state
             self._recompute_token_total()
             self._compaction_generation += 1
 
@@ -473,23 +717,25 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
             entry: TimelineEntry to add
         """
         native_msg = self._timeline_entry_to_native_message(entry)
-        aliased = self._entry_is_externally_owned(entry)
         with self._state_lock:
-            if aliased:
+            if self._entry_is_externally_owned(entry):
                 # The caller still owns mutable content/tool-argument objects that
-                # this message now shares; an in-place edit of theirs would be
-                # invisible to any marker, so accounting must stop trusting the
-                # cached total. Not a copy: the mutable API contract is preserved.
+                # this message now shares. They are not copied away (the mutable API
+                # contract is preserved): the message records a snapshot of them, so
+                # an in-place edit of the caller's is observed per message on read
+                # rather than by distrusting (and rescanning) all retained history.
                 self._native_aliasing_risk = True
             marker_was_valid = self._token_marker_valid()
             # Add to parent timeline for backward compatibility
             super().add_entry(entry)
             # Convert to native message and store
             self._native_messages.append(native_msg)
-            self._fold_token_delta(
-                self._estimate_native_message_tokens(native_msg),
-                marker_was_valid=marker_was_valid,
-            )
+            tokens = self._estimate_native_message_tokens(native_msg)
+            if marker_was_valid:
+                # Record this message's token count together with the dependencies a
+                # later read compares to detect an in-place edit of the caller's.
+                self._record_message_token_cache(native_msg, tokens)
+            self._fold_token_delta(tokens, marker_was_valid=marker_was_valid)
 
     @staticmethod
     def _is_caller_owned_value(value: Any) -> bool:
@@ -669,6 +915,14 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
         # Internal backlink so a compaction commit can map a retained entry to the
         # exact message that mirrors it (see NATIVE_SOURCE_ENTRY_KEY).
         metadata[NATIVE_SOURCE_ENTRY_KEY] = entry
+        # Mirror the entry's temporary-entry signal so both projections agree on
+        # what is disposable. Without this, an ephemeral entry a caller handed to
+        # ``add_entry`` (the ``TimelineEntry.ephemeral`` contract, not the
+        # metadata convention ``set_context`` sets on its own entry) would be
+        # dropped from ``timeline`` but linger in the provider-facing native list
+        # for the rest of the session (I2).
+        if entry.ephemeral:
+            metadata["ephemeral"] = True
 
         return NativeMessage(
             role=role,
@@ -692,16 +946,13 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
             List of NativeMessage objects in chronological order
 
         This returns the live backing list, which callers legitimately mutate in
-        place (that has always been the contract). Because such an edit — a
-        same-length content replacement, or a nested tool-argument dict — cannot be
-        observed from the list or the message objects, the read marks the timeline's
-        token accounting untrusted so estimates recompute from live content. The
-        mark is sticky for this instance: escaped message objects survive into later
-        projections, so only a projection this timeline rebuilt without carrying
-        caller-mutable state clears it (see ``_install_built_projection``).
+        place (that has always been the contract). Because a returned message object
+        lets such a caller rebind even a payload attribute, the read records that the
+        projection has escaped (``_native_aliasing_risk``) and re-arms every cached
+        message with a dependency snapshot, so a later edit is observed per message
+        rather than by distrusting and re-scanning the whole history.
         """
-        with self._state_lock:
-            self._native_aliasing_risk = True
+        self._mark_projection_escaped()
         return self._native_messages
 
     # ------------------------------------------------------------------
@@ -797,7 +1048,12 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
 
         Overrides the parent set_context() to also update the native messages list.
         This removes any existing CONTEXT entries from both self.timeline and
-        self._native_messages, then adds a fresh one to both.
+        self._native_messages, then adds a fresh one to both. Only the
+        runtime-context slot this method owns (``role == "system"`` carrying the
+        ``ephemeral`` flag) is retired: a non-ephemeral CONTEXT entry is a caller's
+        durable state whose lifetime its owner controls, and the session's
+        recovery-note reconciliation depends on it outliving a ``set_context`` that
+        runs before the recovery request is sent.
 
         Args:
             context: Dictionary with context info (e.g., timestamp, user, timezone)
@@ -814,6 +1070,7 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
                     dropped.append(msg)
             self._native_messages = dropped
             self._fold_token_delta(-removed_tokens, marker_was_valid=marker_was_valid)
+            self._rebase_token_caches()
 
             # Call parent implementation (handles timeline and creates entry)
             super().set_context(context)
@@ -827,10 +1084,13 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
                 native_msg.metadata["ephemeral"] = True
                 marker_was_valid = self._token_marker_valid()
                 self._native_messages.insert(0, native_msg)
-                self._fold_token_delta(
-                    self._estimate_native_message_tokens(native_msg),
-                    marker_was_valid=marker_was_valid,
-                )
+                tokens = self._estimate_native_message_tokens(native_msg)
+                self._fold_token_delta(tokens, marker_was_valid=marker_was_valid)
+                if marker_was_valid:
+                    # Record the fresh context message in the cache. Its content is
+                    # this timeline's own immutable string, so a snapshot is only
+                    # taken if the message *objects* have already escaped to a caller.
+                    self._token_message_caches.insert(0, (native_msg, self._capture_message_dependencies(native_msg), tokens))
 
     def clear_old_entries(self, before_timestamp: datetime) -> int:
         """
@@ -858,6 +1118,7 @@ class CompressedTimeline(CompressionMixin, TimelineSerializerMixin, Timeline):
             )
             self._native_messages = [msg for msg in self._native_messages if msg.timestamp >= before_timestamp]
             self._fold_token_delta(removal_delta, marker_was_valid=marker_was_valid)
+            self._rebase_token_caches()
 
             removed_count = original_count - len(self.timeline)
             return removed_count
