@@ -190,38 +190,36 @@ class TestAsyncCloseNeverParksTheLoop:
     async def test_awaited_close_keeps_the_loop_live_while_joining(self):
         executor = ToolExecutor()
         entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
 
         @blocking_io
         def slow() -> int:
             entered.set()
-            time.sleep(0.6)
-            return 1
+            try:
+                assert release.wait(5), "the loop could not release the worker"
+                return 1
+            finally:
+                finished.set()
 
         work = asyncio.create_task(executor.offload_pool.run(slow))
-        assert await asyncio.to_thread(entered.wait, 5), "the offload never started"
-
-        ticks = 0
-
-        async def heartbeat() -> None:
-            nonlocal ticks
-            while True:
-                await asyncio.sleep(0.02)
-                ticks += 1
-
-        beat = asyncio.create_task(heartbeat())
-        await asyncio.sleep(0.1)  # let the heartbeat actually start
-        before = ticks
-
-        started = asyncio.get_running_loop().time()
-        await executor.aclose(wait_for_offload=True)
-        elapsed = asyncio.get_running_loop().time() - started
-        during = ticks - before
-        beat.cancel()
-
-        assert elapsed >= 0.5, "the awaited close returned before the physical work finished"
-        assert during >= 3, "the event loop was parked for the duration of the close join"
-        assert executor.closed is True
-        await work
+        close = None
+        try:
+            assert await asyncio.to_thread(entered.wait, 5), "the offload never started"
+            close = asyncio.create_task(executor.aclose(wait_for_offload=True))
+            # This continuation must run while shutdown is joining the blocked worker.
+            await asyncio.sleep(0.05)
+            assert not finished.is_set(), "shutdown blocked the loop until worker timeout"
+            assert not close.done(), "shutdown returned before the physical work finished"
+            release.set()
+            await close
+            assert finished.is_set()
+            assert executor.closed is True
+            assert await work == 1
+        finally:
+            release.set()
+            await asyncio.gather(work, *([close] if close is not None else []), return_exceptions=True)
+            await executor.aclose(wait_for_offload=True)
 
 
 class TestDefaultPoolProcessBoundary:

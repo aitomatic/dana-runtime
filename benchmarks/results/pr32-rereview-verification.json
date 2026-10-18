@@ -56,12 +56,20 @@
       "skipped": 30,
       "deselected": 167,
       "xfailed": 1,
-      "seconds": 58.42
+      "seconds": 58.42,
+      "head": "6eaebb5"
     },
     "ruff_check": "uv run --no-sync ruff check .: passed",
     "ruff_format": "uv run --no-sync ruff format --check .: 532 files already formatted",
     "actual_session_worker_smokes": "Integrated replay passed: internal producer cancellation, post-commit observer failure, caller versus explicit cancellation, repeated cancellation with non-cooperative physical ownership, and Bash queued-wait cancellation. Fail-closed provider/network guards recorded no attempted external calls.",
     "rejected_submission_smoke": "Closed pool rejected work, claim finished, unbounded physical drain returned within 0.5s, no worker started.",
     "ci": "New-head CI recorded in PR after publication; this file does not claim an unobserved CI result."
+  },
+  "ci_followup": {
+    "failed_run": "https://github.com/aitomatic/dana-runtime/actions/runs/39137610610",
+    "finding": "Both Linux lanes failed only the new shutdown timing assertion: 0.49957/0.49982 seconds versus a 0.5 lower bound after a prior 0.1-second sleep. This is not evidence of premature physical completion.",
+    "repair": "Replaced sleep-duration arithmetic with a worker release event: loop continuation observes shutdown pending and physical worker unfinished, then releases the worker and observes shutdown completion. Finally always releases/joins owned work.",
+    "local_verification": "All 8 pool lifecycle tests passed with unhandled thread warnings fatal; targeted Ruff lint and format checks passed.",
+    "new_head_ci": "Published in PR after both lanes complete."
   }
 }
