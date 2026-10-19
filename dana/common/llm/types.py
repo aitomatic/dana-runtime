@@ -8,8 +8,25 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
+import inspect
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, runtime_checkable
+
+
+try:
+    import structlog
+except ModuleNotFoundError:  # pragma: no cover - optional dependency fallback
+    import logging
+
+    class _StructLogShim:
+        @staticmethod
+        def get_logger() -> logging.Logger:
+            return logging.getLogger("dana")
+
+    structlog = _StructLogShim()
+
+
+logger = structlog.get_logger()
 
 
 if TYPE_CHECKING:
@@ -80,9 +97,20 @@ class LLMError(Exception):
 
 
 class ProviderError(LLMError):
-    """Exception raised when provider operations fail."""
+    """Exception raised when provider operations fail.
 
-    pass
+    ``terminal_response`` optionally carries the provider's final
+    :class:`LLMResponse` (usage, cached tokens, response id, model, reasoning
+    items) when a stream fails *after* the provider reported a terminal event.
+    Callers journaling a failed turn can therefore still record real accounting
+    and replay evidence instead of losing it with the exception. Additive and
+    keyword-only, so existing ``ProviderError("message")`` construction and
+    subclass hierarchies are unaffected.
+    """
+
+    def __init__(self, *args: object, terminal_response: Any | None = None) -> None:
+        super().__init__(*args)
+        self.terminal_response = terminal_response
 
 
 class PromptTooLongError(ProviderError):
@@ -225,9 +253,16 @@ class LLMResponse:
 class LLMStreamChunk:
     """A single chunk from a streaming LLM response."""
 
-    type: str  # "text_delta", "tool_use", "thinking"
+    type: str  # "text_delta", "tool_use", "thinking", "response"
     content: str = ""
     tool_call: dict | None = None  # {"id": str, "name": str, "input": dict}
+    # Terminal metadata carrier (type="response"). Providers that expose a final
+    # response object on the wire (OpenAI Responses API ``response.completed``)
+    # attach the converted LLMResponse here so stream consumers can recover
+    # fields that never appear as deltas — reasoning_items, response_id, model,
+    # usage, finish_reason. Providers without such an event leave it None and
+    # consumers must keep their existing delta-derived behavior.
+    response: LLMResponse | None = None
 
 
 @runtime_checkable
@@ -258,6 +293,10 @@ class LLMProviderProtocol(Protocol):
 
     async def stream(self, messages: list[LLMMessage], tools: list | None = None, **kwargs): ...
 
+    async def aclose(self) -> None:
+        """Release provider-owned network resources (SDK/HTTP clients)."""
+        ...
+
 
 class LLMProvider:
     """Base class for LLM providers. Satisfies LLMProviderProtocol.
@@ -274,6 +313,37 @@ class LLMProvider:
     def supports_native_tools(self) -> bool:
         """Whether this provider supports native function/tool calling."""
         return False
+
+    async def aclose(self) -> None:
+        """Close the provider's SDK/HTTP client if it exposes a close hook.
+
+        Dana-owned lifecycle method: one provider instance owns exactly one SDK
+        client, which is created in the constructor and otherwise never released.
+        Session teardown, ``LLM.switch_provider`` and the embedding equivalent call
+        this so a switched-away provider cannot leak an open connection pool.
+
+        Deliberately not shared across event loops: clients are loop-affine, so
+        closing must happen on the loop that owns the client. Idempotent and
+        best-effort — a provider without a closable client (e.g. google-genai
+        1.2.0 has no ``close``) is a no-op, and a failing close must not mask the
+        real result of the turn being torn down.
+        """
+        client = getattr(self, "client", None)
+        if client is None:
+            return
+        closer = getattr(client, "aclose", None) or getattr(client, "close", None)
+        if closer is None:
+            return
+        try:
+            result = closer()
+            if inspect.isawaitable(result):
+                await result
+        except Exception as e:  # pragma: no cover - teardown must not raise
+            logger.warning(
+                "provider_client_close_failed",
+                provider=self.__class__.__name__,
+                error_type=type(e).__name__,
+            )
 
     # supports_vision, supports_video, supports_audio are set as instance
     # attributes by LLMResource at runtime (based on env/config).

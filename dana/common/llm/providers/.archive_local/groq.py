@@ -77,11 +77,7 @@ class GroqProvider(LLMProvider):
                     openai_messages.append({"role": "assistant", "content": msg.content})
 
             # Build request parameters
-            request_kwargs = {
-                "model": self.model,
-                "messages": openai_messages,
-                **kwargs
-            }
+            request_kwargs = {"model": self.model, "messages": openai_messages, **kwargs}
 
             # Add tools if provided
             if tools:

@@ -2,9 +2,9 @@
 
 import pytest
 
-from dana.common.llm.types import is_multimodal_content, read_media_as_base64
 from dana.common.llm.providers.anthropic import AnthropicProvider
 from dana.common.llm.providers.openai_compatible_base import OpenAICompatibleProvider
+from dana.common.llm.types import is_multimodal_content, read_media_as_base64
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +103,7 @@ class TestReadMediaAsBase64:
         block = {"type": "image", "media_type": "image/png", "path": str(f)}
 
         import base64
+
         result = read_media_as_base64(block)
         assert result == base64.b64encode(content).decode("utf-8")
 

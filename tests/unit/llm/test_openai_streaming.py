@@ -1,8 +1,12 @@
 """Tests for OpenAI provider streaming and API detection."""
 
+import json
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
+from openai import AsyncOpenAI
 import pytest
+from structlog.testing import capture_logs
 
 from dana.common.llm.types import LLMMessage, LLMStreamChunk
 
@@ -11,7 +15,12 @@ from dana.common.llm.types import LLMMessage, LLMStreamChunk
 
 
 def _make_chat_chunk(content=None, tool_calls=None, finish_reason=None):
-    """Build a mock Chat Completions streaming chunk."""
+    """Build a mock Chat Completions streaming chunk.
+
+    ``usage`` is explicitly None because the real SDK only populates it on the
+    dedicated usage frame; a bare ``MagicMock`` would auto-create a truthy
+    attribute and the provider would treat every delta as terminal.
+    """
     delta = MagicMock()
     delta.content = content
     delta.tool_calls = tool_calls
@@ -22,13 +31,17 @@ def _make_chat_chunk(content=None, tool_calls=None, finish_reason=None):
 
     chunk = MagicMock()
     chunk.choices = [choice]
+    chunk.usage = None
     return chunk
 
 
 def _make_empty_chunk():
-    """Build a mock chunk with empty choices."""
+    """Build a mock chunk with empty choices (the usage-frame shape)."""
     chunk = MagicMock()
     chunk.choices = []
+    # A real usage frame carries usage; a bare heartbeat frame does not. Tests that
+    # mean "nothing was reported" must say so explicitly.
+    chunk.usage = None
     return chunk
 
 
@@ -55,6 +68,17 @@ def _make_responses_event(event_type, **kwargs):
     for key, value in kwargs.items():
         setattr(event, key, value)
     return event
+
+
+def _make_message_item(text):
+    """Build a Responses API ``message`` output item carrying output_text."""
+    item = MagicMock()
+    item.type = "message"
+    content = MagicMock()
+    content.type = "output_text"
+    content.text = text
+    item.content = [content]
+    return item
 
 
 async def _async_iter(items):
@@ -94,9 +118,15 @@ class TestStreamChatCompletions:
         async for chunk in provider._stream_chat_completions([LLMMessage(content="Hi", role="user")]):
             results.append(chunk)
 
-        assert len(results) == 2
-        assert results[0] == LLMStreamChunk(type="text_delta", content="Hello")
-        assert results[1] == LLMStreamChunk(type="text_delta", content=" world")
+        deltas = [c for c in results if c.type != "response"]
+        assert deltas == [
+            LLMStreamChunk(type="text_delta", content="Hello"),
+            LLMStreamChunk(type="text_delta", content=" world"),
+        ]
+        # The reported finish_reason must reach the consumer, not be dropped.
+        carriers = [c for c in results if c.type == "response"]
+        assert len(carriers) == 1
+        assert carriers[0].response.finish_reason == "stop"
 
     @pytest.mark.asyncio
     async def test_tool_call_stream_accumulates_deltas(self):
@@ -113,11 +143,11 @@ class TestStreamChatCompletions:
         async for chunk in provider._stream_chat_completions([LLMMessage(content="Weather?", role="user")]):
             results.append(chunk)
 
-        assert len(results) == 1
-        assert results[0].type == "tool_use"
-        assert results[0].tool_call["id"] == "call_1"
-        assert results[0].tool_call["name"] == "get_weather"
-        assert results[0].tool_call["input"] == {"city": "Paris"}
+        tool_chunks = [c for c in results if c.type == "tool_use"]
+        assert len(tool_chunks) == 1
+        assert tool_chunks[0].tool_call["id"] == "call_1"
+        assert tool_chunks[0].tool_call["name"] == "get_weather"
+        assert tool_chunks[0].tool_call["input"] == {"city": "Paris"}
 
     @pytest.mark.asyncio
     async def test_mixed_text_and_tool_calls(self):
@@ -133,9 +163,7 @@ class TestStreamChatCompletions:
         async for chunk in provider._stream_chat_completions([LLMMessage(content="Search", role="user")]):
             results.append(chunk)
 
-        assert len(results) == 2
-        assert results[0].type == "text_delta"
-        assert results[1].type == "tool_use"
+        assert [c.type for c in results if c.type != "response"] == ["text_delta", "tool_use"]
 
     @pytest.mark.asyncio
     async def test_empty_choices_skipped(self):
@@ -147,8 +175,9 @@ class TestStreamChatCompletions:
         async for chunk in provider._stream_chat_completions([LLMMessage(content="Hi", role="user")]):
             results.append(chunk)
 
-        assert len(results) == 1
-        assert results[0].content == "Hi"
+        assert [c.content for c in results if c.type == "text_delta"] == ["Hi"]
+        # No finish reason or usage frame was ever sent, so no terminal is invented.
+        assert not [c for c in results if c.type == "response"]
 
     @pytest.mark.asyncio
     async def test_invalid_tool_args_json_yields_empty_dict(self):
@@ -183,8 +212,7 @@ class TestStreamChatCompletions:
         async for chunk in provider._stream_chat_completions([LLMMessage(content="x", role="user")]):
             results.append(chunk)
 
-        assert len(results) == 2
-        names = {r.tool_call["name"] for r in results}
+        names = {c.tool_call["name"] for c in results if c.type == "tool_use"}
         assert names == {"tool_a", "tool_b"}
 
     @pytest.mark.asyncio
@@ -201,9 +229,134 @@ class TestStreamChatCompletions:
         async for chunk in provider._stream_chat_completions([LLMMessage(content="x", role="user")]):
             results.append(chunk)
 
-        assert len(results) == 1
-        assert results[0].type == "tool_use"
-        assert results[0].tool_call["input"] == {"x": 1}
+        tool_chunks = [c for c in results if c.type == "tool_use"]
+        assert len(tool_chunks) == 1
+        assert tool_chunks[0].tool_call["input"] == {"x": 1}
+
+    @pytest.mark.asyncio
+    async def test_stream_close_releases_the_http_response(self):
+        """Closing the stream generator must release the connection, not leak it.
+
+        A plain ``async for`` over an OpenAI SDK stream never calls the stream's
+        ``__aexit__``, so the provider closes it explicitly. This is the path taken
+        when the consuming task is cancelled or the generator is torn down.
+        """
+        provider = _create_provider()
+        closed = {"n": 0}
+
+        class _Stream:
+            def __init__(self):
+                self._items = iter([_make_chat_chunk(content="a"), _make_chat_chunk(content="b")])
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self._items)
+                except StopIteration:
+                    raise StopAsyncIteration from None
+
+            async def close(self):
+                closed["n"] += 1
+
+        provider.client.chat.completions.create = AsyncMock(return_value=_Stream())
+
+        agen = provider._stream_chat_completions([LLMMessage(content="Hi", role="user")])
+        await agen.__anext__()
+        await agen.aclose()
+
+        assert closed["n"] == 1, "the abandoned response must be closed"
+
+    @pytest.mark.asyncio
+    async def test_stream_close_failure_does_not_mask_the_turn(self):
+        provider = _create_provider()
+
+        class _Stream:
+            def __init__(self):
+                self._items = iter([_make_chat_chunk(content="a")])
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self._items)
+                except StopIteration:
+                    raise StopAsyncIteration from None
+
+            async def close(self):
+                raise RuntimeError("socket already gone")
+
+        provider.client.chat.completions.create = AsyncMock(return_value=_Stream())
+
+        results = [c async for c in provider._stream_chat_completions([LLMMessage(content="Hi", role="user")])]
+
+        assert [c.content for c in results if c.type == "text_delta"] == ["a"]
+
+
+class TestProviderSdkCleanup:
+    @pytest.mark.asyncio
+    async def test_sdk_pool_close_failure_is_redacted(self):
+        from dana.common.llm.llm import LLM
+
+        class FailingPoolTransport(httpx.MockTransport):
+            async def aclose(self):
+                raise RuntimeError("SECRET_SENTINEL pool")
+
+        http_client = httpx.AsyncClient(transport=FailingPoolTransport(lambda request: httpx.Response(200, json={})))
+        provider = _create_provider()
+        provider.client = AsyncOpenAI(api_key="offline", max_retries=0, http_client=http_client)
+
+        with capture_logs() as logs:
+            await LLM(provider=provider).aclose()
+
+        warnings = [log for log in logs if log["event"] == "provider_client_close_failed"]
+        assert len(warnings) == 1
+        assert warnings[0]["error_type"] == "RuntimeError"
+        assert "error" not in warnings[0]
+        assert "SECRET_SENTINEL" not in json.dumps(logs)
+        assert http_client.is_closed
+
+    @pytest.mark.asyncio
+    async def test_sdk_response_close_failure_is_redacted(self):
+        class FailingResponseBody(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                event = {
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "partial",
+                    "sequence_number": 1,
+                    "logprobs": [],
+                }
+                yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+
+            async def aclose(self):
+                raise RuntimeError("SECRET_SENTINEL response")
+
+        http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, stream=FailingResponseBody(), headers={"content-type": "text/event-stream"})
+            )
+        )
+        client = AsyncOpenAI(api_key="offline", base_url="https://offline.invalid/v1", max_retries=0, http_client=http_client)
+        try:
+            stream = await client.responses.create(model="gpt-5-nano", input="hi", stream=True)
+            delta = await anext(stream)
+            assert delta.type == "response.output_text.delta"
+            assert delta.delta == "partial"
+            with capture_logs() as logs:
+                await _create_provider()._close_stream(stream)
+            warnings = [log for log in logs if log["event"] == "stream_close_failed"]
+            assert len(warnings) == 1
+            assert warnings[0]["error_type"] == "RuntimeError"
+            assert "error" not in warnings[0]
+            assert "SECRET_SENTINEL" not in json.dumps(logs)
+            assert stream.response.is_closed
+        finally:
+            await client.close()
 
 
 # --- Responses API streaming tests ---
@@ -215,10 +368,20 @@ class TestStreamResponses:
     @pytest.mark.asyncio
     async def test_text_delta_events(self):
         provider = _create_provider(model="gpt-5")
+        completion = MagicMock()
+        completion.output = [
+            _make_message_item("Hello world"),
+        ]
+        completion.id = "resp_streaming_1"
+        completion.status = "completed"
+        completion.model = "gpt-5"
+        completion.usage = None
+        completion.incomplete_details = None
+
         events = [
             _make_responses_event("response.output_text.delta", delta="Hello"),
             _make_responses_event("response.output_text.delta", delta=" world"),
-            _make_responses_event("response.completed"),
+            _make_responses_event("response.completed", response=completion),
         ]
         provider.client.responses.create = AsyncMock(return_value=_async_iter(events))
 
@@ -226,9 +389,13 @@ class TestStreamResponses:
         async for chunk in provider._stream_responses([LLMMessage(content="Hi", role="user")]):
             results.append(chunk)
 
-        assert len(results) == 2
+        # Two text deltas plus the terminal metadata carrier.
+        assert len(results) == 3
         assert results[0] == LLMStreamChunk(type="text_delta", content="Hello")
         assert results[1] == LLMStreamChunk(type="text_delta", content=" world")
+        assert results[2].type == "response"
+        assert results[2].response.response_id == "resp_streaming_1"
+        assert results[2].response.content == "Hello world"
 
     @pytest.mark.asyncio
     async def test_tool_call_from_output_item_done(self):

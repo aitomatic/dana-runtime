@@ -13,12 +13,16 @@ from dana.common.base_war import BaseWAR
 from dana.common.protocols.war import AgentProtocol, ResourceProtocol, WorkflowProtocol
 from dana.common.schemas import Event, PromptVersionSnapshot
 from dana.config.storage_config import FileStorageConfig
-from dana.core.agent.base_agent import BaseAgent
 
 from .repository_protocol import EventRepositoryProtocol, LearningRepositoryProtocol, PromptRepositoryProtocol, TimelineRepositoryProtocol
 
 
 if TYPE_CHECKING:
+    # Annotations only (`from __future__ import annotations`), and importing it
+    # eagerly closes a package cycle: `dana.core.agent.__init__` pulls STARAgent ->
+    # timeline -> repository_factory -> this module, so this import would run
+    # while `dana.core.agent` is still half-initialized.
+    from dana.core.agent.base_agent import BaseAgent
     from dana.core.timeline.timeline import TimelineEntry
 
 logger = get_logger()
@@ -359,11 +363,17 @@ class LocalTimelineRepository(LocalRepositoryMixin, TimelineRepositoryProtocol):
 
         # Save timeline to JSON using TimelineEntry.to_dict() for consistent serialization
         timeline_file = session_folder / "timeline.json"
+        serialized_entries = [entry.to_dict() for entry in entries]
+        if getattr(self._agent, "_journal_owned_protected_replay", False):
+            for entry in serialized_entries:
+                metadata = entry.get("metadata")
+                if metadata:
+                    entry["metadata"] = {key: value for key, value in metadata.items() if key != "reasoning_items"}
         timeline_data = {
             "session_id": session_id,
             "agent_id": self._agent.object_id,
             "agent_type": self._agent.agent_type if hasattr(self._agent, "agent_type") else None,
-            "entries": [entry.to_dict() for entry in entries],
+            "entries": serialized_entries,
         }
         with open(timeline_file, "w") as f:
             json.dump(timeline_data, f, indent=2)

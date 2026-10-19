@@ -306,6 +306,109 @@ async def test_projection_checkpoint(repository: JournalRepository) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Contract: a stale checkpoint writer cannot move a checkpoint backwards
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_stale_write_is_ignored(repository: JournalRepository) -> None:
+    record, seed = _seed_record()
+    await repository.create_session(record, _to_journal_facts_for_create(record, seed))
+
+    await repository.save_projection_checkpoint(
+        record.owner_scope,
+        record.session_id,
+        ProjectionCheckpoint(projection_name="conversation", last_sequence=5, data={"cursor": "ahead"}),
+    )
+    # A writer that resumed from an older cursor must not clobber the newer one.
+    await repository.save_projection_checkpoint(
+        record.owner_scope,
+        record.session_id,
+        ProjectionCheckpoint(projection_name="conversation", last_sequence=3, data={"cursor": "stale"}),
+    )
+
+    loaded = await repository.load_projection_checkpoint(record.owner_scope, record.session_id, "conversation")
+    assert loaded is not None
+    assert loaded.last_sequence == 5
+    assert dict(loaded.data) == {"cursor": "ahead"}
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_equal_and_forward_writes_win(repository: JournalRepository) -> None:
+    record, seed = _seed_record()
+    await repository.create_session(record, _to_journal_facts_for_create(record, seed))
+    scope, session_id = record.owner_scope, record.session_id
+
+    await repository.save_projection_checkpoint(
+        scope, session_id, ProjectionCheckpoint(projection_name="conversation", last_sequence=5, data={"cursor": "first"})
+    )
+    # Same cursor: the latest writer wins (retries and rewrites are expected).
+    await repository.save_projection_checkpoint(
+        scope, session_id, ProjectionCheckpoint(projection_name="conversation", last_sequence=5, data={"cursor": "second"})
+    )
+    loaded = await repository.load_projection_checkpoint(scope, session_id, "conversation")
+    assert loaded is not None and dict(loaded.data) == {"cursor": "second"}
+
+    # Strictly forward: advances normally.
+    await repository.save_projection_checkpoint(
+        scope, session_id, ProjectionCheckpoint(projection_name="conversation", last_sequence=9, data={"cursor": "third"})
+    )
+    loaded = await repository.load_projection_checkpoint(scope, session_id, "conversation")
+    assert loaded is not None and loaded.last_sequence == 9 and dict(loaded.data) == {"cursor": "third"}
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_projection_names_are_independent(repository: JournalRepository) -> None:
+    record, seed = _seed_record()
+    await repository.create_session(record, _to_journal_facts_for_create(record, seed))
+    scope, session_id = record.owner_scope, record.session_id
+
+    await repository.save_projection_checkpoint(
+        scope, session_id, ProjectionCheckpoint(projection_name="conversation", last_sequence=5, data={"cursor": "conversation"})
+    )
+    # A different projection_name is a different row: the guard is per-row.
+    await repository.save_projection_checkpoint(
+        scope, session_id, ProjectionCheckpoint(projection_name="timeline", last_sequence=1, data={"cursor": "timeline"})
+    )
+    conversation = await repository.load_projection_checkpoint(scope, session_id, "conversation")
+    timeline = await repository.load_projection_checkpoint(scope, session_id, "timeline")
+    assert conversation is not None and conversation.last_sequence == 5
+    assert timeline is not None and timeline.last_sequence == 1
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_stale_write_is_owner_scoped(journal_factory) -> None:
+    """The stale guard must never let one owner's write touch another owner's row."""
+    scope_a = _scope("a")
+    scope_b = _scope("b")
+    record_a, seed_a = _seed_record(session_id="sess-a", scope=scope_a)
+    record_b, seed_b = _seed_record(session_id="sess-b", scope=scope_b)
+    repo_a = await journal_factory()
+    repo_b = await journal_factory()
+    try:
+        await repo_a.create_session(record_a, _to_journal_facts_for_create(record_a, seed_a))
+        await repo_b.create_session(record_b, _to_journal_facts_for_create(record_b, seed_b))
+
+        await repo_a.save_projection_checkpoint(
+            scope_a, record_a.session_id, ProjectionCheckpoint(projection_name="conversation", last_sequence=9, data={"owner": "a"})
+        )
+        # Owner B writes the same session/projection name with a lower cursor.
+        await repo_b.save_projection_checkpoint(
+            scope_b, record_b.session_id, ProjectionCheckpoint(projection_name="conversation", last_sequence=1, data={"owner": "b"})
+        )
+
+        checkpoint_a = await repo_a.load_projection_checkpoint(scope_a, record_a.session_id, "conversation")
+        checkpoint_b = await repo_b.load_projection_checkpoint(scope_b, record_b.session_id, "conversation")
+        assert checkpoint_a is not None and checkpoint_a.last_sequence == 9 and dict(checkpoint_a.data) == {"owner": "a"}
+        assert checkpoint_b is not None and checkpoint_b.last_sequence == 1 and dict(checkpoint_b.data) == {"owner": "b"}
+        # Cross-scope reads stay invisible.
+        assert await repo_a.load_projection_checkpoint(scope_a, record_b.session_id, "conversation") is None
+    finally:
+        await repo_a.close()
+        await repo_b.close()
+
+
+# ---------------------------------------------------------------------------
 # Contract: OwnerScope isolation
 # ---------------------------------------------------------------------------
 

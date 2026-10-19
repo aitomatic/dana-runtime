@@ -256,9 +256,7 @@ class TestEdgeCases:
     def test_unsupported_mime_type(self) -> None:
         normalizer = ContentNormalizer()
         with pytest.raises(MimeTypeError):
-            normalizer.normalize(
-                [{"type": "image", "media_type": "image/x-unsupported", "data": b"x"}]
-            )
+            normalizer.normalize([{"type": "image", "media_type": "image/x-unsupported", "data": b"x"}])
 
     def test_symlink_traversal(self, tmp_path) -> None:
         normalizer = ContentNormalizer()

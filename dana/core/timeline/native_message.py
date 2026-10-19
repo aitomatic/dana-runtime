@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import json
 from typing import Any, Literal
 
 from dana.common.llm.types import LLMMessage
@@ -21,6 +22,12 @@ NativeMessageRole = Literal["user", "assistant", "system", "tool"]
 COMPRESSED_CONTEXT_KEY = "compressed_context"
 COMPRESSION_TIMESTAMP_KEY = "compression_timestamp"
 COMPRESSED_ENTRIES_COUNT_KEY = "compressed_entries_count"
+
+# Internal backlink to the source timeline entry. Compaction uses it to preserve
+# retained message objects even when a leading summary shifts their positions.
+# Serialization strips this backlink; hydration reconstructs it from the paired
+# entries and native messages. It is never a provider or persisted field.
+NATIVE_SOURCE_ENTRY_KEY = "_native_source_entry"
 
 
 @dataclass
@@ -51,11 +58,23 @@ class NativeToolCall:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> NativeToolCall:
-        """Deserialize from dictionary."""
+        """Decode canonical, runtime, or provider function-call dictionaries."""
+        function = data.get("function")
+        if isinstance(function, dict):
+            name = function["name"]
+            arguments = data.get("arguments", function.get("arguments", {}))
+        else:
+            name = function if isinstance(function, str) else data["name"]
+            arguments = data.get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                arguments = {"raw": arguments}
         return cls(
-            id=data["id"],
-            name=data["name"],
-            arguments=data.get("arguments", {}),
+            id=data["id"] if "id" in data else data["tool_call_id"],
+            name=name,
+            arguments=arguments or {},
         )
 
 
@@ -138,7 +157,14 @@ class NativeMessage:
             result["tool_call_id"] = self.tool_call_id
 
         if self.metadata:
-            result["metadata"] = self.metadata
+            if NATIVE_SOURCE_ENTRY_KEY in self.metadata:
+                # Internal backlink, not a provider/persisted field: drop it so
+                # snapshots stay JSON-serializable and a reload re-tags cleanly.
+                persisted_metadata = {key: value for key, value in self.metadata.items() if key != NATIVE_SOURCE_ENTRY_KEY}
+                if persisted_metadata:
+                    result["metadata"] = persisted_metadata
+            else:
+                result["metadata"] = self.metadata
 
         return result
 
@@ -166,7 +192,11 @@ class NativeMessage:
             content=data.get("content", ""),
             tool_calls=tool_calls,
             tool_call_id=data.get("tool_call_id"),
-            metadata=data.get("metadata", {}),
+            # A copy, never the caller's dict: the serializer writes its internal
+            # ``NATIVE_SOURCE_ENTRY_KEY`` backlink (a TimelineEntry object) into this
+            # mapping, and installing that into the caller's decoded payload would
+            # make a later ``json.dumps`` of their data fail (I15).
+            metadata=dict(data.get("metadata") or {}),
             timestamp=timestamp,
         )
 

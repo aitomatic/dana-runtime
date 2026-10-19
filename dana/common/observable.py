@@ -10,59 +10,64 @@ Dispatches to ONE tracing backend per process, selected at decoration time:
 Backends are EXCLUSIVE: LangSmith takes precedence over Langfuse. Toggle the
 active backend via environment variables, not by editing call sites.
 
-LangSmith relies on its SDK's background-thread batching (no per-call flush).
-Langfuse preserves its existing flush-after-each-call behavior.
+Neither backend flushes per call. Both SDKs batch in background threads, and a
+synchronous flush after every nested span is a network round trip on the
+critical path. Call `flush_observability()` at explicit boundaries where
+traces must be delivered (a session ending, a CLI exiting) and
+`shutdown_observability()` once when the process stops tracing.
+
+A backend is imported only when its environment flag asks for it, so a process
+with tracing disabled pays nothing for the SDKs at startup.
 """
 
 from collections.abc import Callable
-import functools
-import inspect
+import logging
 import os
+import threading
 from typing import cast
 
 from dana.common.trace_sanitizer import safe_trace_inputs, safe_trace_outputs
 
 
-# --- Langfuse (existing backend) ---
-try:
-    from langfuse import Langfuse
-    from langfuse import observe as langfuse_observe
-except ModuleNotFoundError:
-    Langfuse = None
-
-    def langfuse_observe(*args, **kwargs):
-        def decorator(func):
-            return func
-
-        if len(args) == 1 and len(kwargs) == 0 and callable(args[0]):
-            return args[0]
-        return decorator
-
-
-# --- LangSmith (alternative backend) ---
-try:
-    from langsmith import traceable as langsmith_traceable
-except ModuleNotFoundError:
-    langsmith_traceable = None
-
+logger = logging.getLogger(__name__)
 
 _TRUTHY = ("true", "1", "yes")
 # LangSmith run_type vocabulary. langfuse `as_type` has no 1:1 mapping.
 _VALID_RUN_TYPES = {"chain", "llm", "tool", "prompt", "retriever"}
 
+# Bounded budget for a lifecycle flush. A tracing backend that is slow, offline
+# or wedged must not be able to hold a process open at exit.
+_FLUSH_TIMEOUT_S = 5.0
+
+# Set once by `shutdown_observability()`. Later flushes become no-ops so
+# shutdown is idempotent and cannot resurrect a released client.
+_shutdown_done = threading.Event()
+
 # Enablement is read ONCE at module load. Toggling requires a process restart
 # (or `importlib.reload(dana.common.observable)` in tests).
-LANGFUSE_ENABLED = Langfuse is not None and os.getenv("LANGFUSE_ENABLED", "false").lower() in _TRUTHY
-LANGSMITH_ENABLED = langsmith_traceable is not None and (
-    os.getenv("LANGSMITH_TRACING", "false").lower() == "true" or os.getenv("DANA_LANGSMITH_ENABLED", "false").lower() in _TRUTHY
-)
+LANGFUSE_ENABLED = False
+OBSERVER = None
+if os.getenv("LANGFUSE_ENABLED", "false").lower() in _TRUTHY:
+    try:
+        from langfuse import Langfuse
+        from langfuse import observe as langfuse_observe
+    except ImportError:
+        # A requested but unavailable backend stays disabled.
+        pass
+    else:
+        LANGFUSE_ENABLED = True
+        OBSERVER = Langfuse()
 
-# Langfuse client singleton (used only on the langfuse branch for per-call flush).
-if LANGFUSE_ENABLED:
-    assert Langfuse is not None  # LANGFUSE_ENABLED requires the import to have succeeded
-    OBSERVER = Langfuse()
-else:
-    OBSERVER = None
+LANGSMITH_ENABLED = False
+langsmith_traceable = None
+if os.getenv("LANGSMITH_TRACING", "false").lower() == "true" or os.getenv("DANA_LANGSMITH_ENABLED", "false").lower() in _TRUTHY:
+    try:
+        from langsmith import traceable as langsmith_traceable
+    except ImportError:
+        # LangSmith ships in the optional `dana-agent[langsmith]` extra.
+        pass
+    else:
+        LANGSMITH_ENABLED = True
 
 
 def _langsmith_kwargs(kwargs: dict) -> dict:
@@ -95,29 +100,6 @@ def _langsmith_kwargs(kwargs: dict) -> dict:
     return ls
 
 
-def _langfuse_wrap(execute_function: Callable, func: Callable) -> Callable:
-    """Wrap a langfuse-observed callable with post-invocation flush (sync + async)."""
-    if inspect.iscoroutinefunction(func):
-
-        @functools.wraps(func)
-        async def async_wrapper(*wrapper_args, **wrapper_kwargs):
-            result = await execute_function(*wrapper_args, **wrapper_kwargs)
-            if OBSERVER:
-                OBSERVER.flush()
-            return result
-
-        return async_wrapper
-
-    @functools.wraps(func)
-    def wrapper(*wrapper_args, **wrapper_kwargs):
-        result = execute_function(*wrapper_args, **wrapper_kwargs)
-        if OBSERVER:
-            OBSERVER.flush()
-        return result
-
-    return wrapper
-
-
 def observable(*args, **kwargs) -> Callable:
     """Decorator that tracks function calls with the active tracing backend.
 
@@ -137,20 +119,18 @@ def observable(*args, **kwargs) -> Callable:
     """
 
     def _apply(func: Callable, dec_args: tuple, dec_kwargs: dict) -> Callable:
-        # Branch 1: LangSmith (precedence). traceable is sync+async native; no flush.
+        # Branch 1: LangSmith (precedence). traceable is sync+async native.
         # Positional decorator params are dropped (none used by any call site);
         # only translated kwargs are forwarded. LANGSMITH_ENABLED guarantees the import succeeded.
         if LANGSMITH_ENABLED:
             traceable = cast("Callable[..., Callable]", langsmith_traceable)
             return traceable(**_langsmith_kwargs(dec_kwargs))(func)
 
-        # Branch 2: Langfuse. Preserve existing flush-after-each-call behavior.
+        # Branch 2: Langfuse. The SDK batches on its own background thread.
         if LANGFUSE_ENABLED:
             if dec_args or dec_kwargs:
-                execute_function = langfuse_observe(*dec_args, **dec_kwargs)(func)
-            else:
-                execute_function = langfuse_observe(func)
-            return _langfuse_wrap(cast("Callable[..., object]", execute_function), func)
+                return cast("Callable[..., object]", langfuse_observe(*dec_args, **dec_kwargs)(func))
+            return cast("Callable[..., object]", langfuse_observe(func))
 
         # Branch 3: no-op
         return func
@@ -164,3 +144,99 @@ def observable(*args, **kwargs) -> Callable:
         return _apply(func, args, kwargs)
 
     return decorator
+
+
+def _flush_bounded(flush: Callable[[], object], timeout: float) -> None:
+    """Run `flush` on a daemon thread, waiting at most `timeout` seconds for it.
+
+    Failures are logged at debug level: a tracing backend that cannot flush is
+    a diagnostics problem, never a reason to fail the caller or block exit.
+    """
+
+    finished = threading.Event()
+
+    def _run() -> None:
+        try:
+            flush()
+        except Exception as exc:  # noqa: BLE001 - optional diagnostics must not propagate
+            logger.debug("Tracing flush failed: %s", type(exc).__name__)
+        finally:
+            finished.set()
+
+    threading.Thread(target=_run, name="dana-observability-flush", daemon=True).start()
+    finished.wait(timeout)
+
+
+def _langsmith_cached_client() -> object:
+    """The client that the active ``@traceable`` runs are queued on.
+
+    ``RunTree.client`` lazily resolves through ``langsmith.run_trees.get_cached_client()``,
+    so that process-wide instance — not a freshly constructed ``Client()``, which is
+    empty and owns no runs — is the one holding the buffered traces this module must
+    deliver. Resolution happens inside the lifecycle worker.
+    """
+    from langsmith.run_trees import get_cached_client
+
+    return get_cached_client()
+
+
+def _flush_active_backend() -> None:
+    """Resolve and flush the backend inside the protected lifecycle worker."""
+    if LANGSMITH_ENABLED:
+        _langsmith_cached_client().flush(timeout=_FLUSH_TIMEOUT_S)
+    elif LANGFUSE_ENABLED and OBSERVER is not None:
+        OBSERVER.flush()
+
+
+def _shutdown_active_backend() -> None:
+    """Resolve and release the backend inside the protected lifecycle worker.
+
+    Langfuse owns background exporter threads that `shutdown()` stops, so it
+    must not simply be flushed. LangSmith keeps a process-wide run tree with no
+    equivalent teardown, so flushing the cached client is the whole release.
+    """
+    if LANGSMITH_ENABLED:
+        _langsmith_cached_client().flush(timeout=_FLUSH_TIMEOUT_S)
+    elif LANGFUSE_ENABLED and OBSERVER is not None:
+        OBSERVER.shutdown()
+
+
+def flush_observability(timeout: float | None = None) -> None:
+    """Deliver buffered traces from the active backend, bounded by `timeout`.
+
+    Intended for explicit lifecycle boundaries (session end, CLI exit, ACP
+    shutdown) rather than per-operation calls. No-op when no backend is enabled
+    or after `shutdown_observability()`. Never raises.
+    """
+    if _shutdown_done.is_set() or not (LANGSMITH_ENABLED or LANGFUSE_ENABLED):
+        return
+    _flush_bounded(_flush_active_backend, _FLUSH_TIMEOUT_S if timeout is None else timeout)
+
+
+def shutdown_observability(timeout: float | None = None) -> None:
+    """Flush and release the active backend. Idempotent; never raises.
+
+    Call once when the process stops tracing, not per session: the backend is
+    process-wide.
+    """
+    if _shutdown_done.is_set():
+        return
+    # Set before releasing so a concurrent flush cannot touch a freed client.
+    _shutdown_done.set()
+    if not (LANGSMITH_ENABLED or LANGFUSE_ENABLED):
+        return
+    _flush_bounded(_shutdown_active_backend, _FLUSH_TIMEOUT_S if timeout is None else timeout)
+
+
+async def aflush_observability(timeout: float | None = None) -> None:
+    """Await `flush_observability()` off the event loop, bounded by `timeout`."""
+    import asyncio
+
+    await asyncio.to_thread(flush_observability, timeout)
+
+
+async def ashutdown_observability(timeout: float | None = None) -> None:
+    """Await `shutdown_observability()` off the event loop, bounded by `timeout`."""
+    import asyncio
+
+    await asyncio.to_thread(shutdown_observability, timeout)

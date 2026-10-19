@@ -1,10 +1,8 @@
 """Unit tests for RLMResource."""
 
-import tempfile
 from pathlib import Path
+import tempfile
 from unittest.mock import AsyncMock, patch
-
-import pytest
 
 from dana.common.resource.rlm_resource import RLMResource
 
@@ -19,7 +17,7 @@ class TestRLMResource:
             file_path = Path(tmpdir) / "test_context.md"
             assert not file_path.exists()
 
-            resource = RLMResource(file=str(file_path), auto_register=False)
+            RLMResource(file=str(file_path), auto_register=False)
 
             assert file_path.exists()
             assert file_path.read_text() == ""

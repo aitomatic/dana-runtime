@@ -2,8 +2,6 @@
 
 from datetime import datetime
 
-import pytest
-
 from dana.core.memory import MemoryEntry, STMemory
 
 

@@ -1,51 +1,46 @@
-"""
-Debug logging system for LLM requests and responses.
+"""Opt-in, bounded LLM diagnostics containing metadata only.
 
-This module provides comprehensive logging of all LLM interactions for debugging purposes.
-Logs are stored in ~/.dana/logs/ with separate files for different types of interactions.
+Prompt text, model output, tool arguments, exception messages, credentials and
+provider replay material are never serialized. Disabled logging does no disk IO.
 """
 
 from datetime import datetime
 import json
+import os
 from pathlib import Path
+from threading import Lock
 from typing import Any
-
-import structlog
+from uuid import uuid4
 
 from .types import LLMMessage, LLMResponse
 
 
-logger = structlog.get_logger()
+_MAX_LOG_BYTES = 4 * 1024 * 1024
 
 
 class LLMDebugLogger:
-    """Debug logger for LLM requests and responses."""
+    """Metadata diagnostics, enabled explicitly or by DANA_LLM_DEBUG_LOGGING."""
 
     def __init__(self):
-        """Initialize the debug logger.
-
-        The log directory is resolved lazily on first use so importing Dana
-        never touches ~/.dana (D8: --help/--version must stay side-effect free).
-        """
+        self.enabled = os.getenv("DANA_LLM_DEBUG_LOGGING", "").lower() in {"1", "true", "yes"}
         self._resolved = False
         self._log_dir: Path | None = None
         self._request_log: Path | None = None
         self._response_log: Path | None = None
         self._agent_log: Path | None = None
         self._error_log: Path | None = None
+        self._write_lock = Lock()
 
     def _ensure_resolved(self) -> None:
-        """Resolve the log directory and log file paths on first use."""
-        if self._resolved:
+        if not self.enabled or self._resolved:
             return
         self._resolved = True
         self._log_dir = self._resolve_log_dir()
-        if self._log_dir is None:
-            return
-        self._request_log = self._log_dir / "llm_requests.jsonl"
-        self._response_log = self._log_dir / "llm_responses.jsonl"
-        self._agent_log = self._log_dir / "agent_interactions.jsonl"
-        self._error_log = self._log_dir / "errors.jsonl"
+        if self._log_dir is not None:
+            self._request_log = self._log_dir / "llm_requests.jsonl"
+            self._response_log = self._log_dir / "llm_responses.jsonl"
+            self._agent_log = self._log_dir / "agent_interactions.jsonl"
+            self._error_log = self._log_dir / "errors.jsonl"
 
     @property
     def log_dir(self) -> Path | None:
@@ -72,47 +67,27 @@ class LLMDebugLogger:
         self._ensure_resolved()
         return self._error_log
 
+    @staticmethod
+    def _label(value: str | None) -> str | None:
+        return value[:160] if value is not None else None
+
     def log_request(
         self, provider: str, model: str, messages: list[LLMMessage], agent_id: str | None = None, agent_type: str | None = None, **kwargs
     ) -> str:
-        """
-        Log an LLM request.
-
-        Args:
-            provider: LLM provider name
-            model: Model name
-            messages: List of messages being sent
-            agent_id: ID of the agent making the request
-            agent_type: Type of the agent making the request
-            **kwargs: Additional parameters
-
-        Returns:
-            Request ID for correlation with response
-        """
-        request_id = f"req_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-
-        # Convert messages to serializable format
-        serializable_messages = []
-        for msg in messages:
-            serializable_messages.append({"role": msg.role, "content": msg.content, "length": len(msg.content) if msg.content else 0})
-
-        log_entry = {
-            "timestamp": datetime.now().isoformat(),
-            "request_id": request_id,
-            "type": "request",
-            "provider": provider,
-            "model": model,
-            "agent_id": agent_id,
-            "agent_type": agent_type,
-            "message_count": len(messages),
-            "messages": serializable_messages,
-            "total_input_length": sum(len(msg.content) if msg.content else 0 for msg in messages),
-            "kwargs": {k: str(v) for k, v in kwargs.items()},  # Convert to strings for JSON
-        }
-
-        self._write_log_entry(self.request_log, log_entry)
-        logger.debug("LLM request logged", request_id=request_id, provider=provider, model=model)
-
+        request_id = uuid4().hex
+        if self.enabled:
+            self._write_log_entry(
+                self.request_log,
+                {
+                    "type": "request",
+                    "request_id": request_id,
+                    "provider": self._label(provider),
+                    "model": self._label(model),
+                    "agent_id": self._label(agent_id),
+                    "agent_type": self._label(agent_type),
+                    "message_count": len(messages),
+                },
+            )
         return request_id
 
     def log_response(
@@ -125,60 +100,37 @@ class LLMDebugLogger:
         agent_type: str | None = None,
         duration_ms: float | None = None,
     ):
-        """
-        Log an LLM response.
-
-        Args:
-            request_id: Request ID from log_request
-            response: LLM response object
-            provider: LLM provider name
-            model: Model name
-            agent_id: ID of the agent that made the request
-            agent_type: Type of the agent that made the request
-            duration_ms: Request duration in milliseconds
-        """
-        log_entry = {
-            "timestamp": datetime.now().isoformat(),
-            "request_id": request_id,
-            "type": "response",
-            "provider": provider,
-            "model": response.model if response.model else model,
-            "agent_id": agent_id,
-            "agent_type": agent_type,
-            "duration_ms": duration_ms,
-            "content_length": len(response.content) if response.content else 0,
-            "content_preview": response.content[:200] + "..." if response.content and len(response.content) > 200 else response.content,
-            "finish_reason": response.finish_reason,
-            "usage": response.usage,
-            "tool_calls_count": len(response.tool_calls) if response.tool_calls else 0,
-            "has_tool_calls": bool(response.tool_calls),
-        }
-
-        self._write_log_entry(self.response_log, log_entry)
-        logger.debug("LLM response logged", request_id=request_id, content_length=log_entry["content_length"])
+        if not self.enabled:
+            return
+        self._write_log_entry(
+            self.response_log,
+            {
+                "type": "response",
+                "request_id": self._label(request_id),
+                "provider": self._label(provider),
+                "model": self._label(response.model or model),
+                "agent_id": self._label(agent_id),
+                "agent_type": self._label(agent_type),
+                "duration_ms": duration_ms,
+                "content_length": len(response.content) if response.content else 0,
+                "finish_reason": self._label(response.finish_reason),
+                "tool_calls_count": len(response.tool_calls) if response.tool_calls else 0,
+            },
+        )
 
     def log_full_response_content(self, request_id: str, content: str, provider: str, model: str):
-        """
-        Log the full response content in a separate file for detailed debugging.
-
-        Args:
-            request_id: Request ID for correlation
-            content: Full response content
-            provider: LLM provider name
-            model: Model name
-        """
-        full_content_log = self.log_dir / f"full_responses_{datetime.now().strftime('%Y%m%d')}.jsonl"
-
-        log_entry = {
-            "timestamp": datetime.now().isoformat(),
-            "request_id": request_id,
-            "provider": provider,
-            "model": model,
-            "full_content": content,
-            "content_length": len(content) if content else 0,
-        }
-
-        self._write_log_entry(full_content_log, log_entry)
+        """Record only the length; full response payload logging is forbidden."""
+        if self.enabled:
+            self._write_log_entry(
+                self.response_log,
+                {
+                    "type": "response_content_redacted",
+                    "request_id": self._label(request_id),
+                    "provider": self._label(provider),
+                    "model": self._label(model),
+                    "content_length": len(content) if content else 0,
+                },
+            )
 
     def log_agent_interaction(
         self,
@@ -189,30 +141,18 @@ class LLMDebugLogger:
         target_agent_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ):
-        """
-        Log agent-to-agent interactions.
-
-        Args:
-            agent_id: ID of the agent performing the interaction
-            agent_type: Type of the agent
-            interaction_type: Type of interaction (query, response, tool_call, etc.)
-            content: Content of the interaction
-            target_agent_id: ID of target agent (for agent-to-agent calls)
-            metadata: Additional metadata
-        """
-        log_entry = {
-            "timestamp": datetime.now().isoformat(),
-            "agent_id": agent_id,
-            "agent_type": agent_type,
-            "interaction_type": interaction_type,
-            "target_agent_id": target_agent_id,
-            "content_length": len(content) if content else 0,
-            "content_preview": content[:200] + "..." if content and len(content) > 200 else content,
-            "metadata": metadata or {},
-        }
-
-        self._write_log_entry(self.agent_log, log_entry)
-        logger.debug("Agent interaction logged", agent_id=agent_id, interaction_type=interaction_type)
+        if self.enabled:
+            self._write_log_entry(
+                self.agent_log,
+                {
+                    "type": "agent_interaction",
+                    "agent_id": self._label(agent_id),
+                    "agent_type": self._label(agent_type),
+                    "interaction_type": self._label(interaction_type),
+                    "target_agent_id": self._label(target_agent_id),
+                    "content_length": len(content) if content else 0,
+                },
+            )
 
     def log_error(
         self,
@@ -223,115 +163,71 @@ class LLMDebugLogger:
         provider: str | None = None,
         model: str | None = None,
     ):
-        """
-        Log errors for debugging.
-
-        Args:
-            error: The exception that occurred
-            context: Context where the error occurred
-            request_id: Request ID if available
-            agent_id: Agent ID if available
-            provider: LLM provider if available
-            model: Model name if available
-        """
-        log_entry = {
-            "timestamp": datetime.now().isoformat(),
-            "request_id": request_id,
-            "agent_id": agent_id,
-            "provider": provider,
-            "model": model,
-            "context": context,
-            "error_type": type(error).__name__,
-            "error_message": str(error),
-            "error_details": getattr(error, "args", []),
-        }
-
-        self._write_log_entry(self.error_log, log_entry)
-        logger.error("Error logged", context=context, error_type=type(error).__name__)
+        if self.enabled:
+            self._write_log_entry(
+                self.error_log,
+                {
+                    "type": "error",
+                    "request_id": self._label(request_id),
+                    "agent_id": self._label(agent_id),
+                    "provider": self._label(provider),
+                    "model": self._label(model),
+                    "context": self._label(context),
+                    "error_type": type(error).__name__,
+                },
+            )
 
     def _write_log_entry(self, log_file: Path | None, entry: dict[str, Any]):
-        """
-        Write a log entry to a JSONL file.
-
-        Args:
-            log_file: Path to the log file
-            entry: Log entry dictionary
-        """
-        if log_file is None:
+        if not self.enabled or log_file is None:
             return
-        try:
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except Exception as e:
-            # Fallback logging - don't let logging errors break the application
-            logger.error("Failed to write debug log", error=str(e), log_file=str(log_file))
+        entry["timestamp"] = datetime.now().isoformat()
+        with self._write_lock:
+            try:
+                encoded = (json.dumps(entry, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+                if log_file.exists() and log_file.stat().st_size + len(encoded) > _MAX_LOG_BYTES:
+                    log_file.replace(log_file.with_suffix(".jsonl.1"))
+                with log_file.open("ab") as stream:
+                    stream.write(encoded)
+            except (OSError, TypeError, ValueError):
+                # Optional diagnostics must not turn a successful request into a failure.
+                self.enabled = False
 
     def get_log_stats(self) -> dict[str, Any]:
-        """
-        Get statistics about the debug logs.
-
-        Returns:
-            Dictionary with log statistics
-        """
         if self.log_dir is None:
             return {"log_directory": None, "log_files": {}}
-
-        stats = {"log_directory": str(self.log_dir), "log_files": {}}
-
-        for log_file in [self.request_log, self.response_log, self.agent_log, self.error_log]:
-            if log_file.exists():
-                stats["log_files"][log_file.name] = {
-                    "size_bytes": log_file.stat().st_size,
-                    "line_count": sum(1 for _ in open(log_file, encoding="utf-8")),
-                }
-            else:
-                stats["log_files"][log_file.name] = {"size_bytes": 0, "line_count": 0}
-
-        return stats
+        files = {}
+        for path in (self.request_log, self.response_log, self.agent_log, self.error_log):
+            if path is not None:
+                size = path.stat().st_size if path.exists() else 0
+                line_count = 0
+                if size:
+                    with path.open(encoding="utf-8") as stream:
+                        line_count = sum(1 for _ in stream)
+                files[path.name] = {"size_bytes": size, "line_count": line_count}
+        return {"log_directory": str(self.log_dir), "log_files": files}
 
     def cleanup_old_logs(self, days_to_keep: int = 7):
-        """
-        Clean up old log files.
-
-        Args:
-            days_to_keep: Number of days of logs to keep
-        """
         if self.log_dir is None:
             return
-
-        cutoff_time = datetime.now().timestamp() - (days_to_keep * 24 * 60 * 60)
-
-        for log_file in self.log_dir.glob("*.jsonl"):
-            if log_file.stat().st_mtime < cutoff_time:
-                try:
-                    log_file.unlink()
-                    logger.info("Cleaned up old log file", file=str(log_file))
-                except Exception as e:
-                    logger.error("Failed to cleanup log file", file=str(log_file), error=str(e))
+        cutoff = datetime.now().timestamp() - days_to_keep * 24 * 60 * 60
+        for path in self.log_dir.glob("*.jsonl*"):
+            if path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
 
     def _resolve_log_dir(self) -> Path | None:
-        candidates = [
-            Path.home() / ".dana" / "logs",
-            Path.cwd() / ".dana" / "logs",
-        ]
-
-        for candidate in candidates:
+        for candidate in (Path.home() / ".dana" / "logs", Path.cwd() / ".dana" / "logs"):
             try:
                 candidate.mkdir(parents=True, exist_ok=True)
-            except Exception:
-                continue
-            else:
                 return candidate
-
+            except OSError:
+                continue
         return None
 
 
-# Global instance
-_debug_logger = None
+_debug_logger: LLMDebugLogger | None = None
 
 
 def get_debug_logger() -> LLMDebugLogger:
-    """Get the global debug logger instance."""
     global _debug_logger
     if _debug_logger is None:
         _debug_logger = LLMDebugLogger()
@@ -339,13 +235,10 @@ def get_debug_logger() -> LLMDebugLogger:
 
 
 def enable_debug_logging():
-    """Enable debug logging (creates the logger and log directory)."""
-    get_debug_logger()
-    logger.info("LLM debug logging enabled", log_dir=str(get_debug_logger().log_dir))
+    """Enable bounded, metadata-only diagnostics."""
+    get_debug_logger().enabled = True
 
 
 def disable_debug_logging():
-    """Disable debug logging."""
-    global _debug_logger
-    _debug_logger = None
-    logger.info("LLM debug logging disabled")
+    """Disable diagnostics, including an instance retained by an active caller."""
+    get_debug_logger().enabled = False

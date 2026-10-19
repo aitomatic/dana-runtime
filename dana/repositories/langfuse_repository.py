@@ -13,23 +13,21 @@ from typing import TYPE_CHECKING
 from structlog import get_logger
 
 
-try:
+if TYPE_CHECKING:
+    # Annotations only (`from __future__ import annotations`); importing these
+    # eagerly closes a package cycle through `dana.core.agent`.
     from langfuse import Langfuse
-except ImportError:
-    Langfuse = None  # type: ignore[misc, assignment]
+
+    from dana.core.agent.base_agent import BaseAgent
 
 from dana.common.base_war import BaseWAR
 from dana.common.protocols.war import AgentProtocol, ResourceProtocol, WorkflowProtocol
 from dana.common.schemas import PromptVersionSnapshot
 from dana.config.storage_config import LangfuseStorageConfig, StorageConfig
-from dana.core.agent.base_agent import BaseAgent
 
 from .local_file_repository import LocalRepositoryMixin
 from .repository_protocol import PromptRepositoryProtocol
 
-
-if TYPE_CHECKING:
-    pass
 
 logger = get_logger()
 
@@ -48,10 +46,15 @@ def _get_langfuse_client(storage_config: LangfuseStorageConfig) -> Langfuse:
         ImportError: If langfuse package is not installed
         ValueError: If credentials are not provided in config or env vars
     """
-    if Langfuse is None:
+    # Imported here, not at module scope: this module is reachable from
+    # `import dana`, and the Langfuse SDK costs ~200 ms to import. A process
+    # that never builds a Langfuse-backed repository should not pay for it.
+    try:
+        from langfuse import Langfuse
+    except ImportError as exc:
         raise ImportError(
-            "langfuse package is not installed. " "Install it with: pip install dana[observability] " "or: pip install langfuse>=3.5.1"
-        )
+            "langfuse package is not installed. Install it with: pip install dana[observability] or: pip install langfuse>=3.5.1"
+        ) from exc
 
     public_key = storage_config.public_key
     secret_key = storage_config.secret_key

@@ -166,7 +166,7 @@ def test_execute_tools_parallel_max_workers_respected():
     agent = MagicMock()
 
     # Patch _execute_single_call to return a simple success dict
-    def fake_single(agent, call):
+    def fake_single(agent, call, *, _prepared=None):
         return {"status": "success", "result": "ok"}
 
     calls = [_make_tool_call("irrelevant") for _ in range(4)]
@@ -197,7 +197,7 @@ def test_execute_tools_parallel_uses_multiple_threads():
     observed_threads: list[int] = []
     lock = threading.Lock()
 
-    def fake_single(agent, call):
+    def fake_single(agent, call, *, _prepared=None):
         with lock:
             observed_threads.append(threading.get_ident())
         return {"status": "success", "result": "ok"}

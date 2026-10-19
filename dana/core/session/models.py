@@ -48,6 +48,24 @@ _FORBIDDEN_PAYLOAD_SUBSTRINGS = frozenset(
     }
 )
 
+# Provider usage counters are numeric accounting, not credential material.
+# Only exact count fields qualify; a string token or an unknown token key still
+# follows the secret-bearing-key rule.
+_TOKEN_COUNT_KEYS = frozenset(
+    {
+        "inputtokens",
+        "outputtokens",
+        "prompttokens",
+        "completiontokens",
+        "totaltokens",
+        "cachedtokens",
+        "cachecreationtokens",
+        "cachecreationinputtokens",
+        "cachereadinputtokens",
+        "reasoningtokens",
+    }
+)
+
 
 def _is_forbidden_key(key: str) -> bool:
     normalized = key.lower().replace("_", "").replace("-", "")
@@ -125,7 +143,9 @@ def _validate_json_safe(value: object, path: str) -> None:
         for k, v in value.items():
             if not isinstance(k, str):
                 raise PayloadSanitizationError(f"{path}: dict key {k!r} must be a string")
-            if _is_forbidden_key(k):
+            normalized = k.lower().replace("_", "").replace("-", "")
+            token_count = normalized in _TOKEN_COUNT_KEYS and (v is None or (type(v) is int and v >= 0))
+            if _is_forbidden_key(k) and not token_count:
                 raise PayloadSanitizationError(
                     f"{path}.{k}: secret-bearing key {k!r} is forbidden in payload; use protected_payload for protected material"
                 )

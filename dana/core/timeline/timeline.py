@@ -211,7 +211,11 @@ class TimelineEntry:
             entry_type=entry_type,
             content=data.get("content", ""),
             timestamp=datetime.fromisoformat(data["timestamp"]),
-            metadata=data.get("metadata", {}),
+            # A copy, never the caller's dict: a projection built from these entries
+            # writes its internal bookkeeping keys (``NATIVE_SOURCE_ENTRY_KEY``, the
+            # compression marker) into an entry's metadata, and installing that into
+            # the caller's decoded payload would mutate their data (I15).
+            metadata=dict(data.get("metadata") or {}),
             is_latest_user_message=data.get("is_latest_user_message", False),
             tool_call_id=data.get("tool_call_id"),
             tool_calls=data.get("tool_calls"),
@@ -574,20 +578,7 @@ class Timeline:
                 # Get context entries (excluding latest user message)
                 context_entries = [entry for entry in self.timeline if not entry.is_latest_user_message]
 
-                # Convert context entries to messages
-                context_messages = []
-                for entry in context_entries:
-                    content = self._format_entry_content(entry)
-
-                    # Handle native tool results (OpenAI format)
-                    if entry.tool_call_id:
-                        context_messages.append(LLMMessage(role="tool", content=content, tool_call_id=entry.tool_call_id))
-                    # Handle assistant messages with native tool calls
-                    elif entry.tool_calls:
-                        context_messages.append(LLMMessage(role="assistant", content=content, tool_calls=entry.tool_calls))
-                    else:
-                        role = self._get_entry_role(entry, default_role)
-                        context_messages.append(LLMMessage(role=role, content=content))
+                context_messages = [self._entry_to_llm_message(entry, default_role) for entry in context_entries]
 
                 # Apply token limit to context if needed
                 if self._estimate_tokens(context_messages) > token_limit:
@@ -605,28 +596,7 @@ class Timeline:
         # Standard processing (no latest user separation)
         timeline_entries = self.timeline
 
-        # Convert entries to LLM messages
-        messages = []
-        for entry in timeline_entries:
-            content = self._format_entry_content(entry)
-
-            # Handle native tool results (OpenAI format)
-            if entry.tool_call_id:
-                messages.append(LLMMessage(role="tool", content=content, tool_call_id=entry.tool_call_id))
-            # Handle assistant messages with native tool calls
-            elif entry.tool_calls:
-                messages.append(LLMMessage(role="assistant", content=content, tool_calls=entry.tool_calls))
-            else:
-                role = self._get_entry_role(entry, default_role)
-                msg = LLMMessage(role=role, content=content)
-                # Propagate reasoning replay metadata when present so providers
-                # can splice raw items into Responses API input[] (Phase 3).
-                meta = entry.metadata or {}
-                if role == "assistant" and meta.get("reasoning_items"):
-                    msg.reasoning_items = meta.get("reasoning_items")
-                    msg.reasoning_fingerprint = meta.get("fingerprint")
-                    msg.response_id = meta.get("response_id")
-                messages.append(msg)
+        messages = [self._entry_to_llm_message(entry, default_role) for entry in timeline_entries]
 
         # Merge consecutive assistant messages (without tool_calls) to avoid confusing the LLM
         # OpenAI models can get confused by multiple consecutive assistant messages.
@@ -655,6 +625,19 @@ class Timeline:
             return self._build_context_with_token_limit(merged_messages, token_limit)
 
         return merged_messages
+
+    def _entry_to_llm_message(self, entry: TimelineEntry, default_role: str) -> LLMMessage:
+        role = "tool" if entry.tool_call_id else "assistant" if entry.tool_calls else self._get_entry_role(entry, default_role)
+        metadata = entry.metadata or {}
+        return LLMMessage(
+            role=role,
+            content=self._format_entry_content(entry),
+            tool_calls=entry.tool_calls,
+            tool_call_id=entry.tool_call_id,
+            reasoning_items=metadata.get("reasoning_items") if role == "assistant" else None,
+            reasoning_fingerprint=metadata.get("fingerprint") if role == "assistant" else None,
+            response_id=metadata.get("response_id") if role == "assistant" else None,
+        )
 
     def _get_entry_role(self, entry: TimelineEntry, default_role: str) -> str:
         """

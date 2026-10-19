@@ -260,3 +260,122 @@ def test_resume_via_load_from_entries_adopts_latest_compact_session(tmp_path, ma
     # No new compact session rolled without a fresh compaction.
     compact = tl2._repository.list_sessions(prefix=_compact_prefix(agent))
     assert compact == [compact_id]
+
+
+@pytest.mark.parametrize("make_factory", FACTORIES)
+def test_load_from_entries_does_not_save_into_another_sessions_snapshot(tmp_path, make_factory):
+    """Cross-session hydration must not overwrite the previous session's snapshot.
+
+    Reproduces the journal-restore shape: one agent instance adopts session A's
+    active compact session, then the session id moves to B and a full projection
+    of B is loaded in place. Without clearing the adopted target, B's next save
+    lands inside A's compact snapshot.
+    """
+    agent = _Agent(str(tmp_path))
+    factory = make_factory(str(tmp_path))
+
+    # Session A: compact snapshot holding A-only history.
+    tl_a = _make_timeline(agent, factory)
+    _add_entry(tl_a, TimelineEntryType.USER_MESSAGE, "A-only")
+    tl_a._last_compression_at = datetime(2026, 4, 20, 12, 0, 0)
+    tl_a.save(agent._session_id)
+
+    a_compact_id = f"{agent._session_id}__compact__20260420T120000_000000"
+    assert a_compact_id in tl_a._repository.list_sessions(prefix=_compact_prefix(agent))
+
+    # Same instance adopts A's compact target (as read_since/rehydrate does).
+    tl_a._rehydrate_active_compact_session()
+    assert tl_a._active_compact_session_id == a_compact_id
+
+    # Session id moves to B; B's full projection is loaded in place.
+    agent._session_id = "sess-B"
+    tl_a.load_from_entries([TimelineEntry(entry_type=TimelineEntryType.USER_MESSAGE, content="B-1")])
+    _add_entry(tl_a, TimelineEntryType.AGENT_RESPONSE, "B-answer")
+    tl_a.save("sess-B")
+
+    # A's snapshot is intact and B did not open a compact session.
+    a_contents = {e.content for e in tl_a._repository.read_session_entries(a_compact_id)}
+    assert "B-1" not in a_contents, "session B must not write into session A's compact snapshot"
+    assert a_contents == {"A-only"}
+    assert tl_a._repository.list_sessions(prefix="sess-B__compact__") == []
+
+    # B's history landed under B's base session id.
+    b_contents = {e.content for e in tl_a._repository.read_session_entries("sess-B")}
+    assert b_contents == {"B-1", "B-answer"}
+
+
+_REASONING_ITEM = {
+    "type": "reasoning",
+    "id": "rs_snapshot_001",
+    "summary": [{"type": "summary_text", "text": "Checked the options."}],
+    "encrypted_content": "opaque_snapshot_blob",
+}
+
+
+class _RecordingRepository:
+    """Records exactly the entries the serializer hands the repository.
+
+    Deliberately does no redaction of its own: this test covers the serializer
+    seam (compaction and communicator saves reach it without the streaming
+    bridge's wrap-around), not the repository's own snapshot encoding.
+    """
+
+    def __init__(self) -> None:
+        self.saved: list[tuple[str, list[TimelineEntry]]] = []
+
+    def save(self, session_id: str, entries: list[TimelineEntry]) -> None:
+        self.saved.append((session_id, list(entries)))
+
+    def read_session_entries(self, session_id: str):
+        for saved_id, entries in self.saved:
+            if saved_id == session_id:
+                yield from entries
+
+    def list_sessions(self, prefix: str = "") -> list[str]:
+        return sorted(session_id for session_id, _ in self.saved if session_id.startswith(prefix))
+
+
+@pytest.mark.parametrize("journal_owned", [True, False])
+@pytest.mark.parametrize("compacted", [False, True])
+def test_save_withholds_opaque_replay_carriers_only_for_journal_owned_agents(tmp_path, journal_owned, compacted):
+    """The serializer's own save path must not write opaque carriers in plaintext.
+
+    The streaming bridge redacts around its final ``save``, but ``save`` is also
+    reached from compaction and from the communicator — so any journal-owned
+    snapshot must withhold ``reasoning_items`` regardless of the caller.
+    """
+    agent = _Agent(str(tmp_path))
+    agent._journal_owned_protected_replay = journal_owned
+    timeline = CompressedTimeline(agent=agent, compression_enabled=False)
+    timeline._repository = _RecordingRepository()
+    entry = TimelineEntry(
+        entry_type=TimelineEntryType.AGENT_THOUGHTS,
+        content="Checked the options.",
+        metadata={
+            "reasoning_items": [_REASONING_ITEM],
+            "fingerprint": "openai:gpt-5:abcd1234",
+            "response_id": "resp_snapshot_001",
+        },
+    )
+    timeline.add_entry(entry)
+    if compacted:
+        timeline._last_compression_at = datetime(2026, 10, 17, 12, 0, 0)
+
+    timeline.save(agent._session_id)
+
+    session_id = f"{agent._session_id}__compact__20261017T120000_000000" if compacted else agent._session_id
+    saved_id, saved_entries = next((s, e) for s, e in timeline._repository.saved if s == session_id)
+    assert saved_id == session_id
+    saved = saved_entries[0]
+    if journal_owned:
+        assert "reasoning_items" not in saved.metadata
+    else:
+        assert saved.metadata["reasoning_items"] == [_REASONING_ITEM]
+    # Non-opaque replay context survives either way.
+    assert saved.metadata["fingerprint"] == "openai:gpt-5:abcd1234"
+    assert saved.metadata["response_id"] == "resp_snapshot_001"
+    # The live projection keeps its carriers: replay and the protected-payload
+    # build both read live metadata.
+    assert entry.metadata["reasoning_items"] == [_REASONING_ITEM]
+    assert timeline.timeline[0].metadata["reasoning_items"] == [_REASONING_ITEM]
+    assert timeline.to_llm_messages()[0].reasoning_items == [_REASONING_ITEM]

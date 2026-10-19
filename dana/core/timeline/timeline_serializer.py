@@ -19,7 +19,8 @@ Compaction model (GH-1):
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -27,6 +28,8 @@ from structlog import get_logger
 
 from dana.core.timeline.native_message import (
     COMPRESSED_CONTEXT_KEY,
+    COMPRESSION_TIMESTAMP_KEY,
+    NATIVE_SOURCE_ENTRY_KEY,
     NativeMessage,
 )
 from dana.core.timeline.timeline import TimelineEntry
@@ -118,19 +121,17 @@ class TimelineSerializerMixin:
 
         # Compression-aware cutoff: drop entries older than the newest
         # compressed-context marker, if any.
-        cutoff_idx = 0
-        for i, entry in enumerate(reversed(all_entries)):
-            if COMPRESSED_CONTEXT_KEY in entry.metadata:
-                cutoff_idx = len(all_entries) - i - 1
-                break
-
+        cutoff_idx = self._cut_at_compression_marker(all_entries, lambda entry: COMPRESSED_CONTEXT_KEY in entry.metadata)
         result_entries = all_entries[cutoff_idx:]
 
         # Native messages: recompute from entries — not persisted anymore.
-        self._native_messages = [self._timeline_entry_to_native_message(e) for e in result_entries]
+        # Install through the accounting seam so the incremental token total
+        # and compaction generation track the rehydrated projection. The
+        # aliasing-risk flag is cleared only if no installed entry still shares
+        # caller-mutable content or tool arguments with the repository read.
+        self._install_built_projection(result_entries)
 
-        for entry in result_entries:
-            yield entry
+        yield from result_entries
 
     def _read_from_compact_session(self: CompressedTimeline, checkpoint: int) -> list[TimelineEntry]:
         """Read entries from the active compact session with checkpoint slicing.
@@ -174,9 +175,9 @@ class TimelineSerializerMixin:
     def rehydrate(self: CompressedTimeline) -> None:
         """Reload this timeline from the agent's current session on disk.
 
-        Thin wrapper over ``read_since``: assigns the persisted entries to
-        ``self.timeline`` (``_native_messages`` is recomputed by ``read_since``
-        as a side effect). Compaction-snapshot aware.
+        Thin wrapper over ``read_since``: the entries are assigned and the
+        native projection + token accounting re-anchored by ``read_since``
+        itself (as part of the same projection swap). Compaction-snapshot aware.
 
         No-op for in-memory timelines (no repository or no agent) — ``read_since``
         would otherwise raise ``ValueError``. A session id that was never saved
@@ -184,7 +185,9 @@ class TimelineSerializerMixin:
         """
         if self._repository is None or self._agent is None:
             return
-        self.timeline = list(self.read_since(0))
+        # Consume the generator; read_since installs the loaded projection.
+        for _ in self.read_since(0):
+            pass
 
     # ------------------------------------------------------------------
     # save
@@ -200,7 +203,8 @@ class TimelineSerializerMixin:
 
         Ephemeral entries (e.g. CONTEXT) are excluded from persistence.
         Native messages are NOT persisted — they are recomputed from entries
-        on load.
+        on load. For a journal-managed session the opaque provider replay
+        carriers are withheld from the snapshot (``_snapshot_entries``).
 
         Args:
             session_id: Caller-supplied session identifier. If it already
@@ -234,7 +238,7 @@ class TimelineSerializerMixin:
         target = self._active_compact_session_id or base_session_id
 
         persistent_entries = [e for e in self.timeline if not e.ephemeral]
-        self._repository.save(target, persistent_entries)
+        self._repository.save(target, self._snapshot_entries(persistent_entries))
 
         logger.info(
             "compressed_timeline_saved",
@@ -242,6 +246,35 @@ class TimelineSerializerMixin:
             entries=len(persistent_entries),
             is_compact=(self._active_compact_session_id is not None),
         )
+
+    def _snapshot_entries(self: CompressedTimeline, entries: list[TimelineEntry]) -> list[TimelineEntry]:
+        """Return the entries to hand the repository for this save.
+
+        For a journal-managed session the opaque provider replay carriers
+        (``reasoning_items``, which can carry the provider's ``encrypted_content``
+        blob) are withheld from the snapshot: the journal persists that payload
+        envelope-encrypted, so writing the same bytes into this plaintext
+        snapshot would defeat the journal's encryption boundary. Every other
+        metadata key — fingerprint, response id, compressed context — is kept,
+        as is every entry without carriers.
+
+        Entries with carriers are copied, never mutated: in-flight replay, the
+        compaction marker bookkeeping and the session's protected-payload build
+        all read the live metadata. Agents without the journal marker (the plain
+        legacy API) are passed through untouched.
+        """
+        agent = self._agent
+        if agent is None or not getattr(agent, "_journal_owned_protected_replay", False):
+            return entries
+
+        snapshot: list[TimelineEntry] = []
+        for entry in entries:
+            metadata = entry.metadata
+            if isinstance(metadata, dict) and metadata.get("reasoning_items"):
+                snapshot.append(replace(entry, metadata={key: value for key, value in metadata.items() if key != "reasoning_items"}))
+            else:
+                snapshot.append(entry)
+        return snapshot
 
     # ------------------------------------------------------------------
     # load_from_entries (repo-free; works on caller-supplied entries)
@@ -260,13 +293,22 @@ class TimelineSerializerMixin:
         backward compatibility with callers that used to persist them;
         the serializer no longer persists them itself.
 
+        Loading is a full replacement of the model-facing projection: the
+        timeline entries and the native messages derived from them are
+        re-established from the supplied data, never carried over from the
+        projection being replaced, and a compaction target that belongs to a
+        different session is dropped (see ``_clear_stale_compact_target``) so the
+        next ``save`` cannot write this session's history into another session's
+        snapshot.
+
         Args:
             entries: List of TimelineEntry objects or dicts (legacy format)
             native_messages: Optional list of native message dicts
         """
+        self._clear_stale_compact_target()
+
         if not entries and not native_messages:
-            self.timeline = []
-            self._native_messages = []
+            self._install_built_projection([])
             return
 
         first_entry = entries[0] if entries else None
@@ -287,14 +329,56 @@ class TimelineSerializerMixin:
 
         if native_messages:
             self._load_timeline_entries_legacy(timeline_entries)
-            self._native_messages = [NativeMessage.from_dict(msg) for msg in native_messages]
+            # The supplied native list is the projection of the same journal
+            # that produced ``entries``, so it is cut at the compression marker
+            # by the same rule. Keeping pre-marker messages here would hand the
+            # provider the compressed-away history alongside the summary.
+            native = [NativeMessage.from_dict(msg) for msg in native_messages]
+            cut = self._native_compression_cutoff(native)
+            retained = native[cut:]
+            # Decoding creates fresh message and metadata containers, but nested
+            # content and argument values can still alias caller-owned payloads.
+            # Installation snapshots those dependencies for token accounting.
+            self._install_model_state(self.timeline, retained)
+            # The supplied native messages are the authoritative model-facing
+            # projection for this load, so tag the ones matching live entries and
+            # leave the rest untagged: a later compaction keeps those objects
+            # (preserving caller edits and replay metadata) and rebuilds only the
+            # entries the supplied list does not cover.
+            self._tag_native_mirrors(self.timeline, retained)
             logger.info(
                 f"Loaded {len(self.timeline)} timeline entries with {len(self._native_messages)} native messages from separate storage"
+                f"{f' (skipped {cut} older messages)' if cut else ''}"
             )
         else:
             self._load_timeline_entries_legacy(timeline_entries)
-            self._native_messages = [self._timeline_entry_to_native_message(entry) for entry in self.timeline]
+            self._install_built_projection(self.timeline)
             logger.info(f"Loaded and converted {len(self.timeline)} legacy timeline entries to native format")
+
+    def _clear_stale_compact_target(self: CompressedTimeline) -> None:
+        """Drop compact-session bookkeeping that belongs to another session.
+
+        A load replaces the projection this instance models. If the active
+        compact write target was adopted for a different session, keeping it
+        means the next ``save`` writes the newly loaded session's history into
+        the previous session's snapshot. Same-session bookkeeping (a compaction
+        that fired on this instance and has a pending roll) is left alone so the
+        compact-roll semantics of ``save`` are unchanged.
+        """
+        agent = self._agent
+        session_id = getattr(agent, "_session_id", None) if agent is not None else None
+        if not session_id or self._active_compact_session_id is None:
+            return
+        if self._strip_compact_suffix(self._active_compact_session_id) == self._strip_compact_suffix(session_id):
+            return
+        logger.info(
+            "stale_compact_target_cleared",
+            stale_session_id=self._active_compact_session_id,
+            session_id=session_id,
+        )
+        self._last_compression_at = None
+        self._active_compact_session_id = None
+        self._active_compact_compression_at = None
 
     def _load_timeline_entries_legacy(self: CompressedTimeline, entries: list[TimelineEntry]) -> None:
         """Load timeline entries with compression-aware cutoff."""
@@ -302,50 +386,103 @@ class TimelineSerializerMixin:
             self.timeline = []
             return
 
-        entries_to_load: list[TimelineEntry] = []
-        found_compressed = False
+        cutoff = self._cut_at_compression_marker(entries, lambda entry: COMPRESSED_CONTEXT_KEY in entry.metadata)
+        self.timeline = entries[cutoff:]
 
-        for entry in reversed(entries):
-            entries_to_load.insert(0, entry)
-            if COMPRESSED_CONTEXT_KEY in entry.metadata:
-                found_compressed = True
-                break
-
-        if found_compressed:
-            self.timeline = entries_to_load
-            logger.info(
-                f"Loaded {len(entries_to_load)} entries with compressed context "
-                f"(skipped {len(entries) - len(entries_to_load)} older entries)"
-            )
+        if cutoff:
+            logger.info(f"Loaded {len(self.timeline)} entries with compressed context (skipped {cutoff} older entries)")
         else:
-            self.timeline = entries
-            logger.info(f"Loaded all {len(entries)} entries (no compressed context found)")
+            logger.info(f"Loaded all {len(self.timeline)} entries (no compressed context found)")
+
+    @staticmethod
+    def _cut_at_compression_marker(items: list[Any], has_marker: Callable[[Any], bool]) -> int:
+        """Return the index of the newest item carrying the compression marker.
+
+        ``_apply_compression`` stamps the marker on the oldest retained item, so
+        everything before it is compressed-away history: it must not be handed
+        to the model again, in either representation (entries or native
+        messages). Returns 0 when no item carries a marker (nothing was
+        compacted), which keeps the whole list.
+        """
+        for index in range(len(items) - 1, -1, -1):
+            if has_marker(items[index]):
+                return index
+        return 0
+
+    def _native_compression_cutoff(self: CompressedTimeline, messages: list[NativeMessage]) -> int:
+        """Keep the explicit summary and retained messages from the newest compaction."""
+        cut = self._cut_at_compression_marker(messages, lambda msg: COMPRESSED_CONTEXT_KEY in msg.metadata)
+        if cut:
+            summary, retained = messages[cut - 1], messages[cut]
+            stamp = retained.metadata.get(COMPRESSION_TIMESTAMP_KEY)
+            if (
+                summary.role == "system"
+                and stamp is not None
+                and summary.metadata.get(COMPRESSION_TIMESTAMP_KEY) == stamp
+                and summary.metadata.get(COMPRESSED_CONTEXT_KEY) == retained.metadata[COMPRESSED_CONTEXT_KEY]
+            ):
+                cut -= 1
+        return cut
+
+    def _tag_native_mirrors(self: CompressedTimeline, entries: list[TimelineEntry], messages: list[NativeMessage]) -> int:
+        """Pair entries and native messages by their tail-aligned projection.
+
+        A hydration path that receives both representations decodes them
+        independently, so the pairing has to be re-established before a later
+        compaction can keep those message objects (preserving caller edits made
+        through the mutable public API, and their reasoning/replay metadata)
+        instead of rebuilding a fresh projection from the entries.
+
+        The supplied representations must describe the same projection. A native
+        summary cohort can precede the entry-backed suffix, so alignment uses the
+        list-length offset in one linear pass. This is positional association,
+        not semantic matching or validation of independently edited lists.
+        Decoding creates new message containers, but their nested payloads may
+        retain caller aliases; tagging copies no payloads.
+
+        Returns:
+            Number of messages tagged.
+        """
+        offset = len(messages) - len(entries)
+        tagged = 0
+        for index, entry in enumerate(entries):
+            message_index = index + offset
+            if not 0 <= message_index < len(messages):
+                continue
+            message = messages[message_index]
+            metadata = message.metadata
+            if metadata is None:
+                metadata = message.metadata = {}
+            metadata[NATIVE_SOURCE_ENTRY_KEY] = entry
+            tagged += 1
+        return tagged
 
     def _load_from_native_format(self: CompressedTimeline, native_data: list[dict[str, Any]]) -> None:
         """Load timeline from native message format (dicts with 'role' key)."""
-        self._native_messages = []
-        entries_to_load: list[NativeMessage] = []
-        found_compressed = False
+        native = [NativeMessage.from_dict(msg_dict) for msg_dict in native_data]
+        cutoff = self._native_compression_cutoff(native)
+        retained = native[cutoff:]
+        # Reconstruct TimelineEntry for backward compatibility, then install.
+        # The entries are rebuilt from the decoded messages, so this install owns
+        # them; the decoded native messages themselves may still share mutable
+        # values held by the input dicts, so the aliasing-risk flag is not cleared
+        # by this path.
+        entries = [self._native_message_to_timeline_entry(msg) for msg in retained]
+        # Tag each message with the entry it mirrors, exactly as the in-memory
+        # builder does, so a later compaction keeps these very message objects
+        # (with any edit a caller made through the mutable public API) instead of
+        # rebuilding a fresh projection from the entries.
+        for message, entry in zip(retained, entries, strict=True):
+            # Each message was decoded from the same payload as its entry, and a
+            # compaction's extra summary message is already dropped by the cutoff
+            # above, so this pairing is exact and needs no value comparison.
+            message.metadata[NATIVE_SOURCE_ENTRY_KEY] = entry
+        self._install_model_state(entries, retained)
 
-        for msg_dict in reversed(native_data):
-            msg = NativeMessage.from_dict(msg_dict)
-            entries_to_load.insert(0, msg)
-            if COMPRESSED_CONTEXT_KEY in msg.metadata:
-                found_compressed = True
-                break
-
-        if found_compressed:
-            self._native_messages = entries_to_load
-            logger.info(
-                f"Loaded {len(entries_to_load)} native messages with compressed context "
-                f"(skipped {len(native_data) - len(entries_to_load)} older messages)"
-            )
+        if cutoff:
+            logger.info(f"Loaded {len(self._native_messages)} native messages with compressed context (skipped {cutoff} older messages)")
         else:
-            self._native_messages = [NativeMessage.from_dict(d) for d in native_data]
-            logger.info(f"Loaded all {len(native_data)} native messages (no compressed context found)")
-
-        # Reconstruct TimelineEntry for backward compatibility
-        self.timeline = [self._native_message_to_timeline_entry(msg) for msg in self._native_messages]
+            logger.info(f"Loaded all {len(self._native_messages)} native messages (no compressed context found)")
 
     def _native_message_to_timeline_entry(self: CompressedTimeline, msg: NativeMessage) -> TimelineEntry:
         """Convert NativeMessage back to TimelineEntry for backward compatibility."""
@@ -373,11 +510,12 @@ class TimelineSerializerMixin:
         else:
             entry_type = TimelineEntryType.AGENT_RESPONSE
 
+        entry_metadata = {key: value for key, value in msg.metadata.items() if key != NATIVE_SOURCE_ENTRY_KEY}
         return TimelineEntry(
             entry_type=entry_type,
             content=msg.content,
             timestamp=msg.timestamp,
-            metadata=msg.metadata.copy(),
+            metadata=entry_metadata,
             tool_call_id=tool_call_id,
             tool_calls=tool_calls,
         )

@@ -110,6 +110,54 @@ ALL assistant finals regardless of terminal status, which differs from
 `ConversationProjector`'s committed-turn gating — partial output remains
 visible in the legacy format.
 
+### Incremental model working context
+
+The journal remains authoritative. `AgentSession` applies facts after its last
+projected sequence instead of rebuilding unchanged history. A completed turn
+may save a derived `conversation-working-v1` checkpoint containing the projection
+cursor and the retained model-facing timeline. The working timeline is a deep
+snapshot, excludes ephemeral context, and preserves compaction summaries rather
+than replaying compressed-away messages.
+
+With a protected-state codec, the entire checkpoint is encrypted and bound to
+its owner, workspace, session and sequence. Without a codec, snapshots containing
+protected reasoning are not persisted. Invalid, incompatible or unreadable
+checkpoints fall back to journal replay; checkpoint failure cannot undo a
+committed turn. Backend checkpoint updates cannot replace a newer sequence
+with an older one.
+
+The terminal journal commit is the authority boundary. A subsequent incremental
+projection failure invalidates derived in-memory state for replay; it must not
+append a conflicting error terminal for an already committed outcome.
+Completed turns also retire their unfinished-turn projection buffers instead
+of carrying historical pending state into later checkpoints.
+
+Interruption observations are temporary context for the next model turn, not
+committed conversation messages. They expire after that turn and are excluded
+from persisted working-context snapshots.
+
+SQLite operations sharing one repository connection are serialized across the
+whole transaction, including queued `BEGIN IMMEDIATE`, commit and conditional
+rollback. Cancellation joins the shielded transaction before releasing the
+connection lock. Reads cannot observe another operation's uncommitted
+transaction on that connection.
+
+Cancellation is not proof that a write rolled back. If cancellation arrives
+during COMMIT, the shielded transaction may already be durable before the caller
+receives `CancelledError`. Direct repository callers must reload the journal
+version before retrying. A retry using the old expected version must handle
+`JournalConflict` by reloading and reconciling the committed facts, not blindly
+appending the same logical operation again.
+
+Cancelling the caller task propagates `CancelledError` after owned producer,
+tool, and required terminal-write cleanup. Explicit `session.cancel()` and an
+internally cancelled producer yield a normal cancellation terminal event without
+marking the consuming task cancelled.
+
+Native compacted snapshots retain both the explicit summary and the oldest
+retained message carrying the same compression timestamp. Resume must not
+discard that summary and synthesize differently formatted provider context.
+
 ## 3. Rollback
 
 `DANA_SESSION_JOURNAL_AUTHORITY=0` is the documented rollback switch for the
@@ -210,12 +258,12 @@ both the SQLite and PostgreSQL adapters. To run the Postgres path in CI:
 2. **Set the test DSN**:
 
    ```bash
-   export DANA_PG_TEST_DSN="postgresql://dana_test:dana_test@localhost:5432/dana_test"
+   export DANA_TEST_POSTGRES_DSN="postgresql://dana_test:dana_test@localhost:5432/dana_test"
    ```
 
-   The contract suite picks up the DSN from the environment; when unset,
-   the Postgres parameterizations are skipped (so CI without Postgres still
-   passes).
+   The contract suite skips PostgreSQL parameters without this DSN locally.
+   With `CI=true`, selected PostgreSQL parameters fail rather than silently
+   skipping when the DSN is absent.
 
 3. **Run the suite**:
 
@@ -226,6 +274,12 @@ both the SQLite and PostgreSQL adapters. To run the Postgres path in CI:
 4. **RLS smoke test** (optional, recommended for multi-tenant deployments):
    create two roles with the RLS policies from §1.2 and assert cross-owner
    access raises `SessionNotFound`.
+
+The repository CI runs its PostgreSQL contract job on every pull request rather
+than path-filtering it. This deliberately spends a separate service-container
+job to catch adapter regressions introduced through shared session code,
+dependencies or test configuration. SQLite-only green results are not evidence
+of PostgreSQL fidelity.
 
 ## 6. Operational checks (cheat sheet)
 

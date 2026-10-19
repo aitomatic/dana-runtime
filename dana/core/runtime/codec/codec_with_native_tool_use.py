@@ -8,6 +8,7 @@ from dana.common.llm.llm import LLM
 from dana.common.llm.types import LLMResponse
 from dana.common.observable import observable
 from dana.core.knowledge.prompts.codecs import AbstractCodec, NativeToolsCodec
+from dana.core.llm.llm_caller import UNSET, _Unset
 from dana.core.llm.response_parser import _to_tool_call_dicts
 
 from ..base import ParsedResponse
@@ -30,7 +31,7 @@ class CodecRuntimeWithNativeToolUse(CodecRuntimeBase):
     def __init__(
         self,
         model: str | None = None,
-        temperature: float = 0,
+        temperature: float | None | _Unset = UNSET,
         max_tokens: int | None = None,
         llm: LLM | None = None,
         provider: str = "anthropic",

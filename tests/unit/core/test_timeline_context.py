@@ -1,8 +1,8 @@
 """Tests for ephemeral runtime context in Timeline."""
 
-from dana.core.timeline.timeline import Timeline, TimelineEntry, TimelineEntryType
 from dana.core.runtime.base import AgentRuntime
 from dana.core.runtime.default import DefaultRuntime
+from dana.core.timeline.timeline import Timeline, TimelineEntry, TimelineEntryType
 
 
 class TestTimelineContext:
@@ -190,36 +190,29 @@ class TestDefaultRuntimeContext:
         assert len(context_entries) == 1
         assert context_entries[0].ephemeral is True
 
-    def test_ip_location_is_cached(self):
-        """IP geolocation result is cached at class level."""
+    def test_default_context_never_attempts_geolocation(self, monkeypatch):
+        """Ambient context must not put a network request on prompt construction."""
+        import urllib.request
 
-        class MockLLM:
-            pass
+        requests = []
 
-        # Reset cache
-        AgentRuntime._cached_location = None
+        def forbidden_request(*args, **kwargs):
+            requests.append((args, kwargs))
+            raise AssertionError("default prompt context attempted network access")
 
-        runtime1 = DefaultRuntime(llm=MockLLM())  # Pass mock LLM to avoid API key requirement
-        runtime2 = DefaultRuntime(llm=MockLLM())  # Pass mock LLM to avoid API key requirement
+        monkeypatch.setattr(urllib.request, "urlopen", forbidden_request)
+        monkeypatch.setattr(AgentRuntime, "_cached_location", None)
+        context = DefaultRuntime()._get_runtime_context()
+        assert "location" not in context
+        assert requests == []
 
-        # First call populates cache
-        loc1 = runtime1._get_ip_location()
+    def test_explicit_location_context_uses_available_location(self, monkeypatch):
+        class LocationRuntime(DefaultRuntime):
+            def get_runtime_context_fields(self):
+                return [*super().get_runtime_context_fields(), "location"]
 
-        # Second call (even from different instance) uses cache
-        loc2 = runtime2._get_ip_location()
-
-        assert loc1 == loc2
-        assert AgentRuntime._cached_location is not None
-
-    def test_context_includes_location_when_available(self):
-        """Context includes location field when IP geolocation succeeds."""
-        # Set a mock cached location
-        AgentRuntime._cached_location = {"location": "Test City, Test State, Test Country"}
-
-        runtime = DefaultRuntime()
-        context = runtime._get_runtime_context()
-
-        assert "location" in context
+        monkeypatch.setattr(AgentRuntime, "_cached_location", {"location": "Test City, Test State, Test Country"})
+        context = LocationRuntime()._get_runtime_context()
         assert context["location"] == "Test City, Test State, Test Country"
 
     def test_context_formats_location(self):

@@ -54,9 +54,7 @@ class RetentionPolicy:
     def __post_init__(self) -> None:
         if self.policy_type is RetentionPolicyType.KEEP_FOR_DURATION:
             if self.duration_seconds is None or self.duration_seconds < 0:
-                raise ValueError(
-                    "KEEP_FOR_DURATION requires a non-negative duration_seconds"
-                )
+                raise ValueError("KEEP_FOR_DURATION requires a non-negative duration_seconds")
 
 
 # ---------------------------------------------------------------------------

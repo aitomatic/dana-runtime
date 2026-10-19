@@ -18,6 +18,12 @@ Contract under test (Task 6):
   8. malformed content — non-text blocks don't crash
   9. stderr logs — diagnostics never on stdout
   10. stdout frame parsing — stdout is valid JSON-RPC only
+  11. failed turn: exactly one visible transcript notification, no
+      duplicate RuntimeError/-32603, protocol response completes
+  12. genuine RPC errors: unknown session / missing params still surface
+      as JSON-RPC error frames
+  13. load_session policy failure: previously published session and grant
+      store stay owned; the failed replacement is closed
 """
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ import json
 import os
 import sys
 from types import SimpleNamespace
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -144,8 +151,7 @@ async def agent(tmp_path):
     conn = RecordingConn()
     a.on_connect(conn)
     yield a, conn
-    if a._repository is not None:
-        await a._repository.close()
+    await a.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +215,89 @@ async def _read_jsonrpc_frame(stdout):
         # we've seen a real frame this branch should never run again.
         assert not skipped_diagnostic, f"unexpected non-JSON stdout line after protocol start: {text!r}"
         skipped_diagnostic = True
+
+
+# ---------------------------------------------------------------------------
+# In-process JSON-RPC harness
+#
+# Drives the real ``acp.agent.connection.AgentSideConnection`` over in-memory
+# streams, so tests exercise the actual wire behaviour: JSON-RPC frame
+# framing, request/notification routing, and the transport's own error mapping
+# framing and error mapping, without spawning a subprocess or touching the network.
+# ---------------------------------------------------------------------------
+
+
+class _MemoryTransport(asyncio.BaseTransport):
+    """Collect newline-delimited frames written by the ACP sender loop."""
+
+    def __init__(self) -> None:
+        self.frames: list[dict] = []
+        self._buffer = b""
+        self._closing = False
+
+    def write(self, data: bytes) -> None:
+        self._buffer += data
+        while b"\n" in self._buffer:
+            line, self._buffer = self._buffer.split(b"\n", 1)
+            if line.strip():
+                self.frames.append(json.loads(line))
+
+    def is_closing(self) -> bool:
+        return self._closing
+
+    def close(self) -> None:
+        self._closing = True
+
+    def abort(self) -> None:
+        self.close()
+
+    def get_extra_info(self, name: str, default: Any = None) -> Any:
+        return default
+
+
+class _MemoryProtocol(asyncio.streams.FlowControlMixin):
+    """Minimal protocol stand-in required by ``asyncio.StreamWriter``."""
+
+
+class AcpWire:
+    """In-process ACP peer: real connection, in-memory streams, frame capture."""
+
+    def __init__(self, agent) -> None:
+        from acp.agent.connection import AgentSideConnection
+
+        self._loop = asyncio.get_running_loop()
+        self.reader = asyncio.StreamReader()
+        self.transport = _MemoryTransport()
+        self.writer = asyncio.StreamWriter(self.transport, _MemoryProtocol(loop=self._loop), self.reader, self._loop)
+        self.conn = AgentSideConnection(agent, self.writer, self.reader, use_unstable_protocol=True)
+
+    @property
+    def frames(self) -> list[dict]:
+        return self.transport.frames
+
+    def send(self, request_id: int, method: str, params: dict) -> None:
+        """Feed one JSON-RPC request frame to the agent."""
+        frame = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+        self.reader.feed_data((json.dumps(frame) + "\n").encode())
+
+    async def response(self, request_id: int, timeout: float = 15.0) -> dict:
+        """Await the response frame carrying ``request_id``."""
+
+        async def _poll() -> dict:
+            while True:
+                for frame in self.frames:
+                    if frame.get("id") == request_id:
+                        return frame
+                await asyncio.sleep(0.005)
+
+        return await asyncio.wait_for(_poll(), timeout=timeout)
+
+    def updates(self) -> list[dict]:
+        """Return every ``session/update`` notification payload in order."""
+        return [f["params"]["update"] for f in self.frames if f.get("method") == "session/update"]
+
+    async def close(self) -> None:
+        await self.conn.close()
 
 
 # ===========================================================================
@@ -282,6 +371,8 @@ class TestLoadSession:
         user_texts = [_update_text(u) for _, u in conn2.updates if _update_kind(u) == "user_message_chunk"]
         assert any("hello" in (t or "") for t in user_texts)
 
+        await a2.aclose()
+
 
 # ===========================================================================
 # 4. prompt — streaming, first chunk, drain-before-response
@@ -332,6 +423,8 @@ class TestPrompt:
         agent_texts = [_update_text(u) for _, u in conn.updates if _update_kind(u) == "agent_message_chunk"]
         # Chunks preserve stream order.
         assert agent_texts == ["A", "B", "C"]
+
+        await a.aclose()
 
     @pytest.mark.asyncio
     async def test_first_chunk_before_response(self, agent):
@@ -385,6 +478,8 @@ class TestBusy:
         resp1 = await asyncio.wait_for(prompt1, timeout=5.0)
         assert resp1.stop_reason == "end_turn"
 
+        await a.aclose()
+
 
 # ===========================================================================
 # 6. cancel
@@ -414,6 +509,8 @@ class TestCancel:
         gate.set()
         resp = await asyncio.wait_for(prompt_task, timeout=5.0)
         assert resp.stop_reason == "cancelled"
+
+        await a.aclose()
 
 
 # ===========================================================================
@@ -465,6 +562,8 @@ class TestResumeSession:
 
         kinds = [_update_kind(u) for _, u in conn2.updates]
         assert "user_message_chunk" in kinds
+
+        await a2.aclose()
 
 
 # ===========================================================================
@@ -698,6 +797,8 @@ class TestModelSwitching:
         assert len(resp.models.available_models) == 2
         assert resp.models.current_model_id == "anthropic/claude-sonnet-4"
 
+        await a.aclose()
+
     @pytest.mark.asyncio
     async def test_set_session_model_switches_model(self, tmp_path):
         """session/set_model switches to a configured target and journals MODEL_CHANGED."""
@@ -736,6 +837,8 @@ class TestModelSwitching:
         assert len(model_changed_facts) == 1
         assert model_changed_facts[0].payload["provider"] == "openai"
         assert model_changed_facts[0].payload["model"] == "gpt-4o"
+
+        await a.aclose()
 
     @pytest.mark.asyncio
     async def test_history_survives_switch(self, tmp_path):
@@ -786,6 +889,9 @@ class TestModelSwitching:
         assert "user_message_chunk" in kinds
         assert "agent_message_chunk" in kinds
 
+        await a2.aclose()
+        await a.aclose()
+
     @pytest.mark.asyncio
     async def test_unknown_model_target_raises(self, tmp_path):
         """Switching to an unconfigured model raises ValueError."""
@@ -809,6 +915,8 @@ class TestModelSwitching:
 
         with pytest.raises(ValueError, match="Unknown model target"):
             await a.set_session_model(model_id="openai/gpt-4o", session_id=sid)
+
+        await a.aclose()
 
     @pytest.mark.asyncio
     async def test_rollback_disables_model_switching(self, tmp_path, monkeypatch):
@@ -839,6 +947,8 @@ class TestModelSwitching:
         # set_session_model should raise
         with pytest.raises(RuntimeError, match="Model switching is disabled"):
             await a.set_session_model(model_id="openai/gpt-4o", session_id=sid)
+
+        await a.aclose()
 
     @pytest.mark.asyncio
     async def test_model_change_journaled_once(self, tmp_path):
@@ -874,42 +984,252 @@ class TestModelSwitching:
         assert len(model_changed_facts) == 2
         assert model_changed_facts[0].payload["model"] == "gpt-4o"
         assert model_changed_facts[1].payload["model"] == "claude-haiku-3"
-        """initialize → session/new round-trip over stdio."""
-        env = {
-            **os.environ,
-            "DANA_SESSION_STATE_KEY": "test-key-32-bytes-ok-for-testing!",
-            "DANA_ACP_JOURNAL": str(tmp_path / "sub.db"),
-        }
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "dana.apps.acp",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
+
+        await a.aclose()
+
+
+# ===========================================================================
+# 11-12. Prompt failure contract over the real JSON-RPC connection
+# ===========================================================================
+
+
+class _FailOnceAgent(FakeAgent):
+    """Fails the first turn, then streams normally (session-still-usable check)."""
+
+    def __init__(self) -> None:
+        super().__init__(chunks=["recovered"])
+        self._failed = False
+
+    async def aquery_stream(self, *, message=None, **kwargs):
+        if not self._failed:
+            self._failed = True
+            raise RuntimeError("boom")
+        async for event in super().aquery_stream(message=message, **kwargs):
+            yield event
+
+
+class TestPromptFailureContract:
+    """A failed turn must be recoverable, not a failed JSON-RPC request.
+
+    Prior contract: one visible transcript notification (the ``TURN_ERROR``
+    translation), no duplicate ``RuntimeError``/``-32603`` response, and a
+    successful ``PromptResponse``. Genuine RPC validation errors keep surfacing
+    as JSON-RPC error frames.
+    """
+
+    @pytest.mark.asyncio
+    async def test_failed_turn_sends_one_notification_and_completes(self, tmp_path):
+        from dana.apps.acp.agent import DanaACPAgent
+
+        a = DanaACPAgent(
+            journal_path=str(tmp_path / "journal.db"),
+            agent_factory=fake_agent_factory(chunks=["x"], error=RuntimeError("boom")),
         )
+        wire = AcpWire(a)
         try:
-            assert proc.stdin is not None
-            assert proc.stdout is not None
+            wire.send(1, "session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            sid = (await wire.response(1))["result"]["sessionId"]
 
-            async def send(req):
-                proc.stdin.write((json.dumps(req) + "\n").encode())
-                await proc.stdin.drain()
+            wire.send(2, "session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "hi"}]})
+            frame = await wire.response(2)
 
-            async def recv():
-                return await _read_jsonrpc_frame(proc.stdout)
+            # The request completes successfully: no second failure surface.
+            assert "error" not in frame, frame
+            assert frame["result"]["stopReason"] == "end_turn"
+            assert not [f for f in wire.frames if "error" in f], "failure turn produced a JSON-RPC error frame"
 
-            # initialize
-            await send({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": 1}})
-            init = await recv()
-            assert init["result"]["protocolVersion"] == 1
+            # Exactly one visible transcript notification carries the failure.
+            chunks = [u for u in wire.updates() if u.get("sessionUpdate") == "agent_message_chunk"]
+            assert len(chunks) == 1, chunks
+            assert "boom" in chunks[0]["content"]["text"]
 
-            # session/new
-            await send({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": str(tmp_path), "mcpServers": []}})
-            new = await recv()
-            session_id = new["result"]["sessionId"]
-            assert session_id
+            # Non-duplication across the whole stream: one chunk, one response.
+            assert len([f for f in wire.frames if f.get("method") == "session/update"]) == 2
         finally:
-            proc.terminate()
-            await asyncio.wait_for(proc.wait(), timeout=5.0)
+            await wire.close()
+            await a.aclose()
+
+    @pytest.mark.asyncio
+    async def test_session_usable_after_failed_turn(self, tmp_path):
+        """A recoverable failure leaves the session able to run the next turn."""
+        from dana.apps.acp.agent import DanaACPAgent
+
+        a = DanaACPAgent(
+            journal_path=str(tmp_path / "journal.db"),
+            agent_factory=lambda: _FailOnceAgent(),
+        )
+        wire = AcpWire(a)
+        try:
+            wire.send(1, "session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            sid = (await wire.response(1))["result"]["sessionId"]
+
+            wire.send(2, "session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "first"}]})
+            first = await wire.response(2)
+            assert first["result"]["stopReason"] == "end_turn"
+
+            wire.send(3, "session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "second"}]})
+            second = await wire.response(3)
+            assert second["result"]["stopReason"] == "end_turn"
+
+            texts = [u["content"]["text"] for u in wire.updates() if u.get("sessionUpdate") == "agent_message_chunk"]
+            assert any("recovered" in t for t in texts), texts
+            assert len([t for t in texts if "Error: boom" in t]) == 1
+        finally:
+            await wire.close()
+            await a.aclose()
+
+    @pytest.mark.asyncio
+    async def test_unknown_session_still_returns_internal_error(self, tmp_path):
+        """Genuine handler failures are not swallowed by the recovery contract."""
+        from dana.apps.acp.agent import DanaACPAgent
+
+        a = DanaACPAgent(journal_path=str(tmp_path / "journal.db"), agent_factory=fake_agent_factory(chunks=["x"]))
+        wire = AcpWire(a)
+        try:
+            wire.send(1, "session/prompt", {"sessionId": "no-such-session", "prompt": [{"type": "text", "text": "hi"}]})
+            frame = await wire.response(1)
+            assert frame["error"]["code"] == -32603
+            assert "no-such-session" in json.dumps(frame["error"]["data"])
+        finally:
+            await wire.close()
+
+    @pytest.mark.asyncio
+    async def test_missing_params_still_returns_invalid_params(self, tmp_path):
+        """Schema validation failures still surface as -32602, unsuppressed."""
+        from dana.apps.acp.agent import DanaACPAgent
+
+        a = DanaACPAgent(journal_path=str(tmp_path / "journal.db"), agent_factory=fake_agent_factory(chunks=["x"]))
+        wire = AcpWire(a)
+        try:
+            wire.send(1, "session/prompt", {"prompt": [{"type": "text", "text": "hi"}]})
+            frame = await wire.response(1)
+            assert frame["error"]["code"] == -32602
+        finally:
+            await wire.close()
+
+
+# ===========================================================================
+# 13. load_session policy failure ownership (S1)
+# ===========================================================================
+
+
+class TestLoadSessionFailureOwnership:
+    """A failed replacement load must not strand a closed published session."""
+
+    @pytest.mark.asyncio
+    async def test_policy_failure_keeps_previous_session_and_store(self, tmp_path, monkeypatch):
+        """Policy init failure: prior session/store stay owned, replacement closed."""
+        monkeypatch.setenv("DANA_POLICY_GRANTS_ENABLED", "1")
+        import dana.apps.acp.agent as acp_agent
+
+        a = acp_agent.DanaACPAgent(
+            journal_path=str(tmp_path / "journal.db"),
+            agent_factory=fake_agent_factory(chunks=["ok"]),
+        )
+        a.on_connect(RecordingConn())
+        sid = (await a.new_session(cwd=str(tmp_path))).session_id
+        previous = a._sessions[sid]
+        previous_grants = a._grant_dbs[sid]
+
+        created: list = []
+        real_session = acp_agent.AgentSession
+
+        def _recording_session(*args, **kwargs):
+            session = real_session(*args, **kwargs)
+            created.append(session)
+            return session
+
+        def _failing_evaluator(*args, **kwargs):
+            raise RuntimeError("policy init failed")
+
+        monkeypatch.setattr(acp_agent, "AgentSession", _recording_session)
+        monkeypatch.setattr(acp_agent, "PolicyEvaluator", _failing_evaluator)
+
+        with pytest.raises(RuntimeError, match="policy init failed"):
+            await a.load_session(cwd=str(tmp_path), session_id=sid)
+
+        # The previously published session stays registered and open...
+        assert a._sessions[sid] is previous
+        assert previous._closed is False
+        # ...with its grant store still owned and still usable.
+        assert a._grant_dbs[sid] is previous_grants
+        assert len(a._grant_dbs) == 1
+        await previous_grants.execute("SELECT 1")
+
+        # The failed replacement released its resources and took no ownership.
+        assert len(created) == 1
+        assert created[0]._closed is True
+
+        await a.aclose()
+
+    @pytest.mark.asyncio
+    async def test_successful_load_replaces_previous_session_and_store(self, tmp_path, monkeypatch):
+        """The replacement publishes and the superseded pair is released."""
+        monkeypatch.setenv("DANA_POLICY_GRANTS_ENABLED", "1")
+        import dana.apps.acp.agent as acp_agent
+
+        a = acp_agent.DanaACPAgent(
+            journal_path=str(tmp_path / "journal.db"),
+            agent_factory=fake_agent_factory(chunks=["ok"]),
+        )
+        a.on_connect(RecordingConn())
+        sid = (await a.new_session(cwd=str(tmp_path))).session_id
+        previous = a._sessions[sid]
+        previous_grants = a._grant_dbs[sid]
+
+        await a.load_session(cwd=str(tmp_path), session_id=sid)
+
+        assert a._sessions[sid] is not previous
+        assert a._sessions[sid]._closed is False
+        assert previous._closed is True
+        assert a._grant_dbs[sid] is not previous_grants
+        assert len(a._grant_dbs) == 1
+        # The superseded store is closed, not merely dereferenced.
+        with pytest.raises(ValueError):
+            await previous_grants.execute("SELECT 1")
+
+        await a.aclose()
+
+
+# ===========================================================================
+# 14. teardown under registry mutation (S2)
+# ===========================================================================
+
+
+class TestAcloseRegistryMutation:
+    """``aclose`` snapshots both registries before the first await."""
+
+    @pytest.mark.asyncio
+    async def test_close_tolerates_registry_mutation_during_teardown(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DANA_POLICY_GRANTS_ENABLED", "1")
+        from dana.apps.acp.agent import DanaACPAgent
+
+        a = DanaACPAgent(
+            journal_path=str(tmp_path / "journal.db"),
+            agent_factory=fake_agent_factory(chunks=["ok"]),
+        )
+        a.on_connect(RecordingConn())
+        sid_a = (await a.new_session(cwd=str(tmp_path))).session_id
+        sid_b = (await a.new_session(cwd=str(tmp_path))).session_id
+
+        session_a = a._sessions[sid_a]
+        original_aclose = session_a.aclose
+        removed_connection = a._grant_dbs[sid_b]
+
+        async def _mutating_aclose() -> None:
+            # Teardown of one session dropping sibling registrations mirrors a
+            # session releasing shared resources while the agent closes.
+            a._sessions.pop(sid_b, None)
+            a._grant_dbs.pop(sid_b, None)
+            await original_aclose()
+
+        monkeypatch.setattr(session_a, "aclose", _mutating_aclose)
+
+        try:
+            await a.aclose()
+            assert a._sessions == {}
+            assert a._grant_dbs == {}
+            with pytest.raises(ValueError, match="no active connection"):
+                await removed_connection.execute("SELECT 1")
+        finally:
+            await removed_connection.close()

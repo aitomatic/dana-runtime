@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import dataclass
+import inspect
 import traceback
 from typing import Any
 
@@ -20,8 +22,21 @@ from dana.common.observable import observable
 from dana.common.utils.misc import Misc
 from dana.core.ext.event_bus import Event, EventBus
 from dana.core.ext.events import TOOL_CALL, TOOL_RESULT
-from dana.core.ext.operation import build_operation
+from dana.core.ext.operation import Operation, build_operation
+from dana.core.policy.effects import Effect, EffectKind, EffectMetadata
+from dana.core.tool.admission import AdmissionController, get_default_admission_controller
 from dana.core.tool.catalog import ToolCatalog
+from dana.core.tool.effect_ordering import plan_batch
+from dana.core.tool.offload import (
+    BlockingIOPool,
+    PhysicalWorkClaim,
+    bound_blocking_io_pool,
+    drain_physical_work,
+    is_blocking_io,
+    is_loop_affine,
+    run_blocking,
+    use_blocking_io_pool,
+)
 from dana.core.tool.tool_executor_helpers import (
     create_tool_error,
     create_tool_success,
@@ -35,6 +50,27 @@ from dana.core.tool.tool_executor_helpers import (
 
 logger = structlog.get_logger()
 
+#: Probe object used only to detect whether an installed getter accepts the
+#: invoking agent (I9). Identity is never observed by the callee.
+_AGENT_ARG_SENTINEL = object()
+
+
+@dataclass
+class _PreparedCall:
+    call: dict[str, Any]
+    operation: Operation | None = None
+    block_reason: str | None = None
+    error: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _OwnedHooks:
+    """One owner's tool-lifecycle hooks (see :meth:`ToolExecutor._hooks_for`)."""
+
+    before: Callable[[dict[str, Any], str | None], Any] | None = None
+    after: Callable[[dict[str, Any], dict[str, Any]], Any] | None = None
+    authorize: Callable[[dict[str, Any], str | None], Any] | None = None
+
 
 class ToolExecutor:
     """Executes tool calls on behalf of an agent (sync and async).
@@ -44,8 +80,13 @@ class ToolExecutor:
     Constructor args:
         agent_getter:             Callable[[], agent] — returns the current agent
                                   (used only when caller does not pass agent directly).
-        tool_name_registry_getter: Callable[[], dict] — returns the @named_tool registry
-                                  maintained on AgentRuntime.
+        tool_name_registry_getter: ``Callable[[agent], dict]`` for an agent-scoped
+                                  registry (the runtime wires one so a shared
+                                  runtime resolves the registry for the
+                                  *dispatching* agent), or ``Callable[[], dict]``
+                                  for a static caller-owned registry (frozen
+                                  benchmark drivers and standalone executors).
+                                  Both contracts are detected and supported.
 
     Tool interception is handled by the EventBus (M3): emit ``tool_call``/
     ``tool_result`` around dispatch in both single-call paths. The previous
@@ -60,13 +101,243 @@ class ToolExecutor:
         max_workers: int | None = None,
         tool_catalog: ToolCatalog | None = None,
         mcp_dispatch_getter: Callable[[], dict[str, Any]] | None = None,
+        admission: AdmissionController | None = None,
+        effect_catalog_getter: Callable[[], Any] | None = None,
+        lifecycle_observer: Callable[[str, dict[str, Any]], None] | None = None,
+        catalog_revision_getter: Callable[[], int] | None = None,
+        offload_pool: BlockingIOPool | None = None,
+        before_hook: Callable[[dict[str, Any], str | None], Any] | None = None,
+        after_hook: Callable[[dict[str, Any], dict[str, Any]], Any] | None = None,
+        authorize_hook: Callable[[dict[str, Any], str | None], Any] | None = None,
+        *,
+        agent_tool_name_registry_getter: Callable[[Any], dict[str, tuple[Any, str]]] | None = None,
+        mcp_effect_resolver: Callable[[], Any] | None = None,
     ) -> None:
         self._agent_getter = agent_getter
         self._tool_name_registry_getter = tool_name_registry_getter
+        self._agent_tool_name_registry_getter = agent_tool_name_registry_getter
         self._max_workers = max_workers
         self._tool_catalog = tool_catalog
         # D7 follow-up 1+2: per-tool MCP dispatch map (tool_name -> async callable).
         self._mcp_dispatch_getter = mcp_dispatch_getter
+        # P1 admission: bounds concurrent leaf tool work and nested sub-agent spawns
+        # without nesting permits across a parent/child await. The process-wide
+        # default controller is SHARED (so nested subtrees inherit one budget), so
+        # this executor records whether it owns the controller: closing an executor
+        # releases only its own, never the shared one (that would zero another live
+        # session's admission bookkeeping).
+        self._owns_admission = admission is not None
+        self._admission = admission if admission is not None else get_default_admission_controller()
+        # Effect-ordering source: the session-owned catalog used for scheduling. A
+        # separate getter (not ``tool_catalog``) so the scheduling catalog can be
+        # pinned per turn without rewriting the executor's dispatch catalog.
+        self._effect_catalog_getter = effect_catalog_getter
+        # Cached (getter, takes_agent) pair for the owner-aware arity probe.
+        self._effect_catalog_arity: tuple[Any, bool] = (None, False)
+        # Lifecycle observer: called with (event_name, payload) for terminal
+        # disposition facts. Best-effort; never allowed to break dispatch.
+        self._lifecycle_observer = lifecycle_observer
+        # Catalog revision: an incrementing integer owned by the runtime. Cached
+        # schema/signature/registry metadata is rebuilt only when it changes, so a
+        # prompt turn never re-derives metadata that discovery did not invalidate.
+        self._catalog_revision_getter = catalog_revision_getter
+        self._catalog_revision: int | None = None
+        self._tool_metadata_revision = 0
+        # Blocking-I/O pool owned by THIS executor/session: closing this executor
+        # closes only its own threads, so concurrent and future sessions keep
+        # working (the process-wide default pool is never killed here).
+        self._offload_pool = offload_pool if offload_pool is not None else BlockingIOPool()
+        # Pre/post-execution hooks (durable-write seam). ``before`` runs right
+        # before dispatch (after interception + admission); ``after`` runs for
+        # every result, including policy blocks. Their failures PROPAGATE — a
+        # durable append that fails must fail the turn, never be swallowed the
+        # way the best-effort lifecycle observer is.
+        self._before_hook = before_hook
+        self._after_hook = after_hook
+        # Authorization hook (I5/I6): resolves the permission decision BEFORE any
+        # shared admission permit is taken, so an interactive prompt cannot hold a
+        # leaf/nested slot while a human decides. Its *returned* refusal is
+        # recoverable (policy_block result); a raised one is fatal.
+        self._authorize_hook = authorize_hook
+        # Per-agent hook trios for a runtime/executor shared by several sessions
+        # (owner-scoped like the effect catalog). Matched by identity, appended
+        # in install order, removed by the owning session's teardown; the
+        # constructor's hooks stay the global/legacy trio in the attributes above.
+        self._agent_hooks: list[tuple[Any, _OwnedHooks]] = []
+        # MCP effect resolver (I9): namespaced MCP name -> EffectMetadata, built
+        # from the server's declared readOnlyHint. Read-only MCP tools overlap;
+        # unannotated ones stay ordered per server.
+        self._mcp_effect_resolver = mcp_effect_resolver
+        # Cached (getter, takes_agent) pair for the owner-aware MCP resolver probe.
+        self._mcp_resolver_arity: tuple[Any, bool] = (None, False)
+        self._closed = False
+
+    def set_catalog_revision_getter(self, getter: Callable[[], int] | None) -> None:
+        """Wire the runtime-owned catalog revision getter (stable-metadata cache).
+
+        The getter returns an integer that the runtime bumps whenever tool
+        discovery/schema/wiring changes. Cached metadata is invalidated when the
+        integer changes; passing ``None`` disables revision-based invalidation.
+        """
+        self._catalog_revision_getter = getter
+
+    def invalidate_tool_metadata(self) -> None:
+        """Force a metadata rebuild on the next dispatch (explicit invalidation)."""
+        self._catalog_revision = None
+        self._tool_metadata_revision += 1
+
+    @property
+    def tool_metadata_revision(self) -> int:
+        """How many times cached tool metadata has been rebuilt."""
+        return self._tool_metadata_revision
+
+    def set_execution_hooks(
+        self,
+        before: Callable[[dict[str, Any], str | None], Any] | None = None,
+        after: Callable[[dict[str, Any], dict[str, Any]], Any] | None = None,
+        authorize: Callable[[dict[str, Any], str | None], Any] | None = None,
+        *,
+        agent: Any | None = None,
+    ) -> None:
+        """Wire the authoritative tool-lifecycle hooks (durable-write seam).
+
+        These are the session's durable-journal boundary — the *only* place a
+        session can make "requested/authorized/started" and "terminal" durable
+        around a tool call. Unlike :meth:`set_lifecycle_observer`, hook failures
+        are NOT swallowed by the tool executor: they propagate so a failed
+        durable append can never be silently lost.
+
+        Async executor (``execute_tools_async`` / ``_execute_single_call_async``):
+
+        * ``authorize(tool_call, block_reason)`` — the I5/I6 seam, awaited **before**
+          any admission permit is acquired, for every call (blocked or not).
+          Returning ``{"block": True, "reason": ...}`` (or a non-empty reason
+          string) makes the call a recoverable ``policy_block`` tool result: the
+          turn continues and the model can adapt. Raising stays fatal, so a failed
+          durable append is never swallowed. A permission prompt awaited here
+          holds **no** tool slot, so a queue of prompts cannot starve the budget.
+        * ``before(tool_call, policy_block_reason)`` is awaited **immediately
+          before dispatch**, *after* the EventBus ``tool_call`` interception has run
+          and after the admission permit was acquired, and *outside* the
+          never-raise dispatch guard. ``tool_call`` carries the model-visible call
+          shape with the post-interception (possibly modified) ``arguments`` — the
+          actual arguments about to be dispatched. ``policy_block_reason`` is
+          ``None`` when the call will be dispatched, or the block reason string when
+          the EventBus already decided to block it; for a blocked call the hook
+          still runs (so the session can persist requested/authorized) and the call
+          is *not* dispatched — the session persists ``started`` only when the
+          reason is ``None``. If ``before`` raises, no dispatch happens and the
+          exception propagates (no side effect). A *returned* refusal from
+          ``before`` is recoverable, exactly like ``authorize``.
+        * ``after(tool_call, result)`` is awaited for **every** completed, failed,
+          cancelled or policy-blocked call, *outside* the best-effort observer
+          guard, *after* the EventBus ``tool_result`` interception has applied its
+          modification, and before the executor returns — so the journal terminal
+          fact is durable before the turn's terminal fact. A cancellation result
+          carries a truthful marker: ``_cancelled`` (acknowledged by the tool) or
+          ``_effect_unknown`` (non-cooperative work whose terminal state cannot be
+          confirmed).
+
+        Each hook may be sync or async (an awaitable return is awaited). The
+        legacy synchronous executor does not invoke these hooks: a synchronous
+        caller has no session-owned journal to make durable, and no loop to await
+        on. A session-bound sync caller journals through the EventBus ``tool_call``
+        handler instead.
+
+        Ownership (``agent``)
+        --------------------
+        A runtime — and therefore its executor — can be shared by several live
+        sessions. The hooks are then *that agent's* durable boundary, so they must
+        resolve per invoking agent exactly like the effect catalog: passing
+        ``agent=<agent>`` registers (or, with all three hooks ``None``, removes)
+        that agent's trio, and dispatch resolves hooks from the *invoking* agent.
+        Without ``agent`` the trio is the global/legacy default, which is what a
+        standalone caller and every pre-existing call site get. Hooks are resolved
+        once per call, so a concurrent session cannot swap them mid-call.
+
+        Entries are matched by identity (``is``), never by ``id()``/``hash()``/
+        equality: an agent is not required to be hashable, a recycled ``id()``
+        cannot alias a stranger's hooks, and removing the entry (session teardown)
+        is the only thing that keeps an agent from being referenced here.
+        """
+        if agent is None:
+            self._before_hook = before
+            self._after_hook = after
+            self._authorize_hook = authorize
+            return
+        if before is None and after is None and authorize is None:
+            self._agent_hooks[:] = [(owner, hooks) for owner, hooks in self._agent_hooks if owner is not agent]
+            return
+        entry = _OwnedHooks(before, after, authorize)
+        for index, (owner, _existing) in enumerate(self._agent_hooks):
+            if owner is agent:
+                self._agent_hooks[index] = (owner, entry)
+                break
+        else:
+            self._agent_hooks.append((agent, entry))
+
+    def _hooks_for(self, agent: Any) -> _OwnedHooks:
+        """The hook trio for the *invoking* agent, else the global/legacy trio.
+
+        Mirrors :meth:`_effect_catalog`: a shared executor serves several sessions,
+        and each session's journal boundary belongs to its own agent. An
+        unregistered agent (a standalone call, or a session that has not wired
+        itself) falls back to the global hooks.
+        """
+        if agent is not None:
+            for owner, hooks in self._agent_hooks:
+                if owner is agent:
+                    return hooks
+        return _OwnedHooks(self._before_hook, self._after_hook, self._authorize_hook)
+
+    async def _run_hook(self, hook: Callable[..., Any] | None, *args: Any) -> None:
+        """Run a lifecycle hook, propagating any failure (durable-append seam)."""
+        if hook is None:
+            return
+        outcome = hook(*args)
+        if inspect.isawaitable(outcome):
+            await outcome
+
+    async def _run_verdict_hook(self, hook: Callable[..., Any] | None, *args: Any) -> str | None:
+        """Run an authorization hook and normalize its verdict (I5).
+
+        Returns the denial reason when the hook *returns* a refusal, or ``None``
+        to allow. A *raised* exception is never a verdict: it propagates unchanged
+        (a failed durable append or a refusal is fatal and must not be converted
+        into a tool result), while ``asyncio.CancelledError`` propagates too.
+        Accepted refusal shapes mirror the EventBus ``tool_call`` contract:
+        ``{"block": True, "reason": ...}`` or a non-empty reason string.
+        """
+        if hook is None:
+            return None
+        outcome = hook(*args)
+        if inspect.isawaitable(outcome):
+            outcome = await outcome
+        if outcome is None or outcome is False:
+            return None
+        if isinstance(outcome, str):
+            return outcome or None
+        if isinstance(outcome, dict) and outcome.get("block") is True:
+            return str(outcome.get("reason") or "blocked")
+        return None
+
+    @property
+    def offload_pool(self) -> BlockingIOPool:
+        """The blocking-I/O pool owned by this executor."""
+        return self._offload_pool
+
+    def _sync_catalog_revision(self) -> None:
+        """Rebuild cached metadata when the runtime reports a new catalog revision."""
+        if self._catalog_revision_getter is None:
+            return
+        try:
+            revision = self._catalog_revision_getter()
+        except Exception:  # noqa: BLE001 — a broken getter must not break dispatch
+            logger.warning("catalog_revision_getter_failed")
+            return
+        if revision != self._catalog_revision:
+            self._catalog_revision = revision
+            self._tool_metadata_revision += 1
 
     def set_mcp_dispatch_getter(self, getter: Callable[[], dict[str, Any]] | None) -> None:
         """Wire the MCP dispatch map getter (per-tool MCP UX, A2).
@@ -75,6 +346,115 @@ class ToolExecutor:
         ``None`` disables MCP per-tool dispatch (fall through to the registry).
         """
         self._mcp_dispatch_getter = getter
+
+    def set_effect_catalog_getter(self, getter: Callable[[], Any] | None) -> None:
+        """Wire the catalog getter used for effect-ordered batch scheduling.
+
+        Distinct from the dispatch catalog so a session can pin a per-turn
+        catalog for ordering without changing where calls are dispatched.
+
+        Two call shapes are supported, detected per call so a session can install
+        it once:
+
+        * ``Callable[[agent], catalog | None]`` — owner-aware (preferred). On a
+          shared runtime several sessions may overlap, so the catalog must be
+          resolved from the *invoking* agent, mirroring
+          ``agent_tool_name_registry_getter``.
+        * ``Callable[[], catalog | None]`` — legacy zero-argument getter.
+
+        A zero-arg callable that also accepts one positional argument is called
+        with the agent; one that accepts neither is called as today.
+        """
+        self._effect_catalog_getter = getter
+
+    def set_mcp_effect_resolver(self, getter: Callable[[], Any] | None) -> None:
+        """Wire the namespaced-MCP-effect resolver (I9).
+
+        ``getter() -> Mapping[str, EffectMetadata]`` maps a namespaced MCP tool
+        name (``server:tool``) to the effects its server declared (a
+        ``readOnlyHint`` annotation becomes a READ effect; otherwise EXECUTE
+        targeted at that server). Consulted only when no catalog entry classifies
+        the call, so a session-owned catalog stays the richer source of truth.
+        """
+        self._mcp_effect_resolver = getter
+
+    def set_lifecycle_observer(self, observer: Callable[[str, dict[str, Any]], None] | None) -> None:
+        """Wire the lifecycle observer (terminal disposition + cleanup facts)."""
+        self._lifecycle_observer = observer
+
+    # ------------------------------------------------------------------
+    # Lifecycle (parent session teardown)
+    # ------------------------------------------------------------------
+
+    def close(self, *, wait_for_offload: bool = False) -> None:
+        """Release executor-owned resources (sync; lifecycle cleanup API).
+
+        Performs, in order:
+        1. Releases admission bookkeeping — only when this executor owns its
+           controller; the shared process-wide default is never cleared, and no
+           in-flight work is ever cancelled.
+        2. Closes the blocking-I/O pool **owned by this executor** — only its own
+           worker threads. The process-wide default pool is untouched, so
+           concurrent sessions keep running and later sessions still work.
+        3. Emits a ``tool_executor_closed`` lifecycle observation.
+
+        Idempotent. Never reports an abandoned future as a confirmed cancellation:
+        a thread cannot be interrupted, so in-flight blocking work is *not*
+        rolled back — it is allowed to finish (``wait_for_offload=False`` drops
+        queued-but-unstarted work only).
+
+        Args:
+            wait_for_offload: When True, block until queued blocking work
+                finishes. Call from a non-loop thread (it joins worker threads).
+        """
+        if not self._begin_close():
+            return
+        self._offload_pool.shutdown(wait=wait_for_offload)
+        self._observe("tool_executor_closed", {"waited_for_offload": wait_for_offload})
+
+    async def aclose(self, *, wait_for_offload: bool = False) -> None:
+        """Async lifecycle cleanup (alias of :meth:`close`, loop-safe).
+
+        Exists so a host can call ``await executor.aclose()`` inside its own
+        ``aclose()``. When ``wait_for_offload=True`` the join of this executor's
+        worker threads runs on a separate thread (:meth:`BlockingIOPool.ashutdown`),
+        so awaiting the teardown does not stall the host's event loop for the
+        duration of in-flight blocking work. MCP transports and provider clients
+        are NOT owned here; the session releases those.
+        """
+        if not self._begin_close():
+            return
+        await self._offload_pool.ashutdown(wait=wait_for_offload)
+        self._observe("tool_executor_closed", {"waited_for_offload": wait_for_offload})
+
+    def _begin_close(self) -> bool:
+        """Claim the one-shot close; ``False`` when already closed.
+
+        Shared by the sync and async paths so their ownership rules cannot drift:
+        admission bookkeeping is released only when this executor owns its
+        controller - the shared process-wide default is never cleared, and no
+        in-flight work is ever cancelled.
+        """
+        if self._closed:
+            return False
+        self._closed = True
+        if self._owns_admission:
+            self._admission.close()
+        return True
+
+    @property
+    def closed(self) -> bool:
+        """Whether :meth:`close` has run."""
+        return self._closed
+
+    def _observe(self, event: str, payload: dict[str, Any]) -> None:
+        """Emit a lifecycle observation; a broken observer never breaks dispatch."""
+        if self._lifecycle_observer is None:
+            return
+        try:
+            self._lifecycle_observer(event, payload)
+        except Exception:  # noqa: BLE001
+            logger.warning("lifecycle_observer_failed", event=event)
 
     # ------------------------------------------------------------------
     # Public API — ToolExecutorProtocol
@@ -87,55 +467,407 @@ class ToolExecutor:
         tool_calls: list[dict[str, Any]],
         parallel: bool = False,
     ) -> list[dict[str, Any]]:
-        """Sync batch executor — sequential by default, parallel via ThreadPoolExecutor when parallel=True."""
+        """Sync batch executor — sequential by default, order-safe parallel when asked.
+
+        When ``parallel=True``, calls are grouped into conflict-ordered waves
+        (:mod:`dana.core.tool.effect_ordering`): calls that provably cannot interfere
+        run concurrently on a bounded thread pool, while conflicting calls keep the
+        model's relative order. ``parallel=False`` remains strictly sequential.
+        """
         if parallel:
             from concurrent.futures import ThreadPoolExecutor
 
+            self._sync_catalog_revision()
+            prepared = [self._prepare_single_call(agent, call) for call in tool_calls]
+            plan = plan_batch(
+                [item.call for item in prepared],
+                self._effect_catalog(agent),
+                metadata_resolver=self._effect_metadata_resolver_for(agent),
+            )
+            results: list[dict[str, Any] | None] = [None] * len(tool_calls)
             with ThreadPoolExecutor(max_workers=self._max_workers) as executor:
-                futures = [executor.submit(self._execute_single_call, agent, call) for call in tool_calls]
-                results = [f.result() for f in futures]
+                for wave in plan.waves:
+                    futures = [(i, executor.submit(self._execute_single_call, agent, tool_calls[i], _prepared=prepared[i])) for i in wave]
+                    for index, future in futures:
+                        results[index] = future.result()
         else:
-            results = []
-            for call in tool_calls:
-                results.append(self._execute_single_call(agent, call))
+            self._sync_catalog_revision()
+            results = [self._execute_single_call(agent, call) for call in tool_calls]
 
         for result, call in zip(results, tool_calls, strict=False):
+            if result is None:
+                continue
             if "tool_call_id" in call:
                 result["tool_call_id"] = call["tool_call_id"]
-        return results
+        return [r for r in results if r is not None]
 
     @observable
     async def execute_tools_async(self, agent: Any, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Async batch executor — runs all tool calls concurrently via asyncio.gather.
+        """Async batch executor — effect-ordered waves, bounded by admission.
 
-        return_exceptions=True so one call's failure cannot abort the batch:
-        every tool_call_id must get a result, or the next OpenAI turn 400s on
-        an unanswered tool call. _execute_single_call_async is already
-        non-raising; this is defense-in-depth for anything it misses.
+        Scheduling (P1 — "make tool concurrency real and bounded"):
+
+        1. Conflict-ordered waves. Calls are classified from catalog effect
+           metadata and packed into waves such that a call only overlaps calls it
+           provably cannot interfere with. The model's call order is preserved for
+           every conflicting pair (see :mod:`dana.core.tool.effect_ordering`).
+        2. Bounded admission. Each dispatch takes one permit from either the leaf
+           pool or the nested (sub-agent) pool, so total concurrency is bounded and
+           nested spawns cannot multiply resource usage.
+        3. An outcome for every id. Each call is individually guarded — one call's
+           failure, error or cancellation never releases, cancels, or skips a
+           sibling — so the next provider turn never sees an unanswered tool call.
         """
-        raw = await asyncio.gather(
-            *[self._execute_single_call_async(agent, call) for call in tool_calls],
-            return_exceptions=True,
+        if not tool_calls:
+            return []
+
+        self._sync_catalog_revision()
+        prepared = [await self._prepare_single_call_async(agent, call) for call in tool_calls]
+        plan = plan_batch(
+            [item.call for item in prepared],
+            self._effect_catalog(agent),
+            metadata_resolver=self._effect_metadata_resolver_for(agent),
         )
-        results: list[dict[str, Any]] = []
-        for result, call in zip(raw, tool_calls, strict=False):
-            if isinstance(result, BaseException):
-                result = create_tool_error(
-                    "execution_error",
-                    call.get("function", ""),
-                    f"Unhandled error executing call: {result}",
+        results: list[dict[str, Any]] = [None] * len(tool_calls)  # type: ignore[list-item]
+
+        # Only two kinds of exception can escape a call now: the session's own hook
+        # failures (durable-append / refusal) and cancellation. Neither may be
+        # converted into a tool result, so the first one is remembered and re-raised
+        # after every call in its wave has been accounted for.
+        fatal: BaseException | None = None
+        with use_blocking_io_pool(bound_blocking_io_pool() or self._offload_pool):
+            for wave in plan.waves:
+                wave_results = await asyncio.gather(
+                    *[self._execute_single_call_async(agent, tool_calls[i], _prepared=prepared[i]) for i in wave],
+                    return_exceptions=True,
                 )
-            if "tool_call_id" in call:
-                result["tool_call_id"] = call["tool_call_id"]
-            results.append(result)
+                for index, result in zip(wave, wave_results, strict=False):
+                    call = tool_calls[index]
+                    if isinstance(result, BaseException):
+                        if fatal is None:
+                            fatal = result
+                        if isinstance(result, asyncio.CancelledError):
+                            # Cancelled mid-dispatch: the call had begun, so its
+                            # effect is not confirmed. The truthful terminal marker
+                            # was already written by the ``after`` hook; this keeps
+                            # the returned shape truthful too.
+                            result = {
+                                "success": False,
+                                "type": "cancelled",
+                                "target": call.get("function", ""),
+                                "result": "Error: Cancelled during execution; effect not confirmed",
+                            }
+                            result["_effect_unknown"] = True
+                        else:
+                            # A hook failure: the session owns that call's terminal
+                            # fact (it may not be durable). Record nothing here.
+                            result = None
+                    if isinstance(result, dict) and "tool_call_id" in call:
+                        result["tool_call_id"] = call["tool_call_id"]
+                    results[index] = result
+                if fatal is not None:
+                    # Every call in this wave has been accounted for; the turn's
+                    # cancellation / journal failure is not swallowed. Calls in
+                    # waves not reached are reconciled by the session's pending-tool
+                    # fallback (requested -> cancelled, started -> effect-unknown).
+                    raise fatal
+
         return results
+
+    def _effect_catalog(self, agent: Any = None) -> Any | None:
+        """The catalog used for effect-ordered scheduling (may be None).
+
+        Owner-aware (I9): a getter that accepts the invoking agent wins, so two
+        overlapping sessions on a shared runtime never schedule from each other's
+        catalog. A zero-argument getter keeps its legacy meaning. The arity
+        decision is cached per getter object, not per call.
+        """
+        getter = self._effect_catalog_getter
+        if getter is None:
+            return self._tool_catalog
+        if self._getter_takes_agent():
+            return getter(agent)
+        return getter()
+
+    def _getter_takes_agent(self) -> bool:
+        """Whether the installed effect-catalog getter accepts the invoking agent."""
+        getter = self._effect_catalog_getter
+        cached_getter, cached_answer = self._effect_catalog_arity
+        if cached_getter is getter:
+            return cached_answer
+        takes_agent = False
+        try:
+            inspect.signature(getter).bind(_AGENT_ARG_SENTINEL)
+            takes_agent = True
+        except (TypeError, ValueError):
+            takes_agent = False
+        self._effect_catalog_arity = (getter, takes_agent)
+        return takes_agent
+
+    def _mcp_effect_metadata(self, function_name: str, agent: Any = None) -> EffectMetadata | None:
+        """Effects for a namespaced MCP tool, from the server's own declaration (I9).
+
+        Truth order: the server-declared resolver (a ``readOnlyHint`` annotation
+        becomes READ, so read-only MCP tools overlap) -> otherwise EXECUTE targeted
+        at that *server*, so two unannotated tools of one server stay ordered while
+        distinct servers remain independent. Never an arbitrary per-argument target
+        that would let unknown mutations of one server overlap.
+
+        The resolver is consulted with the *invoking* agent when it accepts one, so
+        overlapping sessions on a shared executor classify from their own wiring
+        rather than whichever session wired last. A resolver that returns nothing
+        for this agent (e.g. an unregistered owner) falls back to per-server
+        ordering, which is the conservative direction, never a false READ overlap.
+
+        Returns ``None`` when the name is not a currently wired MCP tool, so a
+        normal tool and a ``ClassName:method`` call are unaffected.
+        """
+        if not isinstance(function_name, str) or ":" not in function_name:
+            return None
+        if function_name not in self._mcp_tool_names():
+            return None
+        getter = self._mcp_effect_resolver
+        if getter is not None:
+            declared: Any = None
+            try:
+                declared = getter(agent) if self._mcp_resolver_takes_agent() else getter()
+            except Exception:  # noqa: BLE001 — classification must never break dispatch
+                logger.warning("mcp_effect_resolver_failed")
+            if declared:
+                found = declared.get(function_name)
+                if isinstance(found, EffectMetadata):
+                    return found
+        server = function_name.split(":", 1)[0]
+        if server:
+            return EffectMetadata(effects=(Effect(kind=EffectKind.EXECUTE, target=server),), is_sensitive=False)
+        return None
+
+    def _mcp_resolver_takes_agent(self) -> bool:
+        """Whether the installed MCP-effect resolver accepts the invoking agent.
+
+        Same arity detection as the effect-catalog getter (I9): an owner-aware
+        resolver wins, so a shared executor never classifies one session's call from
+        another session's wiring. Cached per getter object, not per call.
+        """
+        getter = self._mcp_effect_resolver
+        cached_getter, cached_answer = self._mcp_resolver_arity
+        if cached_getter is getter:
+            return cached_answer
+        try:
+            inspect.signature(getter).bind(_AGENT_ARG_SENTINEL)
+            takes_agent = True
+        except (TypeError, ValueError):
+            takes_agent = False
+        self._mcp_resolver_arity = (getter, takes_agent)
+        return takes_agent
+
+    def _effect_metadata_for(self, function_name: str, agent: Any = None) -> EffectMetadata:
+        """Effect metadata for a call: catalog entry, then MCP declaration, then native table.
+
+        The native fallback receives no MCP name set (I9): a wired MCP tool is
+        classified from its server's declaration before this point, so an
+        unclassified tool still falls through to the fail-cautious UNKNOWN and
+        stays serialized against everything.
+        """
+        catalog = self._effect_catalog(agent)
+        if catalog is not None:
+            entry = catalog.get(function_name)
+            if entry is not None:
+                return getattr(entry, "effects", None) or EffectMetadata.unknown()
+        mcp_metadata = self._mcp_effect_metadata(function_name, agent)
+        if mcp_metadata is not None:
+            return mcp_metadata
+        from dana.core.tool.native_catalog import native_effect_metadata
+
+        return native_effect_metadata(function_name)
+
+    def _offload_eligible(self, func: Any) -> bool:
+        """Whether ``func`` declared itself eligible for the offload pool (I7).
+
+        Explicit opt-in only (``@blocking_io``). Every other synchronous callable
+        runs on the calling thread: dispatch cannot know whether an arbitrary sync
+        method touches in-loop mutable state, and guessing wrong makes a worker
+        thread race the loop.
+
+        ``@loop_affine`` keeps its documented meaning ("dispatch keeps it on the
+        event loop") and is therefore an explicit *veto*, not an opt-in: a callable
+        marked both ways stays inline.
+        """
+        if is_loop_affine(func):
+            return False
+        return is_blocking_io(func)
+
+    async def _offload_tool_call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Run an eligible synchronous tool body off the loop under a drain claim (I8).
+
+        The claim is what lets a *cancelled* dispatch keep the admission permit
+        until the physical work really stopped, instead of returning while the tool
+        is still mutating state. On cancellation the executor asks the callable to
+        stop waiting cooperatively (``request_cancel``), then waits until its
+        physical claim settles before re-raising and unwinding the permit-holding
+        frame. A thread cannot be interrupted, so a non-cooperative callable can
+        delay cancellation acknowledgement for as long as its work takes.
+
+        ``*args``/``**kwargs`` mirror the callable's own signature: a catalog
+        adapter takes the arguments dict positionally, while a registry method takes
+        the already-validated keyword arguments.
+        """
+        claim = PhysicalWorkClaim()
+        try:
+            return await run_blocking(func, *args, _claim=claim, **kwargs)
+        except asyncio.CancelledError:
+            claim.request_cancel()
+            await drain_physical_work(claim, timeout=None)
+            raise
+
+    def _tag_admission(self, result: dict[str, Any], admission_kind: str) -> None:
+        """Record the admission pool a result was produced under (nested only).
+
+        Nested (sub-agent) work is tagged so the exclusive-handoff budget is
+        observable at the result boundary. Leaf results stay untagged to keep the
+        common payload byte-identical.
+        """
+        if admission_kind == AdmissionController.NESTED and isinstance(result, dict):
+            result["_admission"] = "nested"
+
+    @staticmethod
+    async def _invoke_mcp_dispatcher(dispatcher: Any, arguments: dict[str, Any], tool_call_id: Any) -> Any:
+        """Invoke an MCP dispatch callable, forwarding the harness tool_call_id.
+
+        The built dispatchers accept ``(arguments, tool_call_id)``. A pre-existing
+        single-argument dispatcher (an injected test double or a caller-registered
+        map) is still supported: it is called with ``arguments`` only, so the
+        harness id is simply not forwarded rather than raising TypeError.
+        """
+        signature = inspect.signature(dispatcher)
+        try:
+            signature.bind(arguments, tool_call_id)
+        except TypeError:
+            signature.bind(arguments)
+            return await dispatcher(arguments)
+        return await dispatcher(arguments, tool_call_id)
+
+    def _effect_metadata_resolver_for(self, agent: Any) -> Callable[[str], EffectMetadata]:
+        """A single-argument metadata resolver pinned to one invoking agent.
+
+        ``plan_batch``'s resolver contract takes only a tool name, so the agent is
+        captured here (once per batch) to keep the catalog lookup owner-aware on a
+        shared runtime.
+        """
+        return lambda name: self._effect_metadata_for(name, agent)
+
+    def _mcp_tool_names(self) -> frozenset[str]:
+        """Namespaced MCP tool names currently wired for dispatch (I9).
+
+        Read from the same dispatch map the async path dispatches through, so the
+        scheduling classification cannot drift from what actually executes. A
+        broken/absent getter yields no names (a caller-provided catalog stays the
+        richer source of truth).
+        """
+        getter = self._mcp_dispatch_getter
+        if getter is None:
+            return frozenset()
+        try:
+            dispatch = getter()
+        except Exception:  # noqa: BLE001 — classification must never break dispatch
+            logger.warning("mcp_dispatch_getter_failed")
+            return frozenset()
+        if not dispatch:
+            return frozenset()
+        return frozenset(name for name in dispatch if isinstance(name, str) and ":" in name)
+
+    def _admission_kind(self, agent: Any, function_name: str, arguments: dict[str, Any]) -> str:
+        """The admission pool for a call (C1).
+
+        A sub-agent dispatch (``agent_id__query``) is *nested* work even though it
+        is not the model-facing ``Task`` tool: the parent awaiting the child must
+        not hold a leaf slot the child's own tool calls need, or a parent/child
+        chain deadlocks at ``leaf_limit``. Every other call keeps the controller's
+        classification.
+        """
+        kind = self._admission.classify(function_name, arguments)
+        if kind == AdmissionController.NESTED:
+            return kind
+        return AdmissionController.NESTED if self._is_sub_agent_dispatch(agent, function_name) else kind
+
+    def _is_sub_agent_dispatch(self, agent: Any, function_name: str) -> bool:
+        """Whether ``function_name`` resolves to a sub-agent query (C1).
+
+        Cheap and side-effect free: the resolved dispatch registry is consulted
+        first (it already knows the bound object), and the name-parsing fallback is
+        only attempted for query-shaped names so a normal tool call never pays for
+        resolution. Any failure means "not proven nested" -> the controller's
+        original classification is kept.
+        """
+        if not isinstance(function_name, str):
+            return False
+        if "__query" != function_name[-7:] and ":query" != function_name[-6:] and ":aquery" != function_name[-7:]:
+            return False
+        try:
+            target = self._registry_for(agent).get(function_name)
+            if target is not None:
+                obj, method_name = target
+                if method_name not in {"query", "aquery"}:
+                    return False
+                # Named resource methods share this registry. A query-shaped
+                # alias alone does not prove that its target is a sub-agent.
+                if any(obj is sub_agent for sub_agent in getattr(agent, "available_agents", ())):
+                    return True
+                from dana.core.agent.base_agent import BaseAgent
+
+                return isinstance(obj, BaseAgent)
+            parsed = parse_function_name(function_name)
+            if not parsed:
+                return False
+            identifier, method_name = parsed
+            if method_name not in {"query", "aquery"}:
+                return False
+            info = find_object_by_id(agent, identifier) or find_object_by_class_name(agent, identifier)
+            return bool(info and info.get("type") == "agent")
+        except Exception:  # noqa: BLE001 — classification must never break dispatch
+            return False
+
+    @staticmethod
+    def _apply_interception(tool_call: dict[str, Any], operation: Operation, pre: dict[str, Any] | None) -> _PreparedCall:
+        arguments = dict(operation.arguments)
+        block_reason = None
+        if isinstance(pre, dict) and pre.get("block") is True:
+            block_reason = str(pre.get("reason", "blocked"))
+        elif isinstance(pre, dict) and isinstance(pre.get("modify"), dict):
+            new_arguments = pre["modify"].get("arguments")
+            if isinstance(new_arguments, dict):
+                arguments = dict(new_arguments)
+        effective_call = {**tool_call, "arguments": arguments}
+        operation = Operation(tool_identity=operation.tool_identity, arguments=arguments)
+        return _PreparedCall(effective_call, operation, block_reason)
+
+    def _preparation_error(self, tool_call: dict[str, Any], exc: Exception) -> _PreparedCall:
+        name = tool_call.get("function", "")
+        result = create_tool_error("execution_error", name, f"Error preparing call {name}: {exc}\n{traceback.format_exc()}")
+        return _PreparedCall({**tool_call, "arguments": {}}, error=result)
+
+    def _prepare_single_call(self, agent: Any, tool_call: dict[str, Any]) -> _PreparedCall:
+        try:
+            operation = build_operation(tool_call, self._registry_for(agent))
+            pre = self._emit_tool_call(agent, operation, tool_call.get("tool_call_id"))
+            return self._apply_interception(tool_call, operation, pre)
+        except Exception as exc:
+            return self._preparation_error(tool_call, exc)
+
+    async def _prepare_single_call_async(self, agent: Any, tool_call: dict[str, Any]) -> _PreparedCall:
+        try:
+            operation = build_operation(tool_call, self._registry_for(agent))
+        except Exception as exc:
+            return self._preparation_error(tool_call, exc)
+        pre = await self._emit_tool_call_async(agent, operation, tool_call.get("tool_call_id"))
+        return self._apply_interception(tool_call, operation, pre)
 
     # ------------------------------------------------------------------
     # Single-call dispatch (sync)
     # ------------------------------------------------------------------
 
     @observable
-    def _execute_single_call(self, agent: Any, tool_call: dict[str, Any]) -> dict[str, Any]:
+    def _execute_single_call(self, agent: Any, tool_call: dict[str, Any], *, _prepared: _PreparedCall | None = None) -> dict[str, Any]:
         """Dispatch one tool call synchronously, with EventBus interception (M3).
 
         Emits ``tool_call`` (before) and ``tool_result`` (after). A ``tool_call``
@@ -148,20 +880,15 @@ class ToolExecutor:
         outer guard. An escaping exception would abort the surrounding batch loop.
         """
         function_name = tool_call.get("function", "")
-        arguments = tool_call.get("arguments", {})
         try:
-            registry = self._get_registry()
-            operation = build_operation(tool_call, registry)
-            tool_call_id = tool_call.get("tool_call_id")
-
-            # --- tool_call event (before dispatch) ---
-            pre = self._emit_tool_call(agent, operation, tool_call_id)
-            if isinstance(pre, dict) and pre.get("block") is True:
-                return create_tool_error("policy_block", function_name, str(pre.get("reason", "blocked")))
-            if isinstance(pre, dict) and isinstance(pre.get("modify"), dict):
-                new_arguments = pre["modify"].get("arguments")
-                if isinstance(new_arguments, dict):
-                    arguments = new_arguments
+            prepared = _prepared if _prepared is not None else self._prepare_single_call(agent, tool_call)
+            if prepared.error is not None:
+                return prepared.error
+            arguments = prepared.call["arguments"]
+            operation = prepared.operation
+            tool_call_id = prepared.call.get("tool_call_id")
+            if prepared.block_reason is not None:
+                return create_tool_error("policy_block", function_name, prepared.block_reason)
 
             result = self._dispatch_single_call(agent, function_name, arguments)
 
@@ -193,17 +920,28 @@ class ToolExecutor:
         1. ToolCatalog (if wired) — primary path per ADR-004.
         2. @named_tool registry — legacy fast path.
         3. Standard name parsing fallback.
+
+        This is the legacy synchronous entry point: blocking work stays on the
+        caller's own thread by design (a synchronous caller has no loop to stall).
         """
         # --- ToolCatalog fast path (ADR-004) ---
         if self._tool_catalog is not None:
             entry = self._tool_catalog.get(function_name)
             if entry is not None:
+                if not callable(entry.adapter):
+                    # Classification-only entries are never executable (the native
+                    # catalog's adapter is a no-op that must not become a tool result).
+                    return create_tool_error(
+                        "catalog_entry_not_executable",
+                        function_name,
+                        f"Catalog entry '{function_name}' has no callable adapter; it is registered for classification only.",
+                    )
                 result = entry.adapter(arguments)
                 if isinstance(result, dict) and "success" in result:
                     return result
                 return create_tool_success("resource", function_name, result)
 
-        registry = self._get_registry()
+        registry = self._registry_for(agent)
 
         # --- @named_tool registry fast path ---
         if function_name in registry:
@@ -256,49 +994,194 @@ class ToolExecutor:
     # ------------------------------------------------------------------
 
     @observable
-    async def _execute_single_call_async(self, agent: Any, tool_call: dict[str, Any]) -> dict[str, Any]:
+    async def _execute_single_call_async(
+        self, agent: Any, tool_call: dict[str, Any], *, _prepared: _PreparedCall | None = None
+    ) -> dict[str, Any]:
         """Dispatch one tool call asynchronously, with EventBus interception (M3).
 
         Async counterpart of ``_execute_single_call``: same event flow, but uses
         ``await bus.emit`` (via the async emit helpers) so handlers run on the
-        same loop as dispatch. Never raises (bus S1 + outer guard).
+        same loop as dispatch.
+
+        The EventBus never raises (S1), so it cannot enforce durability. The
+        session's durable boundary is :meth:`set_execution_hooks`: ``before`` is
+        awaited after interception + admission and immediately before dispatch
+        (outside the never-raise dispatch guard), and ``after`` for every
+        terminal outcome including policy blocks. A hook failure propagates —
+        unlike the best-effort observer.
         """
-        function_name = tool_call.get("function", "")
-        arguments = tool_call.get("arguments", {})
-        try:
-            registry = self._get_registry()
-            operation = build_operation(tool_call, registry)
-            tool_call_id = tool_call.get("tool_call_id")
+        prepared = _prepared if _prepared is not None else await self._prepare_single_call_async(agent, tool_call)
+        if prepared.error is not None:
+            return prepared.error
+        effective_call = prepared.call
+        function_name = effective_call.get("function", "")
+        arguments = effective_call["arguments"]
+        tool_call_id = effective_call.get("tool_call_id")
+        operation = prepared.operation
+        block_reason = prepared.block_reason
 
-            # --- tool_call event (before dispatch) ---
-            pre = await self._emit_tool_call_async(agent, operation, tool_call_id)
-            if isinstance(pre, dict) and pre.get("block") is True:
-                return create_tool_error("policy_block", function_name, str(pre.get("reason", "blocked")))
-            if isinstance(pre, dict) and isinstance(pre.get("modify"), dict):
-                new_arguments = pre["modify"].get("arguments")
-                if isinstance(new_arguments, dict):
-                    arguments = new_arguments
+        # Resolve this call's owner-scoped hooks ONCE (see ``_hooks_for``): the
+        # invoking agent's trio when its session registered one, else the global
+        # legacy trio. A concurrent session installing its own hooks therefore
+        # cannot swap this call's journal boundary mid-flight.
+        hooks = self._hooks_for(agent)
 
-            result = await self._dispatch_single_call_async(agent, function_name, arguments)
+        # I6: authorization is resolved BEFORE any admission permit is taken, so an
+        # interactive permission prompt cannot hold a leaf/nested slot while a human
+        # decides (a queue of prompts must not starve the budget). It is consulted
+        # for every call, blocked or not; the EventBus interception verdict is passed
+        # in, so a call that a handler already refused is not re-litigated.
+        authorize_reason = block_reason
+        if hooks.authorize is not None:
+            try:
+                verdict = await self._run_verdict_hook(hooks.authorize, effective_call, block_reason)
+            except asyncio.CancelledError:
+                # The turn was cancelled while the decision was pending. Nothing was
+                # dispatched, so the truthful disposition is "no effect" — but the
+                # caller (and the journal) still gets a terminal fact through
+                # ``after`` rather than a cancellation with no recorded outcome.
+                result = {
+                    "success": False,
+                    "type": "cancelled",
+                    "target": function_name,
+                    "result": "Error: Cancelled before execution; the tool had no effect",
+                }
+                result["_cancelled"] = True
+                await self._run_hook(hooks.after, effective_call, result)
+                raise
+            if verdict is not None:
+                authorize_reason = verdict
 
-            # --- tool_result event (after dispatch) ---
-            post = await self._emit_tool_result_async(agent, operation, tool_call_id, result)
-            if isinstance(post, dict) and isinstance(post.get("modify"), dict):
-                result = post["modify"]
-            elif isinstance(post, dict) and "modify" in post:
-                logger.warning(
-                    "tool_result handler returned non-dict modify (tool=%s); ignored",
-                    function_name,
-                )
+        if authorize_reason is not None:
+            # I5: a *returned* refusal is recoverable — the call is not dispatched,
+            # no permit is taken and no "started" fact is truthfully recordable, and
+            # the model receives a policy_block tool result it can adapt to instead
+            # of losing the turn. A *raised* failure from either hook stays fatal
+            # (durable-write seam) and propagates below without a terminal fact.
+            result = create_tool_error("policy_block", function_name, authorize_reason)
+            await self._run_hook(hooks.before, effective_call, authorize_reason)
+            await self._run_hook(hooks.after, effective_call, result)
             return result
+
+        # Outcome accounting for every terminal path. ``propagate`` re-raises the
+        # original exception AFTER the terminal fact is durable, so a cancellation
+        # is neither swallowed nor reported without a truthful terminal marker.
+        result: dict[str, Any] | None = None
+        propagate: BaseException | None = None
+
+        def _cancel_marker(effect_unknown: bool) -> dict[str, Any]:
+            """Truthful terminal shape for an interrupted call."""
+            marker = {
+                "success": False,
+                "type": "cancelled",
+                "target": function_name,
+                "result": (
+                    "Error: Cancelled during execution; effect not confirmed"
+                    if effect_unknown
+                    else "Error: Cancelled before execution; the tool had no effect"
+                ),
+            }
+            marker["_effect_unknown" if effect_unknown else "_cancelled"] = True
+            return marker
+
+        kind = self._admission_kind(agent, function_name, arguments)
+        try:
+            permit = await self._admission.acquire_kind(kind)
+        except asyncio.CancelledError as exc:
+            # Cancelled while queued for a permit: never dispatched, so it had no
+            # effect. The truthful marker is the acknowledged/no-effect form.
+            result = _cancel_marker(effect_unknown=False)
+            propagate = exc
         except Exception as exc:
-            return create_tool_error(
+            result = create_tool_error(
                 "execution_error",
                 function_name,
-                f"Error executing call {function_name}: {exc}\n{traceback.format_exc()}",
+                f"Error awaiting admission for {function_name}: {exc}\n{traceback.format_exc()}",
+            )
+        else:
+            try:
+                # "Before" runs AFTER the permit is acquired, immediately before
+                # dispatch, so the session's TOOL_STARTED fact is truthful (the call
+                # is admitted and executing) rather than only queued. It sits
+                # OUTSIDE the dispatch error guard: a failed durable append must
+                # propagate rather than become a tool result.
+                #
+                # It is also the single decision point for queue cancellation: the
+                # session re-checks its cancel event after appending TOOL_STARTED and
+                # raises ``CancelledError`` (having journaled the acknowledgement)
+                # when the turn was cancelled during the durable commit. The executor
+                # therefore never short-circuits the hook, which would lose that
+                # call's requested/authorized facts.
+                #
+                # A *returned* refusal (I5) is recoverable, exactly like
+                # ``authorize``: the call is not dispatched and the model gets a
+                # policy_block result. ``CancelledError`` still propagates (handled
+                # below) and any other raised failure still propagates unswallowed.
+                before_reason = await self._run_verdict_hook(hooks.before, effective_call, None)
+            except asyncio.CancelledError as exc:
+                # Queue cancellation decided by the session's own hook (e.g. the
+                # turn was cancelled after this call was admitted but before it
+                # ran): no dispatch, no effect. The terminal marker is still written
+                # through ``after`` so no caller sees a cancellation without a fact.
+                result = _cancel_marker(effect_unknown=False)
+                propagate = exc
+            except Exception:
+                # The session's before-hook failed (failed durable append). The hook
+                # is the session's authoritative journal boundary and owns the
+                # terminal fact in that case, so the executor records nothing further
+                # and propagates the failure unchanged — a durable append that failed
+                # must never be swallowed.
+                raise
+            else:
+                if before_reason is not None:
+                    result = create_tool_error("policy_block", function_name, before_reason)
+                elif propagate is None:
+                    try:
+                        result = await self._dispatch_single_call_async(
+                            agent, function_name, arguments, tool_call_id=tool_call_id, admission_kind=kind
+                        )
+                    except asyncio.CancelledError as exc:
+                        # Cancelled *during* dispatch. The tool may already have
+                        # committed part of its effect and no acknowledgement was
+                        # observed, so the truthful disposition is effect-unknown (never
+                        # auto-retry, ADR-011) — not a fabricated "cancelled".
+                        result = _cancel_marker(effect_unknown=True)
+                        propagate = exc
+                    except Exception as exc:
+                        result = create_tool_error(
+                            "execution_error",
+                            function_name,
+                            f"Error executing call {function_name}: {exc}\n{traceback.format_exc()}",
+                        )
+            finally:
+                permit.release()
+
+        # --- tool_result event (after dispatch) ---
+        post = await self._emit_tool_result_async(agent, operation, tool_call_id, result)
+        if isinstance(post, dict) and isinstance(post.get("modify"), dict):
+            result = post["modify"]
+        elif isinstance(post, dict) and "modify" in post:
+            logger.warning(
+                "tool_result handler returned non-dict modify (tool=%s); ignored",
+                function_name,
             )
 
-    async def _dispatch_single_call_async(self, agent: Any, function_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        # Terminal fact is durable before the executor returns (and before the
+        # original cancellation is re-raised), so the journal terminal precedes the
+        # turn's terminal.
+        await self._run_hook(hooks.after, effective_call, result)
+        if propagate is not None:
+            raise propagate
+        return result
+
+    async def _dispatch_single_call_async(
+        self,
+        agent: Any,
+        function_name: str,
+        arguments: dict[str, Any],
+        tool_call_id: Any = None,
+        admission_kind: str = "leaf",
+    ) -> dict[str, Any]:
         """Pure dispatch of one resolved tool call (async). Never emits.
 
         Dispatch logic is intentionally NOT merged with the sync variant (only
@@ -309,6 +1192,14 @@ class ToolExecutor:
         1. ToolCatalog (if wired) — primary path per ADR-004.
         2. @named_tool registry — legacy fast path.
         3. Standard name parsing fallback.
+
+        Args:
+            tool_call_id: The harness tool_call_id, forwarded to MCP dispatch so
+                the real id (not a generated stand-in) reaches per-call tracking
+                and the transport request-id record.
+            admission_kind: The pool holding this call's permit (``"leaf"`` or
+                ``"nested"``); the nested value tags the result so nested work is
+                observable without inspecting the scheduler.
         """
         # --- MCP per-tool dispatch (D7 follow-up 1+2, A2) ---
         # Namespaced MCP tool names (server:tool) do not collide with native
@@ -316,19 +1207,48 @@ class ToolExecutor:
         if self._mcp_dispatch_getter is not None:
             mcp_map = self._mcp_dispatch_getter()
             if mcp_map and function_name in mcp_map:
-                formatted = await mcp_map[function_name](arguments)
-                return create_tool_success("mcp", function_name, formatted)
+                dispatcher = mcp_map[function_name]
+                dispatched = await self._invoke_mcp_dispatcher(dispatcher, arguments, tool_call_id)
+                result = (
+                    dispatched
+                    if isinstance(dispatched, dict) and "success" in dispatched
+                    else create_tool_success("mcp", function_name, dispatched)
+                )
+                self._tag_admission(result, admission_kind)
+                return result
 
         # --- ToolCatalog fast path (ADR-004) ---
         if self._tool_catalog is not None:
             entry = self._tool_catalog.get(function_name)
             if entry is not None:
-                result = entry.adapter(arguments)
+                if not callable(entry.adapter):
+                    # Classification-only entries (native catalog, and MCP entries
+                    # whose adapter the session has not wired) are NOT executable.
+                    # Refuse explicitly instead of dispatching a no-op.
+                    return create_tool_error(
+                        "catalog_entry_not_executable",
+                        function_name,
+                        f"Catalog entry '{function_name}' has no callable adapter; it is registered for classification only.",
+                    )
+                if asyncio.iscoroutinefunction(entry.adapter):
+                    result = await entry.adapter(arguments)
+                elif not self._offload_eligible(entry.adapter):
+                    # Unmarked synchronous adapter: keep it on the calling thread.
+                    # Moving an arbitrary sync callable to a worker thread races any
+                    # in-loop mutable state it touches, so only callables that opted
+                    # in with ``@blocking_io`` may be offloaded (I7).
+                    result = entry.adapter(arguments)
+                else:
+                    # Explicitly eligible blocking adapter: keep it off the loop.
+                    result = await self._offload_tool_call(entry.adapter, arguments)
                 if isinstance(result, dict) and "success" in result:
-                    return result
-                return create_tool_success("resource", function_name, result)
+                    final = result
+                else:
+                    final = create_tool_success("resource", function_name, result)
+                self._tag_admission(final, admission_kind)
+                return final
 
-        registry = self._get_registry()
+        registry = self._registry_for(agent)
 
         # --- @named_tool registry fast path ---
         if function_name in registry:
@@ -337,9 +1257,19 @@ class ToolExecutor:
             arguments = validate_and_cast_method_arguments(method, arguments)
             if asyncio.iscoroutinefunction(method):
                 result = await method(**arguments)
+            elif self._offload_eligible(method):
+                # Explicitly eligible (``@blocking_io``): run it on the bounded
+                # offload pool so it cannot stall the event loop. The registry's
+                # synchronous API keeps working unchanged.
+                result = await self._offload_tool_call(method, **arguments)
             else:
+                # Unmarked synchronous method: keep it inline. An arbitrary sync
+                # method may touch loop-owned mutable state, and a worker thread
+                # would race it (I7).
                 result = method(**arguments)
-            return create_tool_success("resource", function_name, result)
+            final = create_tool_success("resource", function_name, result)
+            self._tag_admission(final, admission_kind)
+            return final
 
         # --- Standard name parsing fallback ---
         parsed = parse_function_name(function_name)
@@ -370,9 +1300,15 @@ class ToolExecutor:
                 arguments = self._inject_session_id(agent, arguments)
             if asyncio.iscoroutinefunction(method):
                 result = await method(**arguments)
+            elif self._offload_eligible(method):
+                result = await self._offload_tool_call(method, **arguments)
             else:
+                # Unmarked synchronous method on a resolved object: keep it inline
+                # (I7 — only explicit ``@blocking_io`` work is moved to a thread).
                 result = method(**arguments)
-            return create_tool_success(obj_info["type"], f"{identifier}.{actual_method_name}", result)
+            final = create_tool_success(obj_info["type"], f"{identifier}.{actual_method_name}", result)
+            self._tag_admission(final, admission_kind)
+            return final
 
         return create_tool_error(
             "method_not_found",
@@ -384,8 +1320,16 @@ class ToolExecutor:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _get_registry(self) -> dict[str, tuple[Any, str]]:
-        """Return the @named_tool registry, or empty dict if not wired."""
+    def _registry_for(self, agent: Any) -> dict[str, tuple[Any, str]]:
+        """Return the @named_tool registry valid for the *invoking* ``agent``.
+
+        Never reads executor- or runtime-wide "current agent" state: on a shared
+        runtime an overlapping invocation for another agent may have replaced it
+        at any await. The agent travels with the call, so it is the only correct
+        selector.
+        """
+        if self._agent_tool_name_registry_getter is not None:
+            return self._agent_tool_name_registry_getter(agent)
         if self._tool_name_registry_getter is not None:
             return self._tool_name_registry_getter()
         return {}

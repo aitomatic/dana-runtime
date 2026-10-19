@@ -189,23 +189,19 @@ class DanaCodeApp:
         the in-memory permission grant db (D7.3) so it does not leak a worker
         thread on exit.
         """
-        if self._repo is not None:
-            with contextlib.suppress(Exception):
-                await self._repo.close()
-            self._repo = None
-        if self._grant_db is not None:
-            with contextlib.suppress(Exception):
-                await self._grant_db.close()
-            self._grant_db = None
-        # D7.5 (AC #4): release MCP transports/leases so configured stdio servers
-        # do not leak subprocesses on REPL exit.
-        if self.agent_session is not None:
-            with contextlib.suppress(Exception):
-                await self.agent_session.dispose_mcp()
-            # D7.6: detach the TOOL_CALL permission hook so it does not outlive
-            # the session (best-effort).
-            with contextlib.suppress(Exception):
-                self.agent_session._unregister_policy_hook()
+        # Operations may still need journal/grant storage during their cleanup.
+        try:
+            if self.agent_session is not None:
+                await self.agent_session.aclose()
+        finally:
+            if self._repo is not None:
+                with contextlib.suppress(Exception):
+                    await self._repo.close()
+                self._repo = None
+            if self._grant_db is not None:
+                with contextlib.suppress(Exception):
+                    await self._grant_db.close()
+                self._grant_db = None
 
     async def _initialize_session(self) -> None:
         """Construct an AgentSession backed by the Session Journal.
@@ -437,14 +433,12 @@ class DanaCodeApp:
         except SessionBusy:
             print("\n⏳ A turn is already in progress. Please wait for it to finish.\n")
         except (KeyboardInterrupt, asyncio.CancelledError):
-            # Ctrl-C mid-turn → cooperative cancel (ADR-005). prompt() catches
-            # the cancellation internally and terminalizes the turn as
-            # TURN_CANCELLED — a truthful terminal fact rendered by D7.2. If the
-            # cancellation propagated here, set the cancel event and drain any
-            # remaining events so the terminal is rendered, then RESUME the
-            # REPL (absorb the cancel — do not re-raise / exit). Closing the
-            # generator ensures its ``async with`` lock releases so the next
-            # turn is never stuck-busy.
+            # Caller cancellation propagates after AgentSession's owned cleanup
+            # and durable TURN_CANCELLED write. This interactive host translates
+            # it to an interruption and resumes the REPL instead of exiting.
+            # Explicit session.cancel() remains a normal terminal event stream.
+            # Close the generator so prompt ownership cannot leak into the
+            # next user turn.
             with contextlib.suppress(RuntimeError, Exception):
                 await self.agent_session.cancel()
             with contextlib.suppress(Exception):
@@ -453,6 +447,8 @@ class DanaCodeApp:
             with contextlib.suppress(Exception):
                 await gen.aclose()
             print("\n⏹ Turn interrupted.\n")
+        finally:
+            await gen.aclose()
 
     # ------------------------------------------------------------------
     # Legacy path (DANA_CODE_AGENTSESSION_ENABLED=0)

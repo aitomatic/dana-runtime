@@ -136,6 +136,7 @@ class DanaACPAgent:
         self._agent_factory = agent_factory or _default_agent_factory
         self._owner_id = owner_id or os.environ.get("USER", "local")
         self._sessions: dict[str, AgentSession] = {}
+        self._grant_dbs: dict[str, aiosqlite.Connection] = {}
         self._repository: JournalRepository | None = None
         self._conn: Any = None
         # Feature flag: DANA_SESSION_JOURNAL_AUTHORITY=0 selects legacy
@@ -166,6 +167,65 @@ class DanaACPAgent:
             os.makedirs(os.path.dirname(self._journal_path) or ".", exist_ok=True)
             self._repository = await SQLiteJournalRepository.open(self._journal_path)
         return self._repository
+
+    async def aclose(self) -> None:
+        """Close session operations before their permission and journal stores.
+
+        Both registries are snapshotted before the first ``await``: closing a
+        session can re-enter this agent (session teardown releases MCP leases
+        and the journal), and iterating a live dict across an await would raise
+        ``RuntimeError: dictionary changed size during iteration``.
+        """
+        first_error: Exception | None = None
+        sessions = list(self._sessions.values())
+        connections = list(self._grant_dbs.values())
+        for session in sessions:
+            try:
+                await session.aclose()
+            except Exception as exc:
+                first_error = first_error or exc
+        self._sessions.clear()
+        for connection in connections:
+            try:
+                await connection.close()
+            except Exception as exc:
+                first_error = first_error or exc
+        self._grant_dbs.clear()
+        if self._repository is not None:
+            try:
+                await self._repository.close()
+            except Exception as exc:
+                first_error = first_error or exc
+            self._repository = None
+        if first_error is not None:
+            raise first_error
+
+    async def _configure_session_policy(self, session: AgentSession) -> aiosqlite.Connection | None:
+        """Wire the durable-grant evaluator for ``session``.
+
+        Returns the new per-session grant connection (``None`` when the
+        feature flag is off) WITHOUT registering it: ownership transfers to
+        the caller only after this call returns. A failure here closes the
+        half-built store and propagates, so a caller replacing an already
+        published session keeps the previous session and store intact.
+        """
+        if not self._policy_grants_enabled:
+            return None
+        from dana.core.policy.store_schema import POLICY_SQLITE_DDL
+        from dana.core.policy.store_sqlite import SQLiteGrantStore
+
+        grant_db = await aiosqlite.connect(":memory:")
+        try:
+            grant_db.row_factory = aiosqlite.Row
+            for statement in POLICY_SQLITE_DDL:
+                await grant_db.execute(statement)
+            await grant_db.commit()
+            evaluator = PolicyEvaluator(create_default_hard_policy(), SQLiteGrantStore(grant_db), session.permission_mode)
+            session.set_policy_evaluator(evaluator)
+        except BaseException:
+            await grant_db.close()
+            raise
+        return grant_db
 
     @property
     def journal_authority_enabled(self) -> bool:
@@ -272,21 +332,13 @@ class DanaACPAgent:
         )
         # Set the current version to match the journal (SESSION_CREATED fact)
         session._current_version = init_facts[0].sequence
-        # Wire policy evaluator for permission adapter (D3)
-        if self._policy_grants_enabled:
-            from dana.core.policy.store_schema import POLICY_SQLITE_DDL
-            from dana.core.policy.store_sqlite import SQLiteGrantStore
-
-            grant_db = await aiosqlite.connect(":memory:")
-            grant_db.row_factory = aiosqlite.Row
-            for stmt in POLICY_SQLITE_DDL:
-                await grant_db.execute(stmt)
-            await grant_db.commit()
-            grant_store = SQLiteGrantStore(grant_db)
-            hard_policy = create_default_hard_policy()
-            evaluator = PolicyEvaluator(hard_policy, grant_store, PermissionMode.DEFAULT)
-            session.set_policy_evaluator(evaluator)
+        grant_db = await self._configure_session_policy(session)
+        # Publish the session and its grant store without an intervening await:
+        # teardown snapshots both registries, so they must not be observed with
+        # a session registered and its store still unowned.
         self._sessions[session_id] = session
+        if grant_db is not None:
+            self._grant_dbs[session_id] = grant_db
         logger.info("session created", session_id=session_id, cwd=cwd)
 
         # D4: Build model state from catalog (rollback: None when disabled)
@@ -516,7 +568,38 @@ class DanaACPAgent:
             agent_factory=self._agent_factory,
         )
         await session.load()
+        try:
+            new_grants = await self._configure_session_policy(session)
+        except BaseException:
+            # Policy configuration failed: the replacement never takes
+            # ownership. Release its half-loaded resources and re-raise the
+            # original failure; leave the previously published session and
+            # grant store intact, so a failed load cannot strand a closed
+            # session in the registry.
+            try:
+                await session.aclose()
+            except Exception:
+                logger.warning("failed to close unconfigured session", session_id=session_id, exc_info=True)
+            raise
+
+        # Publish the replacement and its grant store with no await in between,
+        # then release the superseded pair best-effort: a close failure must not
+        # undo a load whose facts the journal has already accepted.
+        previous = self._sessions.get(session_id)
+        old_grants = self._grant_dbs.pop(session_id, None)
         self._sessions[session_id] = session
+        if new_grants is not None:
+            self._grant_dbs[session_id] = new_grants
+        if previous is not None:
+            try:
+                await previous.aclose()
+            except Exception:
+                logger.warning("failed to close superseded session", session_id=session_id, exc_info=True)
+        if old_grants is not None:
+            try:
+                await old_grants.close()
+            except Exception:
+                logger.warning("failed to close superseded grant store", session_id=session_id, exc_info=True)
 
         # Replay host events as session_update notifications BEFORE returning.
         async for event in session.replay_host_events(0):
@@ -599,11 +682,14 @@ class DanaACPAgent:
         text_blocks, content_blocks_payload = normalized_blocks_to_text_blocks(normalized_blocks)
         stop_reason = "end_turn"
 
+        from contextlib import aclosing
+
         try:
-            async for event in session.prompt(text_blocks, content_blocks=content_blocks_payload):
-                update = host_event_to_acp_update(event)
-                if update is not None:
-                    await self._notify(session_id, update)
+            async with aclosing(session.prompt(text_blocks, content_blocks=content_blocks_payload)) as events:
+                async for event in events:
+                    update = host_event_to_acp_update(event)
+                    if update is not None:
+                        await self._notify(session_id, update)
         except SessionBusy:
             stop_reason = "max_turn_requests"
             return PromptResponse(stop_reason=stop_reason)
@@ -614,7 +700,10 @@ class DanaACPAgent:
                 stop_reason = "cancelled"
             elif terminal.fact_type is FactType.TURN_ERROR:
                 # ACP has no "error" stop_reason; end_turn signals the turn ended.
-                # The error details are visible in host events (TURN_ERROR update).
+                # The failure is already visible to the client as the single
+                # TURN_ERROR -> agent_message_chunk transcript notification
+                # (translation.host_event_to_acp_update), so the prompt completes
+                # successfully instead of failing the JSON-RPC request twice.
                 stop_reason = "end_turn"
 
         return PromptResponse(stop_reason=stop_reason)

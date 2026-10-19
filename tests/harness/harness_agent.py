@@ -8,13 +8,12 @@ By default uses the codec system (CSXMLCodec) for reliable tool parsing.
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
-from typing import Any
+import time
 
 from dana.common.protocols import DictParams
-from dana.core.agent.star_agent import STARAgent
 from dana.core.agent.base_star_agent import EXIT_STAR_LOOP_FLAG
+from dana.core.agent.star_agent import STARAgent
 from dana.core.knowledge.prompts.codecs import CSXMLCodec
 
 from .fault_injection import FaultInjector

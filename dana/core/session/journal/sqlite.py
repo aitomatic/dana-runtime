@@ -8,6 +8,13 @@ single ``BEGIN IMMEDIATE`` transaction, so two concurrent writers cannot
 interleave: the second to acquire the write lock observes the new version and
 raises :class:`~dana.core.session.journal.models.JournalConflict`.
 
+Every write runs as one cancellation-safe unit
+(:meth:`SQLiteJournalRepository._write_unit`). The unit owns the connection
+until it has either committed or been unwound and rolled back, so a caller that
+is cancelled (``asyncio.timeout``/``TaskGroup``) can never hand the shared
+connection back sitting inside an open transaction, and the caller always
+observes its own cancellation rather than a database error.
+
 OwnerScope maps to the ``(owner_id, workspace)`` composite column pair; a
 session_id is only ever resolved within that pair, giving owner isolation for
 free at the index level.
@@ -15,12 +22,15 @@ free at the index level.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 import json
+from typing import TypeVar
 import uuid
 
 import aiosqlite
+import structlog
 
 from dana.core.session.journal.models import (
     AppendResult,
@@ -95,11 +105,25 @@ def _deserialize_artifact_refs(value: str | None) -> tuple[ArtifactRef, ...]:
     return tuple(ArtifactRef(uri=r["uri"], media_type=r["media_type"], size=r["size"], sha256=r["sha256"]) for r in raw)
 
 
+_T = TypeVar("_T")
+
+logger = structlog.get_logger(__name__)
+
+
 class SQLiteJournalRepository:
     """JournalRepository backed by an on-disk SQLite database (aiosqlite)."""
 
     def __init__(self, db: aiosqlite.Connection) -> None:
         self._db = db
+        # I3: aiosqlite serializes individual statements, not transactional
+        # *units*. Two sessions sharing one connection would otherwise be able to
+        # interleave a BEGIN..ROLLBACK with another writer's statements, exposing
+        # uncommitted rows to a reader or losing part of a batch. Every statement
+        # this repository issues goes through this lock, so one transaction - and
+        # its rollback - is atomic with respect to every other operation on the
+        # same connection. Distinct connections (and external writers) are
+        # unaffected: SQLite's own file locking governs those.
+        self._lock = asyncio.Lock()
 
     @classmethod
     async def open(cls, path: str) -> SQLiteJournalRepository:
@@ -213,6 +237,11 @@ class SQLiteJournalRepository:
             )
 
     async def _require_session_row(self, scope: OwnerScope, session_id: str) -> aiosqlite.Row:
+        """Row lookup for callers that already hold the connection ownership.
+
+        Safe to call from inside a write unit (:meth:`_write_unit`) or from a
+        method that holds ``self._lock``; it never acquires the lock itself.
+        """
         row = await _fetchone(
             self._db,
             "SELECT * FROM session_journals WHERE owner_id=? AND workspace=? AND session_id=?",
@@ -221,6 +250,139 @@ class SQLiteJournalRepository:
         if row is None:
             raise SessionNotFound(scope, session_id)
         return row
+
+    # ------------------------------------------------------------------
+    # Internal: cancellation-safe write units
+    # ------------------------------------------------------------------
+
+    async def _write_unit(self, work: Callable[[], Awaitable[_T]]) -> _T:
+        """Run ``work`` as one complete, cancellation-safe transaction unit.
+
+        ``work`` is invoked with ``self._lock`` held and after the ``BEGIN
+        IMMEDIATE`` has physically executed; it must therefore not touch
+        ``self._lock`` itself (use the lock-free ``_require_session_row`` /
+        ``_fetchone`` helpers). It returns before ``COMMIT``.
+
+        The lock is acquired here, in the *outer* frame, and is held for the
+        entire lifetime of the unit plus its cleanup - including the rollback
+        that :meth:`_abandon` has to perform after a cancellation. That is what
+        makes the ownership airtight: a competing reader or writer that was
+        already queued on the lock can never slip into the gap between "the
+        unit unwound" and "the connection was put back outside a transaction",
+        so it can never observe an uncommitted row or trip a nested
+        ``BEGIN IMMEDIATE``.
+
+        The unit runs in its own task, so cancelling the *caller*
+        (``asyncio.timeout`` / ``TaskGroup`` / teardown) cannot abandon the
+        transaction half-done: the unit either commits, or - if the caller was
+        cancelled - is unwound and the connection restored before the caller's
+        cancellation is re-raised and the lock released. The connection is
+        therefore never handed back inside an open transaction, no matter where
+        the cancellation lands.
+        """
+        async with self._lock:
+            unit = asyncio.create_task(self._run_unit(work))
+            try:
+                return await asyncio.shield(unit)
+            except asyncio.CancelledError:
+                # Still holding the lock: _restore must not (and does not)
+                # reacquire it, it just waits for the unit to unwind and then
+                # restores the connection in place.
+                await self._abandon(unit)
+                raise
+
+    async def _run_unit(self, work: Callable[[], Awaitable[_T]]) -> _T:
+        """Execute one ``BEGIN IMMEDIATE`` .. ``COMMIT`` unit.
+
+        Caller contract: ``self._lock`` is already held by :meth:`_write_unit`
+        and is not released here, so this coroutine never touches the lock.
+        """
+        # Deliberately NOT inside a try: if this BEGIN fails (``database is
+        # locked``) the unit opened no transaction of its own, and a ROLLBACK
+        # here would mask that error ("cannot rollback - no transaction is
+        # active") and could silently undo a transaction a previous, abandoned
+        # unit left behind. Cancellation during the BEGIN is resolved by
+        # _abandon once the statement queue has drained.
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            result = await work()
+            await self._db.commit()
+        except BaseException as exc:
+            # Cancellation is unwound by _abandon instead: a statement the body
+            # queued may still be waiting on the worker thread (a BEGIN that has
+            # not executed yet is invisible to ``in_transaction``), so the
+            # rollback has to happen after the queue is flushed.
+            if not isinstance(exc, asyncio.CancelledError) and self._db.in_transaction:
+                await self._db.execute("ROLLBACK")
+            raise
+        return result
+
+    async def _abandon(self, unit: asyncio.Task[_T]) -> None:
+        """Unwind a write unit whose caller was cancelled, then restore the connection.
+
+        Called with ``self._lock`` held by :meth:`_write_unit`, which keeps
+        holding it until this returns: the lock therefore spans the unwind, the
+        queue barrier and the conditional rollback as one indivisible region.
+
+        Runs off the cancelled caller's stack (hence in its own task) so that
+        repeated cancellation of the caller cannot interrupt the restoration
+        half-way. Returns only once the connection is out of any transaction.
+        """
+        await self._settle(asyncio.create_task(self._restore(unit)))
+
+    async def _restore(self, unit: asyncio.Task[_T]) -> None:
+        """Cancel ``unit``, wait for it to unwind, and roll back what it left open.
+
+        ``self._lock`` is held by the caller for the whole call, so this method
+        deliberately never acquires it - acquiring it here would open exactly
+        the window (unit released, restoration not yet run) that this repair
+        exists to close.
+        """
+        unit.cancel()
+        try:
+            await unit
+        except BaseException:
+            # The unit's own outcome is irrelevant here: the caller was cancelled
+            # and will observe that, not the abandoned unit's error.
+            pass
+        try:
+            # FIFO barrier: every statement queued before the cancellation has
+            # now executed, so ``in_transaction`` finally reflects the truth
+            # (a BEGIN that was still queued when the unit unwound is only
+            # visible after this point).
+            await self._db.execute("SELECT 1")
+        except BaseException:
+            logger.warning(
+                "session journal connection unusable after a cancelled write; unable to inspect transaction state",
+                exc_info=True,
+            )
+            return
+        if not self._db.in_transaction:
+            return
+        try:
+            await self._db.execute("ROLLBACK")
+        except BaseException:
+            logger.warning(
+                "session journal rollback after a cancelled write failed; the connection may remain in a transaction",
+                exc_info=True,
+            )
+
+    async def _settle(self, task: asyncio.Task[object]) -> None:
+        """Wait for a restoration task to finish, absorbing repeated cancellation.
+
+        Each cancellation of the caller is delivered at the ``shield`` await, so
+        the loop simply keeps waiting for the same (uncancelled) task instead of
+        abandoning the connection restoration half-way.
+        """
+        while True:
+            try:
+                await asyncio.shield(task)
+                return
+            except asyncio.CancelledError:
+                if task.done():
+                    return
+            except BaseException:
+                return
 
     # ------------------------------------------------------------------
     # Protocol: create / append / read / load
@@ -236,9 +398,8 @@ class SQLiteJournalRepository:
         already exists.
         """
         scope = record.owner_scope
-        # aiosqlite has no async context-manager transaction; manage BEGIN/COMMIT/ROLLBACK manually.
-        await self._db.execute("BEGIN IMMEDIATE")
-        try:
+
+        async def work() -> SessionRecord:
             existing = await _fetchone(
                 self._db,
                 "SELECT session_id FROM session_journals WHERE owner_id=? AND workspace=? AND session_id=?",
@@ -266,12 +427,11 @@ class SQLiteJournalRepository:
                 ),
             )
             await self._insert_facts(self._db, scope, record.session_id, facts)
-            await self._db.commit()
-        except BaseException:
-            await self._db.execute("ROLLBACK")
-            raise
+            # Read back from the row this unit just wrote: a nested locked load
+            # would deadlock against the lock the unit already holds.
+            return self._row_to_session(await self._require_session_row(scope, record.session_id))
 
-        return await self.load_session(scope, record.session_id)
+        return await self._write_unit(work)
 
     async def append(
         self,
@@ -283,8 +443,8 @@ class SQLiteJournalRepository:
     ) -> AppendResult:
         if not facts:
             raise ValueError("cannot append an empty batch of facts")
-        await self._db.execute("BEGIN IMMEDIATE")
-        try:
+
+        async def work() -> AppendResult:
             row = await _fetchone(
                 self._db,
                 "SELECT version FROM session_journals WHERE owner_id=? AND workspace=? AND session_id=?",
@@ -332,58 +492,55 @@ class SQLiteJournalRepository:
                     "UPDATE session_journals SET version=?, updated_at=? WHERE owner_id=? AND workspace=? AND session_id=?",
                     (new_version, _iso(now), *self._scope_key(scope), session_id),
                 )
-            await self._db.commit()
-        except BaseException:
-            await self._db.execute("ROLLBACK")
-            raise
+            return AppendResult(new_version=new_version, appended_facts=tuple(durable))
 
-        return AppendResult(new_version=new_version, appended_facts=tuple(durable))
+        return await self._write_unit(work)
 
     async def read_facts(self, scope: OwnerScope, session_id: str, after_sequence: int = 0) -> list[JournalFact]:
-        # Existence check first so SessionNotFound is raised for unknown sessions.
-        await self._require_session_row(scope, session_id)
-        rows = await _fetchall(
-            self._db,
-            "SELECT * FROM session_facts WHERE owner_id=? AND workspace=? AND session_id=? AND sequence > ? ORDER BY sequence ASC",
-            (*self._scope_key(scope), session_id, after_sequence),
-        )
-        return [self._row_to_fact(r) for r in rows]
+        async with self._lock:
+            # Existence check first so SessionNotFound is raised for unknown sessions.
+            await self._require_session_row(scope, session_id)
+            rows = await _fetchall(
+                self._db,
+                "SELECT * FROM session_facts WHERE owner_id=? AND workspace=? AND session_id=? AND sequence > ? ORDER BY sequence ASC",
+                (*self._scope_key(scope), session_id, after_sequence),
+            )
+            return [self._row_to_fact(r) for r in rows]
 
     async def load_session(self, scope: OwnerScope, session_id: str) -> SessionRecord:
-        row = await self._require_session_row(scope, session_id)
-        return self._row_to_session(row)
+        async with self._lock:
+            row = await self._require_session_row(scope, session_id)
+            return self._row_to_session(row)
 
     # ------------------------------------------------------------------
     # Protocol: list / archive / purge
     # ------------------------------------------------------------------
 
     async def list_sessions(self, scope: OwnerScope) -> list[SessionRecord]:
-        rows = await _fetchall(
-            self._db,
-            "SELECT * FROM session_journals WHERE owner_id=? AND workspace=? AND status != ? ORDER BY created_at ASC",
-            (scope.owner_id, scope.workspace, SessionStatus.DELETED.value),
-        )
-        return [self._row_to_session(r) for r in rows]
+        async with self._lock:
+            rows = await _fetchall(
+                self._db,
+                "SELECT * FROM session_journals WHERE owner_id=? AND workspace=? AND status != ? ORDER BY created_at ASC",
+                (scope.owner_id, scope.workspace, SessionStatus.DELETED.value),
+            )
+            return [self._row_to_session(r) for r in rows]
 
     async def archive_session(self, scope: OwnerScope, session_id: str) -> SessionRecord:
-        await self._db.execute("BEGIN IMMEDIATE")
-        try:
+        async def work() -> SessionRecord:
             # Existence check first -> SessionNotFound for unknown sessions.
             await self._require_session_row(scope, session_id)
             await self._db.execute(
                 "UPDATE session_journals SET status=?, updated_at=? WHERE owner_id=? AND workspace=? AND session_id=?",
                 (SessionStatus.ARCHIVED.value, _iso(_now()), *self._scope_key(scope), session_id),
             )
-            await self._db.commit()
-        except BaseException:
-            await self._db.execute("ROLLBACK")
-            raise
-        # Re-read to reflect the updated row in a single source of truth.
-        return await self.load_session(scope, session_id)
+            # Read back from the row this unit just wrote: a nested locked load
+            # would deadlock against the lock the unit already holds.
+            return self._row_to_session(await self._require_session_row(scope, session_id))
+
+        return await self._write_unit(work)
 
     async def purge_session(self, scope: OwnerScope, session_id: str) -> None:
-        await self._db.execute("BEGIN IMMEDIATE")
-        try:
+        async def work() -> None:
             # Existence check INSIDE the transaction so a concurrent purge
             # between check and BEGIN cannot silently no-op.
             await self._require_session_row(scope, session_id)
@@ -397,20 +554,27 @@ class SQLiteJournalRepository:
                 "DELETE FROM session_journals WHERE owner_id=? AND workspace=? AND session_id=?",
                 (*self._scope_key(scope), session_id),
             )
-            await self._db.commit()
-        except BaseException:
-            await self._db.execute("ROLLBACK")
-            raise
+
+        await self._write_unit(work)
 
     # ------------------------------------------------------------------
     # Protocol: projection checkpoints
     # ------------------------------------------------------------------
 
     async def save_projection_checkpoint(self, scope: OwnerScope, session_id: str, checkpoint: ProjectionCheckpoint) -> None:
+        """Upsert a projection checkpoint, refusing to move a checkpoint backwards.
+
+        The write is a no-op when the stored checkpoint has advanced *past* the
+        incoming ``last_sequence`` (a stale writer that resumed from an older
+        cursor), so a slower process can never overwrite a projection that is
+        further ahead. An equal cursor still overwrites: the latest writer for
+        the same cursor wins. The conflict target is the OwnerScope-scoped
+        primary key, so owner isolation is unchanged.
+        """
         now = _now()
         ts = checkpoint.updated_at if checkpoint.updated_at is not None else now
-        await self._db.execute("BEGIN IMMEDIATE")
-        try:
+
+        async def work() -> None:
             await self._db.execute(
                 """
                 INSERT INTO projection_checkpoints
@@ -420,6 +584,7 @@ class SQLiteJournalRepository:
                     last_sequence = excluded.last_sequence,
                     updated_at    = excluded.updated_at,
                     data          = excluded.data
+                WHERE excluded.last_sequence >= projection_checkpoints.last_sequence
                 """,
                 (
                     scope.owner_id,
@@ -431,29 +596,29 @@ class SQLiteJournalRepository:
                     _serialize_json(checkpoint.data),
                 ),
             )
-            await self._db.commit()
-        except BaseException:
-            await self._db.execute("ROLLBACK")
-            raise
+
+        await self._write_unit(work)
 
     async def load_projection_checkpoint(self, scope: OwnerScope, session_id: str, projection_name: str) -> ProjectionCheckpoint | None:
-        row = await _fetchone(
-            self._db,
-            "SELECT * FROM projection_checkpoints WHERE owner_id=? AND workspace=? AND session_id=? AND projection_name=?",
-            (*self._scope_key(scope), session_id, projection_name),
-        )
-        if row is None:
-            return None
-        return ProjectionCheckpoint(
-            projection_name=row["projection_name"],
-            last_sequence=row["last_sequence"],
-            data=_deserialize_json(row["data"]),
-            updated_at=_parse_dt(row["updated_at"]),
-        )
+        async with self._lock:
+            row = await _fetchone(
+                self._db,
+                "SELECT * FROM projection_checkpoints WHERE owner_id=? AND workspace=? AND session_id=? AND projection_name=?",
+                (*self._scope_key(scope), session_id, projection_name),
+            )
+            if row is None:
+                return None
+            return ProjectionCheckpoint(
+                projection_name=row["projection_name"],
+                last_sequence=row["last_sequence"],
+                data=_deserialize_json(row["data"]),
+                updated_at=_parse_dt(row["updated_at"]),
+            )
 
     # ------------------------------------------------------------------
     # Protocol: lifecycle
     # ------------------------------------------------------------------
 
     async def close(self) -> None:
-        await self._db.close()
+        async with self._lock:
+            await self._db.close()

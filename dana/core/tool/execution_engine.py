@@ -106,6 +106,9 @@ class ToolExecutionEngine:
 
         # In-flight tracking
         self._in_flight: dict[str, _InFlight] = {}
+        # Tracked MCP cancellation notifications: retained until completion so a
+        # cancellation task is never abandoned (and can be awaited at teardown).
+        self._cancel_tasks: set[asyncio.Task[Any]] = set()
 
         # Remote adapters (e.g. MCP) keyed by server name
         self._remote_adapters: dict[str, MCPExecutionAdapter] = {}
@@ -188,7 +191,19 @@ class ToolExecutionEngine:
                 server_name = entry.identity.source[len("mcp:") :]
                 adapter = self._remote_adapters.get(server_name)
                 if adapter is not None:
-                    return adapter.call_tool(tool_call, tool_call_id)
+                    # The adapter API takes the tool_call dict + the harness id;
+                    # passing the dict as the *name* (and the id as arguments) would
+                    # call a tool literally named "{...}" and lose per-call tracking.
+                    from dana.common.utils.misc import Misc
+
+                    in_flight = _InFlight(tool_call_id, entry)
+                    self._in_flight[tool_call_id] = in_flight
+                    try:
+                        result = Misc.safe_asyncio_run(adapter.call_tool_from_dict, tool_call, tool_call_id)
+                        in_flight.set_result(result)
+                        return result
+                    finally:
+                        self._in_flight.pop(tool_call_id, None)
                 return create_tool_error(
                     "remote_adapter_not_found",
                     function_name,
@@ -232,7 +247,17 @@ class ToolExecutionEngine:
                 server_name = entry.identity.source[len("mcp:") :]
                 adapter = self._remote_adapters.get(server_name)
                 if adapter is not None:
-                    return await adapter.call_tool_async(tool_call, tool_call_id)
+                    # Route the whole tool_call through the adapter's dict entry
+                    # point so the harness tool_call_id (not a stand-in) keys
+                    # per-call tracking and the recorded transport request id.
+                    in_flight = _InFlight(tool_call_id, entry)
+                    self._in_flight[tool_call_id] = in_flight
+                    try:
+                        result = await adapter.call_tool_from_dict(tool_call, tool_call_id)
+                        in_flight.set_result(result)
+                        return result
+                    finally:
+                        self._in_flight.pop(tool_call_id, None)
                 return create_tool_error(
                     "remote_adapter_not_found",
                     function_name,
@@ -337,20 +362,13 @@ class ToolExecutionEngine:
                 server_name = source[4:]  # Strip "mcp:" prefix
                 adapter = self._remote_adapters.get(server_name)
                 if adapter is not None:
-                    # Send cancellation notification to the remote server
-                    # This is fire-and-forget; the response will carry
-                    # the acknowledgement
-                    import asyncio
-
-                    try:
-                        loop = asyncio.get_running_loop()
-                        loop.create_task(adapter.send_cancellation_notification(tool_call_id))
-                    except RuntimeError:
-                        logger.warning(
-                            "cancel_mcp_no_loop",
-                            tool_call_id=tool_call_id,
-                            server_name=server_name,
-                        )
+                    # Send the cancellation notification without blocking the caller
+                    # (the remote's acknowledgement arrives on the tool response,
+                    # which the executing call observes). The task is retained so it
+                    # is never abandoned: a strong reference keeps it alive until
+                    # completion, its exception is consumed, and :meth:`aclose` can
+                    # await it during orderly teardown.
+                    self._spawn_cancel_notification(adapter, server_name, tool_call_id)
                     logger.info(
                         "cancel_mcp",
                         tool_call_id=tool_call_id,
@@ -398,7 +416,7 @@ class ToolExecutionEngine:
             else:
                 final = create_tool_success("resource", entry.identity.name, result)
 
-            # Check if cancellation was requested during execution
+            # A latency budget is diagnostic, never proof of cancellation.
             if in_flight.is_cancelled:
                 elapsed = time.monotonic() - in_flight.started_at
                 max_latency = (entry.max_latency_ms or 0) / 1000.0
@@ -410,10 +428,18 @@ class ToolExecutionEngine:
                         elapsed_ms=round(elapsed * 1000),
                         max_latency_ms=entry.max_latency_ms,
                     )
-                # Still return the result — we never report cancelled because
-                # a future was abandoned (ADR-005)
-                final["_cancelled"] = True
 
+            in_flight.set_result(final)
+            return final
+        except Exception as exc:
+            if not in_flight.is_cancelled:
+                raise
+            final = create_tool_error(
+                "execution_error",
+                entry.identity.name,
+                f"Error executing {entry.identity.name}: {exc}\n{traceback.format_exc()}",
+            )
+            final["_effect_unknown"] = True
             in_flight.set_result(final)
             return final
         finally:
@@ -446,6 +472,7 @@ class ToolExecutionEngine:
             else:
                 final = create_tool_success("resource", entry.identity.name, result)
 
+            # A completed result remains authoritative, even after cancellation.
             if in_flight.is_cancelled:
                 elapsed = time.monotonic() - in_flight.started_at
                 max_latency = (entry.max_latency_ms or 0) / 1000.0
@@ -457,8 +484,18 @@ class ToolExecutionEngine:
                         elapsed_ms=round(elapsed * 1000),
                         max_latency_ms=entry.max_latency_ms,
                     )
-                final["_cancelled"] = True
 
+            in_flight.set_result(final)
+            return final
+        except Exception as exc:
+            if not in_flight.is_cancelled:
+                raise
+            final = create_tool_error(
+                "execution_error",
+                entry.identity.name,
+                f"Error executing {entry.identity.name}: {exc}\n{traceback.format_exc()}",
+            )
+            final["_effect_unknown"] = True
             in_flight.set_result(final)
             return final
         finally:
@@ -482,6 +519,89 @@ class ToolExecutionEngine:
             if existing is not manager:
                 return existing
         return self._worker_managers[worker_id]
+
+    def _spawn_cancel_notification(
+        self,
+        adapter: MCPExecutionAdapter,
+        server_name: str,
+        tool_call_id: str,
+    ) -> None:
+        """Send an MCP cancellation notification on a tracked, never-abandoned task.
+
+        Requires a running loop (``cancel`` is called from the turn's loop). Without
+        one the notification cannot be sent, so the fact is logged rather than
+        silently dropped — the call's disposition stays effect-unknown until the
+        remote is heard from.
+        """
+        in_flight = self._in_flight.get(tool_call_id)
+        if in_flight is None:
+            return
+        # Publish cancellation before yielding to the notification task. The
+        # transport can fail in this same turn, before that task ever runs.
+        adapter.cancellation_tracker.request_cancellation(tool_call_id)
+
+        async def send_if_active() -> None:
+            # The call may already have completed and forgotten its tracker state.
+            # Do not recreate that state, or cancel a new call reusing the same ID.
+            if self._in_flight.get(tool_call_id) is in_flight:
+                await adapter.send_cancellation_notification(tool_call_id)
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning(
+                "cancel_mcp_no_loop",
+                tool_call_id=tool_call_id,
+                server_name=server_name,
+            )
+            return
+
+        notification = send_if_active()
+        task = loop.create_task(notification)
+        if not isinstance(task, asyncio.Future):
+            # A loop whose ``create_task`` does not return a task cannot have the
+            # notification tracked or awaited. Never leak the coroutine: close both
+            # the returned object and the coroutine that was handed over, and record
+            # that the notification was not sent, so the disposition stays
+            # effect-unknown rather than silently assumed cancelled.
+            for candidate in (task, notification):
+                close = getattr(candidate, "close", None)
+                if close is not None:
+                    close()
+            logger.warning(
+                "cancel_notification_unschedulable",
+                tool_call_id=tool_call_id,
+                server_name=server_name,
+            )
+            return
+        self._cancel_tasks.add(task)
+
+        def _done(finished: asyncio.Task) -> None:
+            self._cancel_tasks.discard(finished)
+            if finished.cancelled():
+                return
+            exc = finished.exception()
+            if exc is not None:
+                logger.warning(
+                    "cancel_notification_failed",
+                    tool_call_id=tool_call_id,
+                    server_name=server_name,
+                    error=str(exc),
+                )
+
+        task.add_done_callback(_done)
+
+    async def aclose(self) -> None:
+        """Await in-flight cancellation notifications, then close the engine.
+
+        Orderly teardown: outstanding MCP cancellation notifications are awaited so
+        no task is abandoned and the remote is told about every cancelled call
+        before the transports are released.
+        """
+        if self._cancel_tasks:
+            await asyncio.gather(*list(self._cancel_tasks), return_exceptions=True)
+            self._cancel_tasks.clear()
+        self.close()
 
     def _execute_isolated_sync(
         self,
@@ -517,11 +637,15 @@ class ToolExecutionEngine:
             response = manager.send_request(request)
 
             if in_flight.is_cancelled:
+                # The worker process group was killed mid-work for a
+                # non-cooperative tool: whether its side effects committed before
+                # the kill cannot be confirmed. Report the truthful disposition.
                 final = create_tool_error(
                     "cancelled",
                     entry.identity.name,
                     "Cancelled during execution",
                 )
+                final["_effect_unknown"] = True
             elif response.status == WorkerStatus.SUCCESS:
                 final = create_tool_success("resource", entry.identity.name, response.result)
             elif response.status == WorkerStatus.CANCELLED:

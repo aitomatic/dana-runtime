@@ -296,8 +296,8 @@ class TestExecuteToolCall:
         assert events[3].metadata["error"] == "Something went wrong"
 
     @pytest.mark.asyncio
-    async def test_no_engine_returns_stub_result(self, repo):
-        """When no tool engine is set, a stub result is emitted."""
+    async def test_missing_engine_never_claims_execution(self, repo):
+        """A missing dispatch engine is a durable failure, not a successful effect."""
         scope = await _setup_session(repo)
         session = await _make_session(repo, scope, tool_engine=None)
         events = await _collect(
@@ -308,8 +308,10 @@ class TestExecuteToolCall:
                 correlation_id="corr-1",
             )
         )
-        assert len(events) == 4
-        assert events[3].event_type is HostEventType.TOOL_RESULT
+        assert events[-1].event_type is HostEventType.TOOL_FAILURE
+        facts = await repo.read_facts(scope, "sess-1")
+        assert FactType.TOOL_FAILURE in {fact.fact_type for fact in facts}
+        assert not {FactType.TOOL_STARTED, FactType.TOOL_RESULT} & {fact.fact_type for fact in facts}
 
 
 # ===========================================================================

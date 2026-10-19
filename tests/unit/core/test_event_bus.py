@@ -148,9 +148,9 @@ def test_t17_handlers_called_in_subscribe_order():
     # Stronger: distinct markers confirm order
     bus2 = EventBus()
     seq: list = []
-    bus2.subscribe("x", lambda _e: (seq.append("first") or None))
-    bus2.subscribe("x", lambda _e: (seq.append("second") or None))
-    bus2.subscribe("x", lambda _e: (seq.append("third") or None))
+    bus2.subscribe("x", lambda _e: seq.append("first") or None)
+    bus2.subscribe("x", lambda _e: seq.append("second") or None)
+    bus2.subscribe("x", lambda _e: seq.append("third") or None)
     _emit(bus2, Event("x"))
     assert seq == ["first", "second", "third"]
 

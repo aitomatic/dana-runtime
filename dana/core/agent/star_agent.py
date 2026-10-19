@@ -6,6 +6,7 @@ It provides a cleaner, more maintainable architecture for the STAR (See-Think-Ac
 and conversational agent functionality using composable components.
 """
 
+import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 import inspect
@@ -36,14 +37,56 @@ from .star_agent_streaming import STARAgentStreamingMixin
 logger = structlog.get_logger()
 
 
+def _client_is_borrowed(llm: Any) -> bool:
+    """Whether ``llm`` carries the host marker saying its pool is not this agent's.
+
+    Only an explicit ``True`` counts. A duck-typed client that cannot carry the
+    marker (test doubles, harness mocks) keeps the historical "owned unless it was
+    injected" behaviour rather than being skipped at teardown by a truthy stand-in.
+    """
+    return getattr(llm, "provider_borrowed", False) is True
+
+
 # from dana.apps.dana.thought_logger import ThoughtLogger  # Moved to avoid circular import
 
 
 class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
-    """STARAgent implementation using composition-based architecture."""
+    """STARAgent implementation using composition-based architecture.
+
+    Durable-history ownership (see :meth:`_legacy_timeline_persistence_enabled`):
+    an agent driven by a journal-managed session persists its turn history once,
+    in the session journal, and therefore must not also rewrite a derived legacy
+    timeline snapshot on every turn. A standalone (legacy API) agent keeps the
+    legacy snapshot because ``resume()`` reads it back.
+    """
 
     # Configuration constants
     MAX_THINK_RETRIES = 3  # Maximum retries when output format or done/response rules are invalid
+
+    #: Durable-history ownership seam. Set to ``True`` by the journal host
+    #: (``AgentSession``) on the agent it drives: the session journal is then the
+    #: sole authority for this session's history, so the agent's per-turn legacy
+    #: timeline snapshots (``_timeline.save``) are redundant derived writes and are
+    #: skipped. An instance attribute set by whoever owns the durable history —
+    #: never inferred from the replay-protection flag, which is about withholding
+    #: opaque provider replay carriers from a snapshot that is still written.
+    _journal_managed_session = False
+
+    #: Teardown started. Set by BOTH teardown paths: :meth:`close` for its documented
+    #: non-blocking contract (sync callers keep their owned cleanup pending on the
+    #: running loop, and an awaited :meth:`aclose` is the barrier that finishes it) and
+    #: :meth:`aclose` too. It only prevents starting a *second* full release pass.
+    _lifecycle_closed = False
+
+    #: Marker for the awaited teardown. Set once by :meth:`aclose`; unlike
+    #: ``_lifecycle_closed`` it is never set by the non-blocking :meth:`close`, so a
+    #: second awaited teardown still drains cleanup the first one could not.
+    _lifecycle_settled = False
+
+    #: The task performing the one awaited release pass (``_settle_lifecycle``).
+    #: Created lazily by :meth:`aclose` on the running loop; concurrent and repeated
+    #: teardowns join *it* instead of duplicating or shortcutting the pass.
+    _lifecycle_settle_task: asyncio.Task[None] | None = None
 
     def __init__(
         self,
@@ -135,6 +178,14 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         # llm_client: eager when injected (provider carries its own client, no env
         # needed), otherwise None so the lazy `llm_client` property builds it later.
         self._llm_client = injected_llm
+        # An injected provider *instance* is borrowed: the caller may keep using it
+        # after this agent is torn down, so the agent must never close it. Every
+        # other path (lazy property, string provider, LLMCaller adoption) builds or
+        # adopts the client for this agent and is closed by ``aclose()``. The
+        # wrapper records this so teardown reads the ownership of the pool the
+        # client points at, not of the construction path (see ``_install_llm_client``).
+        if injected_llm is not None:
+            injected_llm.provider_borrowed = True
         self._llm_config = {
             "provider": provider_name,
             "model": effective_model,
@@ -155,6 +206,12 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                 codec=codec,
                 use_native_tools=None,
             )
+            # We built this runtime, so its tool executor (offload pool + admission
+            # bookkeeping) is ours to release. An injected runtime belongs to the
+            # caller, who may drive it from other agents.
+            self._owns_runtime = True
+        else:
+            self._owns_runtime = False
 
         self._runtime = runtime
         # Sink 2: push the injected LLM into the runtime's LLMCaller so the actual
@@ -182,6 +239,12 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             )
         else:
             self._ltmemory = None
+
+        # The memory store's sub-LLM follows the same rule as the agent's own
+        # client: ``_install_llm_client`` and ``LTMemory.set_llm`` keep the two in
+        # sync, and each wrapper's ``provider_borrowed`` marker decides at teardown
+        # whether *this* agent may close the pool it points at. Nothing to record
+        # here.
 
         # Determine storage_config for timeline and event_log
 
@@ -254,6 +317,11 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
 
             self.with_resources(CodeExecutionResource(resource_id="code-execution"))
 
+        #: Sub-agents this agent constructed itself (not added via ``with_agents``,
+        #: which borrows the caller's object). Only these are torn down with the
+        #: parent: the caller retains ownership of anything it passed in.
+        self._owned_internal_agents: list[Any] = []
+
         if enable_assistant:
             from dana.core.agent.assistant_agent import AssistantAgent
 
@@ -264,6 +332,7 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
                 auto_register=False,  # Don't register sub-agent globally
             )
             self.with_agents(assistant)
+            self._owned_internal_agents.append(assistant)
 
         # Initialize reminder system for system-reminder injection.
         # Reminders check validity lazily during evaluate(), so order doesn't matter.
@@ -303,11 +372,18 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
 
         With ``reload_timeline=True`` ``session_id`` becomes a real context
         boundary:
-          1. Flushes the outgoing session's timeline to disk (no data loss).
+          1. Flushes the outgoing session's timeline to disk (no data loss) —
+             only when this agent owns durable history (see
+             ``_legacy_timeline_persistence_enabled``). A journal-managed agent
+             never wrote that snapshot in the first place, so there is nothing
+             to flush and the journal already holds the committed history.
           2. Rebuilds the timeline from scratch — resets entries AND all
              compaction-tracking state.
           3. Rehydrates from the new session's persisted entries (compaction-
              snapshot aware). An unknown session id yields an empty timeline.
+
+        The reload path is the legacy API. The journal host only relabels (see
+        ``_prepare_agent``), then rebuilds entries from journal facts.
 
         This is the internal primitive; ``reload_timeline`` is not exposed on the
         query methods. Prefer the public ``resume(session_id)`` wrapper for the
@@ -335,7 +411,12 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             return
 
         timeline = getattr(self, "_timeline", None)
-        if timeline is not None and getattr(timeline, "_repository", None) is not None and timeline.timeline:
+        if (
+            self._legacy_timeline_persistence_enabled()
+            and timeline is not None
+            and getattr(timeline, "_repository", None) is not None
+            and timeline.timeline
+        ):
             timeline.save(self._session_id)
 
         self._session_id = session_id
@@ -429,25 +510,103 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
     ) -> None:
         """Build a single LLM and fan it out to every sink (agent client, runtime
         call site, long-term memory). No-op when neither an instance nor a name is
-        given, so the legacy lazy path is preserved."""
+        given, so the legacy lazy path is preserved.
+
+        Ownership follows the source: an injected *instance* is borrowed; a client
+        this method constructs from a provider name is this agent's to retire
+        (``owns=True``). The wrapper's ``provider_borrowed`` marker records that at
+        installation, so a later provider swap inside the same wrapper updates it
+        (see ``LLM.switch_provider``).
+        """
         if llm_provider_instance is not None:
             if llm_provider is not None or model is not None:
                 logger.debug("llm_provider_instance set; ignoring llm_provider/model args")
             llm = LLM(provider=llm_provider_instance)
+            owns = False
             self._llm_config = {
                 "provider": getattr(llm_provider_instance, "name", None) or "custom",
                 "model": getattr(llm_provider_instance, "model", None),
             }
         elif llm_provider is not None:
             llm = LLM(provider=llm_provider, model=model)
+            owns = True
             self._llm_config = {"provider": llm_provider, "model": model}
         else:
             return
 
+        self._install_llm_client(llm, owns=owns)
+
+    def _install_llm_client(self, llm: LLM, *, owns: bool) -> None:
+        """Install ``llm`` as this agent's client and fan it out to every sink.
+
+        Ownership is tracked on the *provider pool*, not on the construction path:
+        two wrappers over the same provider are not independent retirement targets,
+        so re-installing a wrapper over the pool this agent already owns (for
+        example ``set_llm_provider(llm_provider_instance=agent.llm_client.provider)``)
+        must not close the pool the replacement just installed. Closing the
+        replaced wrapper is what closes its provider (``LLM.close``), so retirement
+        is gated on both: this agent owned the replaced wrapper *and* the
+        replacement points at a different pool. Re-installing the same wrapper is
+        therefore never a close, and a borrowed client is never closed.
+
+        Retirement uses the ``LLM.close()`` facade (loop-affine, best-effort, never
+        raises). The facade's ``provider_borrowed`` marker is written here so
+        teardown and a later in-place switch agree on who owns the pool the wrapper
+        points at.
+        """
+        previous = self._llm_client
+        memory_holder = getattr(getattr(self, "_ltmemory", None), "_rlm", None)
+        memory_holder = getattr(memory_holder, "_llm", None)
+        incoming_provider = getattr(llm, "provider", None)
+
+        previous_provider = getattr(previous, "provider", None) if previous is not None else None
+        previous_owned = previous is not None and previous is not llm and not _client_is_borrowed(previous)
+        shares_pool = previous_owned and previous_provider is not None and previous_provider is incoming_provider
+        if previous_owned and not shares_pool:
+            previous.close()
+
+        # Cleanup a retired facade scheduled on this loop must outlive the facade:
+        # ``close`` only schedules, and only ``aclose`` awaits, so the pool the host
+        # still holds takes over the tasks of every facade it replaces — including the
+        # one just retired here, and any already pending on a re-installed facade.
+        llm.take_over_pending_cleanup(previous, memory_holder)
+
+        # A replacement pointing at a pool this agent already owns through a facade
+        # it currently holds (its own client, or the memory store's) is not a new
+        # borrow: this agent built that pool, so teardown still releases it.
+        incoming_is_owned_here = owns or (
+            incoming_provider is not None
+            and any(
+                holder is not None
+                and holder is not llm
+                and not _client_is_borrowed(holder)
+                and getattr(holder, "provider", None) is incoming_provider
+                for holder in (previous, memory_holder)
+            )
+        )
+        try:
+            llm.provider_borrowed = not incoming_is_owned_here
+        except AttributeError:  # pragma: no cover - duck-typed client without attribute slots
+            # A client that cannot carry the marker is treated as owned, exactly as
+            # before the marker existed; teardown still guards every close hook.
+            logger.debug("llm_provider_ownership_marker_unsupported", client_type=type(llm).__name__)
         self._llm_client = llm
         if getattr(self, "_runtime", None) is not None:
             self._runtime.set_llm(llm)
-        if getattr(self, "_ltmemory", None) is not None:
+        if self._ltmemory is not None:
+            # Fan-out displaces whatever the memory store had: retire its own
+            # facade (never a borrowed one, never the replacement, never a wrapper
+            # already handled above), then let the store follow the installed
+            # client's lifetime.
+            if (
+                memory_holder is not None
+                and memory_holder is not llm
+                and memory_holder is not previous
+                and not _client_is_borrowed(memory_holder)
+                and getattr(memory_holder, "provider", None) is not incoming_provider
+            ):
+                memory_holder.close()
+                llm.take_over_pending_cleanup(memory_holder)
             self._ltmemory.set_llm(llm)
 
     def set_llm_provider(
@@ -470,12 +629,204 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
 
     @llm_client.setter
     def llm_client(self, value: LLM):
-        """Set the LLM client. Prefer set_llm_provider() to swap providers (also keeps _llm_config in sync)."""
-        self._llm_client = value
-        if hasattr(self._runtime, "set_llm"):
-            self._runtime.set_llm(value)
-        if getattr(self, "_ltmemory", None) is not None:
-            self._ltmemory.set_llm(value)
+        """Set the LLM client. Prefer set_llm_provider() to swap providers (also keeps _llm_config in sync).
+
+        Assignment transfers ownership: this is the internal adoption channel used
+        by LLMCaller for a client built for this agent. A host that wants to share
+        one client across agents must pass ``llm_provider_instance=`` (borrow).
+        """
+        self._install_llm_client(value, owns=True)
+
+    # ============================================================================
+    # PUBLIC API - DURABLE HISTORY OWNERSHIP & LIFECYCLE
+    # ============================================================================
+
+    def _legacy_timeline_persistence_enabled(self) -> bool:
+        """Whether this agent should write the derived legacy timeline snapshot.
+
+        ``True`` for a standalone (legacy API) agent, whose ``resume()`` reads
+        that snapshot back from the repository.
+
+        ``False`` when the journal host owns this session's durable history
+        (:attr:`_journal_managed_session`): ``AgentSession`` rebuilds the working
+        timeline from journal facts (``_populate_timeline``) and never reads the
+        legacy snapshot, so writing it every turn would duplicate the same
+        history in a second store. The in-memory timeline is unaffected — only the
+        redundant whole-history write is skipped.
+        """
+        return not getattr(self, "_journal_managed_session", False)
+
+    def close(self) -> None:
+        """Synchronously release this agent's owned lifecycle resources.
+
+        Sync counterpart of :meth:`aclose` for callers that cannot await (e.g.
+        ``AssistantAgent`` discarding a finished per-query instance). Identical
+        ownership rules (see :meth:`_install_llm_client`); the executor is released
+        through the synchronous ``close()`` hook it publishes, and every step is
+        best-effort. Only internally constructed sub-agents
+        (:attr:`_owned_internal_agents`) are closed — a child added with
+        ``with_agents`` is borrowed from its caller.
+
+        Deliberately non-blocking: with a loop already running, the LLM facade only
+        *schedules* its cleanup on that loop, so this returns before the owned pool
+        is released. That is what ``close()`` means for a sync caller. An awaited
+        :meth:`aclose` is not skipped afterwards — it re-enters and waits for the
+        scheduled cleanup, which is the only way a host can turn "cleanup started"
+        into "cleanup finished" without parking the calling thread.
+        """
+        if getattr(self, "_lifecycle_closed", False):
+            return
+        self._lifecycle_closed = True
+
+        if getattr(self, "_owns_runtime", False):
+            executor = getattr(getattr(self, "_runtime", None), "_tool_executor", None)
+            if executor is not None:
+                close_executor = getattr(executor, "close", None)
+                if close_executor is not None:
+                    try:
+                        close_executor()
+                    except Exception as exc:  # pragma: no cover - teardown must not raise
+                        logger.warning("agent_runtime_close_failed", error_type=type(exc).__name__)
+
+        for agent in getattr(self, "_owned_internal_agents", ()):
+            close_subagent = getattr(agent, "close", None)
+            if close_subagent is None:
+                continue
+            try:
+                close_subagent()
+            except Exception as exc:  # pragma: no cover - teardown must not raise
+                logger.warning("subagent_close_failed", error_type=type(exc).__name__)
+
+        memory_llm = getattr(getattr(self, "_ltmemory", None), "_rlm", None)
+        memory_llm = getattr(memory_llm, "_llm", None)
+        if memory_llm is not None and memory_llm is not self._llm_client and not _client_is_borrowed(memory_llm):
+            close_memory_llm = getattr(memory_llm, "close", None)
+            if close_memory_llm is not None:
+                try:
+                    close_memory_llm()
+                except Exception as exc:  # pragma: no cover - teardown must not raise
+                    logger.warning("agent_ltmemory_close_failed", error_type=type(exc).__name__)
+
+        llm = self._llm_client
+        if llm is not None and not _client_is_borrowed(llm):
+            close_llm = getattr(llm, "close", None)
+            if close_llm is not None:
+                try:
+                    close_llm()
+                except Exception as exc:  # pragma: no cover - teardown must not raise
+                    logger.warning("agent_llm_close_failed", error_type=type(exc).__name__)
+
+    async def aclose(self) -> None:
+        """Release this agent's owned lifecycle resources.
+
+        Called by the session host at teardown (:meth:`AgentSession.aclose`).
+        Idempotent; never raises, so a teardown failure cannot mask or replace a
+        committed turn outcome. Runs from an async context, so loop-affine SDK
+        clients are closed on the loop that owns them.
+
+        Releases, in order:
+
+        1. The runtime's tool executor (its own offload pool + admission
+           bookkeeping) — only when this agent built the runtime.
+        2. Sub-agents this agent constructed itself (the ``AssistantAgent`` built
+           when ``enable_assistant=True``) that expose ``aclose`` — its owned
+           client (and its per-query fresh instance) is thereby released instead
+           of leaked. A child added with ``with_agents`` is owned by the caller
+           and is never closed here.
+        3. The memory store's sub-LLM (``LTMemory`` → ``RLMResource``) — closed
+           only when this agent owns it, i.e. the constructor built the store
+           without an injected LLM so the resource built its own SDK client.
+        4. The LLM client — only when this agent owns it.
+
+        Ownership rules (see ``_install_llm_client``): each installed wrapper carries
+        the ownership of the pool it currently points at. An injected provider
+        instance is borrowed and stays open — the caller may still be using it
+        elsewhere — while a client this agent built, adopted from an LLMCaller, or
+        a replacement created by ``LLM.switch_provider`` inside an installed wrapper
+        belongs to this agent and is released here.
+
+        The client is closed only when it already exists: teardown must never
+        construct one (that would open a connection pool purely to shut it down).
+        An embedding client is not closed because the agent never creates one.
+        A sub-agent that exposes no close hook is left untouched, since its
+        lifetime is not this agent's to end.
+        """
+        if getattr(self, "_lifecycle_settled", False):
+            return
+        # Teardown completion is owned by its own task, never by whichever caller
+        # happened to start it: joining must wait for the *teardown*, not for the rest
+        # of that caller's lifetime (which may itself be waiting on this join). A task
+        # outlives its awaiting caller, so cancelling a joiner cannot abandon the
+        # cleanup that is already in flight.
+        in_flight = self._lifecycle_settle_task
+        if in_flight is None:
+            in_flight = asyncio.create_task(self._settle_lifecycle())
+            self._lifecycle_settle_task = in_flight
+        if not in_flight.done():
+            await asyncio.shield(in_flight)
+            return
+        await in_flight  # already finished: surface any terminal result once
+
+    async def _settle_lifecycle(self) -> None:
+        """One full, awaited release pass; sets ``_lifecycle_settled`` only when done."""
+        first_pass = not getattr(self, "_lifecycle_closed", False)
+        self._lifecycle_closed = True
+        if first_pass and getattr(self, "_owns_runtime", False):
+            executor = getattr(getattr(self, "_runtime", None), "_tool_executor", None)
+            if executor is not None:
+                close_executor = getattr(executor, "aclose", None)
+                if close_executor is not None:
+                    try:
+                        await close_executor()
+                    except Exception as exc:  # pragma: no cover - teardown must not raise
+                        logger.warning("agent_runtime_close_failed", error_type=type(exc).__name__)
+
+        # Owned internal children are always visited, including after a sync
+        # ``close()`` started their teardown: ``close`` only schedules a child's
+        # SDK cleanup, so the parent's awaited teardown is the only place that can
+        # turn "child cleanup started" into "child cleanup finished". A borrowed
+        # child (``with_agents``) is never visited.
+        for agent in getattr(self, "_owned_internal_agents", ()):
+            close_subagent = getattr(agent, "aclose", None)
+            if close_subagent is None:
+                continue
+            try:
+                await close_subagent()
+            except Exception as exc:  # pragma: no cover - teardown must not raise
+                logger.warning("subagent_close_failed", error_type=type(exc).__name__)
+
+        memory_llm = getattr(getattr(self, "_ltmemory", None), "_rlm", None)
+        memory_llm = getattr(memory_llm, "_llm", None)
+        if memory_llm is not None and memory_llm is not self._llm_client and not _client_is_borrowed(memory_llm):
+            close_memory_llm = getattr(memory_llm, "aclose", None)
+            if close_memory_llm is not None:
+                try:
+                    await close_memory_llm()
+                except Exception as exc:  # pragma: no cover - teardown must not raise
+                    logger.warning("agent_ltmemory_close_failed", error_type=type(exc).__name__)
+
+        # The installed facade is always visited, even on a drain-only pass, and
+        # even when its pool is borrowed: it is where cleanup scheduled by an
+        # earlier sync ``close()`` or by a retired facade now waits, and awaiting
+        # that cleanup never closes the pool the facade currently points at.
+        llm = self._llm_client
+        if llm is not None:
+            if _client_is_borrowed(llm):
+                drain = getattr(llm, "await_pending_cleanup", None)
+                if drain is not None:
+                    try:
+                        await drain()
+                    except Exception as exc:  # pragma: no cover - teardown must not raise
+                        logger.warning("agent_llm_drain_failed", error_type=type(exc).__name__)
+            else:
+                close_llm = getattr(llm, "aclose", None)
+                if close_llm is not None:
+                    try:
+                        await close_llm()
+                    except Exception as exc:  # pragma: no cover - teardown must not raise
+                        logger.warning("agent_llm_close_failed", error_type=type(exc).__name__)
+        # Settled means finished: only a completed pass may suppress later ones.
+        self._lifecycle_settled = True
 
     # ============================================================================
     # PUBLIC API - AGENT IDENTITY & PROMPTS
@@ -488,6 +839,15 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         super().with_agents(*agents)
         return self
 
+    def add_agent(self, agent: AgentProtocol) -> None:
+        self.with_agents(agent)
+
+    def remove_agent(self, agent_id: str) -> bool:
+        removed = super().remove_agent(agent_id)
+        if removed and hasattr(self._runtime, "reset"):
+            self._runtime.reset()
+        return removed
+
     def with_resources(self, *resources: ResourceProtocol) -> BaseSTARAgent:
         """Add resources to the agent."""
         if hasattr(self._runtime, "reset"):
@@ -495,12 +855,30 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
         super().with_resources(*resources)
         return self
 
+    def add_resource(self, resource: ResourceProtocol) -> None:
+        self.with_resources(resource)
+
+    def remove_resource(self, resource_id: str) -> bool:
+        removed = super().remove_resource(resource_id)
+        if removed and hasattr(self._runtime, "reset"):
+            self._runtime.reset()
+        return removed
+
     def with_workflows(self, *workflows: WorkflowProtocol) -> BaseSTARAgent:
         """Add workflows to the agent."""
         if hasattr(self._runtime, "reset"):
             self._runtime.reset()
         super().with_workflows(*workflows)
         return self
+
+    def add_workflow(self, workflow: WorkflowProtocol) -> None:
+        self.with_workflows(workflow)
+
+    def remove_workflow(self, workflow_id: str) -> bool:
+        removed = super().remove_workflow(workflow_id)
+        if removed and hasattr(self._runtime, "reset"):
+            self._runtime.reset()
+        return removed
 
     def with_notifiable(self, *notifiables: Notifiable) -> BaseSTARAgent:
         """Add notifiables to the agent."""
@@ -583,8 +961,10 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             if hasattr(self, "_event_log") and self._event_log is not None:
                 self._event_log.save(session_id)
 
-            # Save timeline (agent, codec, storage_config already set in __init__)
-            if hasattr(self, "_timeline") and self._timeline is not None:
+            # Save the derived legacy timeline snapshot (agent, codec,
+            # storage_config already set in __init__) unless the journal host owns
+            # this session's durable history.
+            if self._legacy_timeline_persistence_enabled() and hasattr(self, "_timeline") and self._timeline is not None:
                 self._timeline.save(session_id)
 
     async def aquery(self, **kwargs) -> DictParams:
@@ -611,8 +991,9 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             if hasattr(self, "_event_log") and self._event_log is not None:
                 self._event_log.save(session_id)
 
-            # Save timeline (agent, codec, storage_config already set in __init__)
-            if hasattr(self, "_timeline") and self._timeline is not None:
+            # Save the derived legacy timeline snapshot unless the journal host
+            # owns this session's durable history (see ``query``).
+            if self._legacy_timeline_persistence_enabled() and hasattr(self, "_timeline") and self._timeline is not None:
                 self._timeline.save(session_id)
 
     def converse(self, initial_message: str | None = None, session_id: str | None = None) -> None:
@@ -840,8 +1221,14 @@ class STARAgent(STARAgentStreamingMixin, BaseSTARAgent):
             if not caller_message:
                 return {"trace_percepts": self._mark_star_loop_exit(trace_inputs)}
 
-            # Add caller_message to timeline with caller tracking
-            if isinstance(caller_message, str):
+            # Add caller_message to timeline with caller tracking.
+            # Callers may hand us plain text or canonical multimodal content
+            # blocks (list[dict]). Both are valid TimelineEntry content, so a
+            # block list is ingested as-is: coercing it with str() would
+            # flatten the blocks the provider has to convert.
+            if isinstance(caller_message, str) or (
+                isinstance(caller_message, list) and all(isinstance(block, dict) for block in caller_message)
+            ):
                 # Create new entry and mark it as latest
                 new_entry = TimelineEntry(entry_type=TimelineEntryType.USER_MESSAGE, content=caller_message, is_latest_user_message=True)
                 self._timeline.add_entry(new_entry)

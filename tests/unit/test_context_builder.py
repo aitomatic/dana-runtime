@@ -1,5 +1,7 @@
 """Unit tests for ContextBuilder."""
 
+from dataclasses import FrozenInstanceError
+
 import pytest
 
 from dana.core.context import Context, ContextBuilder
@@ -156,7 +158,7 @@ class TestContext:
             budget=1000,
         )
 
-        with pytest.raises(Exception):  # FrozenInstanceError
+        with pytest.raises(FrozenInstanceError):
             context.text = "new content"
 
     def test_context_fields(self):

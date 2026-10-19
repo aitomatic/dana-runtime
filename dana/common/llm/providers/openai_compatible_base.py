@@ -17,10 +17,13 @@ from ..types import (
     LLMResponse,
     LLMStreamChunk,
     LLMTimeoutError,
+    PromptTooLongError,
+    ProviderError,
     is_multimodal_content,
     read_media_as_base64,
     unsupported_placeholder,
 )
+from ._stream_teardown import close_stream
 
 
 logger = structlog.get_logger()
@@ -43,11 +46,14 @@ def _extract_audio_format(media_type: str) -> str:
 
 # Model families with known parameter restrictions.
 # Key is a model prefix matched against the model name.
-# "rename" remaps the parameter key (e.g. max_tokens → max_completion_tokens).
+# "rename" remaps the parameter key for the Chat Completions API
+# (e.g. max_tokens → max_completion_tokens); "rename_responses" is the mapping for
+# the Responses API, which does not accept the Chat Completions name at all (it
+# rejects max_completion_tokens with a TypeError) and uses max_output_tokens.
 MODEL_RESTRICTIONS: dict[str, dict] = {
     "gpt-5": {
         "temperature": {"allowed_values": [1], "default": 1},
-        "max_tokens": {"rename": "max_completion_tokens"},
+        "max_tokens": {"rename": "max_completion_tokens", "rename_responses": "max_output_tokens"},
     },
 }
 
@@ -102,6 +108,134 @@ def _serialize_output_item(item: Any) -> dict:
         "summary": summary_list,
         "encrypted_content": getattr(item, "encrypted_content", None),
     }
+
+
+def _extract_responses_output(response: Any) -> tuple[list[str], list[str], list[dict], list[Any]]:
+    """Split a Responses API ``response.output`` into its replay-relevant parts.
+
+    Returns ``(content_parts, reasoning_parts, reasoning_items, function_call_items)``:
+    message text, reasoning summary text, raw reasoning items (see
+    :func:`_serialize_output_item`), and ``function_call`` output items.
+
+    Shared by the non-streaming conversion and the streaming terminal carrier so
+    the two paths cannot drift on what is captured for cross-turn replay.
+    """
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    reasoning_items: list[dict] = []
+    function_call_items: list[Any] = []
+
+    for item in response.output:
+        item_type = getattr(item, "type", None)
+        if item_type == "reasoning":
+            reasoning_items.append(_serialize_output_item(item))
+            for s in getattr(item, "summary", None) or []:
+                text = getattr(s, "text", None)
+                if text:
+                    reasoning_parts.append(text)
+        elif item_type == "message":
+            for c in getattr(item, "content", None) or []:
+                if getattr(c, "type", None) == "output_text":
+                    text = getattr(c, "text", "") or ""
+                    if text:
+                        content_parts.append(text)
+        elif item_type == "function_call":
+            function_call_items.append(item)
+
+    return content_parts, reasoning_parts, reasoning_items, function_call_items
+
+
+def _responses_tool_calls(function_call_items: list[Any]) -> list:
+    """Convert Responses ``function_call`` output items to Chat-Completions
+    shaped tool calls, so downstream parsers (``_to_tool_call_dicts``) see no
+    difference between the two API paths.
+    """
+    from openai.types.chat import ChatCompletionMessageToolCall
+    from openai.types.chat.chat_completion_message_tool_call import Function
+
+    return [
+        ChatCompletionMessageToolCall(
+            id=item.call_id,
+            type="function",
+            function=Function(name=item.name, arguments=item.arguments or ""),
+        )
+        for item in function_call_items
+    ]
+
+
+def _tool_calls_completed(function_call_items: list[Any]) -> bool:
+    """True when every ``function_call`` item carries complete arguments.
+
+    Only an absent status (older payloads) or ``"completed"`` establishes
+    executable arguments. In-progress and incomplete calls are not executable.
+    """
+    return bool(function_call_items) and all(getattr(item, "status", None) in (None, "completed") for item in function_call_items)
+
+
+def _truncation_reason(response: Any) -> str | None:
+    """The Chat-Completions-style label for a truncated Responses terminal.
+
+    ``None`` when the terminal did not report truncation (or is absent on older
+    payloads). ``max_output_tokens`` maps to ``length``; any other cut-off reason
+    (content filter, ...) keeps the distinct ``incomplete`` label so a consumer
+    cannot mistake a refusal for an ordinary length limit.
+    """
+    if getattr(response, "status", None) != "incomplete":
+        return None
+    details = getattr(response, "incomplete_details", None)
+    reason = getattr(details, "reason", None) if details else None
+    return "length" if reason == "max_output_tokens" else "incomplete"
+
+
+def _responses_finish_reason(response: Any, function_call_items: list[Any]) -> str:
+    """Map Responses API status to a Chat-Completions-style finish_reason so
+    callers don't need to know which path was used.
+
+    The ``function_call`` items decide first, because they are what the host may act
+    on: a call the provider marked complete (or left status-less) carries complete
+    arguments and is executable, so the turn reports ``tool_calls`` even when the
+    terminal status is ``incomplete`` — reporting a truncation label there makes the
+    host drop a turn the model finished on purpose. A call explicitly marked
+    ``incomplete`` has truncated arguments and must never be executed, so it keeps
+    the truncation label.
+
+    With no calls, a truncation terminal keeps its ``length``/``incomplete`` label and
+    anything else is a normal ``stop``.
+    """
+    truncated = _truncation_reason(response)
+    has_calls = bool(function_call_items)
+    if has_calls:
+        return "tool_calls" if _tool_calls_completed(function_call_items) else (truncated or "incomplete")
+    return truncated or "stop"
+
+
+def _responses_usage(response: Any) -> tuple[dict[str, int] | None, int | None]:
+    """Map Responses API usage onto the Chat-Completions-shaped dict callers read.
+
+    Returns ``(usage, reasoning_tokens)``; ``(None, None)`` when the response
+    carries no usage block.
+    """
+    usage_obj = getattr(response, "usage", None)
+    if not usage_obj:
+        return None, None
+
+    usage: dict[str, int] = {
+        "prompt_tokens": usage_obj.input_tokens,
+        "completion_tokens": usage_obj.output_tokens,
+        "total_tokens": usage_obj.total_tokens,
+    }
+    input_details = getattr(usage_obj, "input_tokens_details", None)
+    if input_details:
+        cached = getattr(input_details, "cached_tokens", None)
+        if cached is not None:
+            usage["cached_tokens"] = cached
+
+    reasoning_tokens = None
+    output_details = getattr(usage_obj, "output_tokens_details", None)
+    if output_details:
+        reasoning_tokens = getattr(output_details, "reasoning_tokens", None) or None
+
+    return usage, reasoning_tokens
 
 
 def _looks_like_include_rejection(err: BadRequestError) -> bool:
@@ -306,8 +440,16 @@ class OpenAICompatibleProvider(LLMProvider):
         return None
 
     @staticmethod
-    def _filter_params_for_model(model: str, params: dict) -> dict:
-        """Filter/adjust parameters based on model-specific restrictions."""
+    def _filter_params_for_model(model: str, params: dict, api: str = "chat") -> dict:
+        """Filter/adjust parameters based on model-specific restrictions.
+
+        ``api`` selects which token-ceiling parameter name this API accepts.
+        The Chat Completions and Responses APIs disagree (``max_completion_tokens``
+        vs ``max_output_tokens``), and sending the wrong one is a hard TypeError from
+        the installed SDK, so the rename has to be applied per call site rather than
+        assumed identical. ``api="chat"`` is the default to keep existing callers and
+        tests unchanged.
+        """
         family = OpenAICompatibleProvider._get_model_family(model)
         if not family:
             return params
@@ -323,12 +465,12 @@ class OpenAICompatibleProvider(LLMProvider):
             if param_name not in filtered:
                 continue
             current_value = filtered[param_name]
-            # Rename parameter (e.g. max_tokens → max_completion_tokens)
-            rename_to = restriction.get("rename")
+            # Rename parameter to the name this API actually accepts
+            rename_to = restriction.get("rename_responses" if api == "responses" else "rename")
             if rename_to:
                 del filtered[param_name]
                 filtered[rename_to] = current_value
-                adjustments_made.append(f"{param_name} renamed to {rename_to}")
+                adjustments_made.append(f"{param_name} renamed to {rename_to} ({api})")
                 continue
             # Remove disallowed values
             allowed_values = restriction.get("allowed_values")
@@ -527,9 +669,10 @@ class OpenAICompatibleProvider(LLMProvider):
         (e.g. Azure with api-version < 2025-03-01-preview). Reasoning text is not
         surfaced on this path; only ``reasoning_tokens`` count if the API returns it.
         """
+        timeout = kwargs.get("timeout")
         _, openai_messages = self.prepare_messages(messages)
 
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ["json_mode"] and v is not None}
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ["json_mode", "timeout"] and v is not None}
         filtered_kwargs = self._filter_params_for_model(self.model, filtered_kwargs)
 
         request_kwargs = {"model": self.model, "messages": openai_messages, **filtered_kwargs}
@@ -543,7 +686,7 @@ class OpenAICompatibleProvider(LLMProvider):
 
         response = await self.client.chat.completions.create(
             **request_kwargs,
-            timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
+            timeout=httpx.Timeout(timeout or self.DEFAULT_TIMEOUT_SECONDS),
         )
 
         choice = response.choices[0]
@@ -583,14 +726,12 @@ class OpenAICompatibleProvider(LLMProvider):
         Chat Completions emits (``ChatCompletionMessageToolCall``) so downstream
         parsers (e.g. ``response_parser._to_tool_call_dicts``) see no difference.
         """
-        from openai.types.chat import ChatCompletionMessageToolCall
-        from openai.types.chat.chat_completion_message_tool_call import Function
-
+        timeout = kwargs.get("timeout")
         _, openai_messages = self.prepare_messages(messages)
         responses_input = self._convert_to_responses_input(openai_messages)
 
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ["json_mode"] and v is not None}
-        filtered_kwargs = self._filter_params_for_model(self.model, filtered_kwargs)
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ["json_mode", "timeout"] and v is not None}
+        filtered_kwargs = self._filter_params_for_model(self.model, filtered_kwargs, api="responses")
 
         request_kwargs = {"model": self.model, "input": responses_input, **filtered_kwargs}
 
@@ -623,7 +764,7 @@ class OpenAICompatibleProvider(LLMProvider):
         try:
             response = await self.client.responses.create(
                 **request_kwargs,
-                timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
+                timeout=httpx.Timeout(timeout or self.DEFAULT_TIMEOUT_SECONDS),
             )
         except BadRequestError as e:
             # Sticky one-shot fallback: drop the include flag and retry. Subsequent
@@ -637,7 +778,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 request_kwargs.pop("include", None)
                 response = await self.client.responses.create(
                     **request_kwargs,
-                    timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
+                    timeout=httpx.Timeout(timeout or self.DEFAULT_TIMEOUT_SECONDS),
                 )
             elif _looks_like_reasoning_rejection(e):
                 # Stale reasoning id, item-shape mismatch (e.g. unknown field
@@ -652,72 +793,23 @@ class OpenAICompatibleProvider(LLMProvider):
                 request_kwargs["input"] = [item for item in request_kwargs["input"] if item.get("type") != "reasoning"]
                 response = await self.client.responses.create(
                     **request_kwargs,
-                    timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
+                    timeout=httpx.Timeout(timeout or self.DEFAULT_TIMEOUT_SECONDS),
                 )
             else:
                 raise
 
-        content_parts: list[str] = []
-        reasoning_parts: list[str] = []
-        reasoning_items: list[dict] = []
-        tool_calls_list: list = []
+        content_parts, reasoning_parts, reasoning_items, function_call_items = _extract_responses_output(response)
 
-        for item in response.output:
-            item_type = getattr(item, "type", None)
-            if item_type == "reasoning":
-                reasoning_items.append(_serialize_output_item(item))
-                for s in item.summary or []:
-                    text = getattr(s, "text", None)
-                    if text:
-                        reasoning_parts.append(text)
-            elif item_type == "message":
-                for c in item.content or []:
-                    if getattr(c, "type", None) == "output_text":
-                        text = getattr(c, "text", "") or ""
-                        if text:
-                            content_parts.append(text)
-            elif item_type == "function_call":
-                tool_calls_list.append(
-                    ChatCompletionMessageToolCall(
-                        id=item.call_id,
-                        type="function",
-                        function=Function(name=item.name, arguments=item.arguments or ""),
-                    )
-                )
+        tool_calls_list: list = _responses_tool_calls(function_call_items)
 
-        # Map Responses API status to a Chat-Completions-style finish_reason so
-        # callers don't need to know which path was used.
-        if tool_calls_list:
-            finish_reason = "tool_calls"
-        elif response.status == "incomplete":
-            details = getattr(response, "incomplete_details", None)
-            reason = getattr(details, "reason", None) if details else None
-            finish_reason = "length" if reason == "max_output_tokens" else "incomplete"
-        else:
-            finish_reason = "stop"
-
-        usage = None
-        reasoning_tokens = None
-        if response.usage:
-            usage = {
-                "prompt_tokens": response.usage.input_tokens,
-                "completion_tokens": response.usage.output_tokens,
-                "total_tokens": response.usage.total_tokens,
-            }
-            input_details = getattr(response.usage, "input_tokens_details", None)
-            if input_details:
-                cached = getattr(input_details, "cached_tokens", None)
-                if cached is not None:
-                    usage["cached_tokens"] = cached
-            output_details = getattr(response.usage, "output_tokens_details", None)
-            if output_details:
-                reasoning_tokens = getattr(output_details, "reasoning_tokens", None) or None
+        resp_finish_reason = _responses_finish_reason(response, function_call_items)
+        resp_usage, reasoning_tokens = _responses_usage(response)
 
         return LLMResponse(
             content="".join(content_parts),
             model=response.model,
-            usage=usage,
-            finish_reason=finish_reason,
+            usage=resp_usage,
+            finish_reason=resp_finish_reason,
             tool_calls=tool_calls_list or None,
             reasoning_tokens=reasoning_tokens,
             reasoning_content="".join(reasoning_parts) or None,
@@ -770,14 +862,40 @@ class OpenAICompatibleProvider(LLMProvider):
 
     # --- Streaming methods (Phases 2-4) ---
 
+    def _supports_stream_usage(self) -> bool:
+        """Whether this endpoint accepts ``stream_options={"include_usage": True}``.
+
+        Chat Completions streams on OpenAI and on current Azure ``api-version``
+        values accept it; older Azure versions reject the unknown field with a 400.
+        The base (OpenAI-compatible) answer is yes and Azure overrides by version,
+        so the request-side policy is decided by an explicit capability instead of a
+        speculative retry: a 400 for a malformed request is never retried, and
+        re-issuing a stream would duplicate output already delivered.
+
+        Callers may still opt in or out per request: an explicit ``stream_options``
+        passed through ``kwargs`` wins (the request is then sent as given).
+        """
+        return True
+
     async def _stream_chat_completions(self, messages: list[LLMMessage], tools: list | None = None, **kwargs):
         """Stream via client.chat.completions.create(stream=True).
 
-        Yields LLMStreamChunk. Accumulates incremental tool call deltas.
+        Yields LLMStreamChunk. Accumulates incremental tool call deltas, then emits
+        a terminal ``response`` carrier with the model id, real usage (including
+        cached tokens and reasoning tokens), the requested response id, and the
+        provider's actual ``finish_reason``.
+
+        Request controls mirror :meth:`_chat_via_chat_completions`: the same
+        json_mode ``response_format`` and the same ``MODEL_RESTRICTIONS`` rename /
+        removal apply. ``stream_options={"include_usage": True}`` is required for
+        the API to send the usage accounting at all — without it the streaming path
+        had no token/cache counters while the non-streaming path did — but it is
+        only sent when the endpoint supports it (:meth:`_supports_stream_usage`).
         """
+        timeout = kwargs.get("timeout")
         _, openai_messages = self.prepare_messages(messages)
 
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ["json_mode"] and v is not None}
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ["json_mode", "timeout"] and v is not None}
         filtered_kwargs = self._filter_params_for_model(self.model, filtered_kwargs)
 
         request_kwargs = {"model": self.model, "messages": openai_messages, "stream": True, **filtered_kwargs}
@@ -786,59 +904,134 @@ class OpenAICompatibleProvider(LLMProvider):
             request_kwargs["tools"] = self.prepare_tools(tools)
             request_kwargs["tool_choice"] = "auto"
 
+        if kwargs.get("json_mode", False):
+            request_kwargs["response_format"] = {"type": "json_object"}
+
+        # Ask for the final usage frame when the endpoint accepts it. Caller-supplied
+        # stream_options win (e.g. to opt out against a proxy that rejects the field).
+        if "stream_options" in request_kwargs or self._supports_stream_usage():
+            stream_options = dict(request_kwargs.pop("stream_options", None) or {})
+            stream_options.setdefault("include_usage", True)
+            request_kwargs["stream_options"] = stream_options
+
         response = await self.client.chat.completions.create(
             **request_kwargs,
-            timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
+            timeout=httpx.Timeout(timeout or self.DEFAULT_TIMEOUT_SECONDS),
         )
 
         tool_calls: dict[int, dict] = {}
+        text_parts: list[str] = []
+        finish_reason: str | None = None
+        model: str | None = None
+        response_id: str | None = None
+        usage: dict[str, int] | None = None
+        reasoning_tokens: int | None = None
 
-        async for chunk in response:
-            if not chunk.choices:
-                continue
+        try:
+            async for chunk in response:
+                if getattr(chunk, "model", None):
+                    model = chunk.model
+                if getattr(chunk, "id", None):
+                    response_id = chunk.id
+                # With include_usage the final frame carries usage and an empty choices
+                # list — read it before the choices guard so it is not skipped.
+                if getattr(chunk, "usage", None):
+                    usage = {
+                        "prompt_tokens": chunk.usage.prompt_tokens,
+                        "completion_tokens": chunk.usage.completion_tokens,
+                        "total_tokens": chunk.usage.total_tokens,
+                    }
+                    details = getattr(chunk.usage, "prompt_tokens_details", None)
+                    if details is not None:
+                        cached = getattr(details, "cached_tokens", None)
+                        if cached is not None:
+                            usage["cached_tokens"] = cached
+                    completion_details = getattr(chunk.usage, "completion_tokens_details", None)
+                    if completion_details is not None:
+                        reasoning_tokens = getattr(completion_details, "reasoning_tokens", None) or None
 
-            choice = chunk.choices[0]
-            delta = choice.delta
+                if not chunk.choices:
+                    continue
 
-            if delta and delta.content:
-                yield LLMStreamChunk(type="text_delta", content=delta.content)
+                choice = chunk.choices[0]
+                delta = choice.delta
 
-            if delta and delta.tool_calls:
-                for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
-                    if idx not in tool_calls:
-                        tool_calls[idx] = {"id": "", "name": "", "arguments": ""}
-                    if tc_delta.id:
-                        tool_calls[idx]["id"] = tc_delta.id
-                    if tc_delta.function:
-                        if tc_delta.function.name:
-                            tool_calls[idx]["name"] = tc_delta.function.name
-                        if tc_delta.function.arguments:
-                            tool_calls[idx]["arguments"] += tc_delta.function.arguments
+                if delta and delta.content:
+                    text_parts.append(delta.content)
+                    yield LLMStreamChunk(type="text_delta", content=delta.content)
 
-            if choice.finish_reason == "tool_calls":
-                for tc in tool_calls.values():
-                    try:
-                        parsed_args = json.loads(tc["arguments"]) if tc["arguments"] else {}
-                    except json.JSONDecodeError:
-                        parsed_args = {}
-                    yield LLMStreamChunk(
-                        type="tool_use",
-                        tool_call={"id": tc["id"], "name": tc["name"], "input": parsed_args},
-                    )
-                tool_calls.clear()
+                if delta and delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tool_calls:
+                            tool_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                        if tc_delta.id:
+                            tool_calls[idx]["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                tool_calls[idx]["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                tool_calls[idx]["arguments"] += tc_delta.function.arguments
+
+                if choice.finish_reason is not None:
+                    finish_reason = choice.finish_reason
+
+                if choice.finish_reason == "tool_calls":
+                    for tc in tool_calls.values():
+                        yield LLMStreamChunk(type="tool_use", tool_call=self._parsed_tool_call(tc))
+                    tool_calls.clear()
+        finally:
+            # A plain ``async for`` never calls the SDK stream's ``__aexit__``, so a
+            # consumer that stops early (cancellation, host-side break, error) would
+            # leave the HTTP response and its connection open until GC. Close it
+            # explicitly; best-effort, because teardown must not mask the real result.
+            await self._close_stream(response)
 
         # Post-loop flush: yield any remaining tool calls not yet emitted
         if tool_calls:
             for tc in tool_calls.values():
-                try:
-                    parsed_args = json.loads(tc["arguments"]) if tc["arguments"] else {}
-                except json.JSONDecodeError:
-                    parsed_args = {}
-                yield LLMStreamChunk(
-                    type="tool_use",
-                    tool_call={"id": tc["id"], "name": tc["name"], "input": parsed_args},
-                )
+                yield LLMStreamChunk(type="tool_use", tool_call=self._parsed_tool_call(tc))
+
+        # A terminal is only reported when the provider actually reported
+        # something: a finish reason or a usage frame. Model id and response id
+        # appear on every frame, so they prove the stream started, not that it
+        # finished — a connection dropped mid-stream has them and nothing else, and
+        # emitting a carrier there would manufacture the "clean stop" this path
+        # exists to avoid. Consumers keep their delta-derived state instead.
+        if finish_reason is not None or usage is not None:
+            yield LLMStreamChunk(
+                type="response",
+                response=LLMResponse(
+                    content="".join(text_parts),
+                    model=model or self.model,
+                    usage=usage,
+                    finish_reason=finish_reason,
+                    reasoning_tokens=reasoning_tokens,
+                    response_id=response_id,
+                ),
+            )
+
+    @staticmethod
+    async def _close_stream(stream: Any) -> None:
+        """Best-effort release of a provider SDK stream's HTTP response.
+
+        Needed because a plain ``async for`` over an OpenAI SDK stream never runs
+        the stream object's ``__aexit__``: the connection is only released when the
+        body is read to completion or ``close()`` is called. A consumer that stops
+        early (cancellation, host-side break, mid-stream error) would otherwise hold
+        the response open until garbage collection. Failures are logged, never
+        raised, so teardown cannot mask the real result of the turn.
+        """
+        await close_stream(stream)
+
+    @staticmethod
+    def _parsed_tool_call(tc: dict) -> dict:
+        """Turn an accumulated tool-call delta into a wire-shaped tool call dict."""
+        try:
+            parsed_args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+        except json.JSONDecodeError:
+            parsed_args = {}
+        return {"id": tc["id"], "name": tc["name"], "input": parsed_args}
 
     def _prepare_tools_for_responses(self, tools: list) -> list[dict]:
         """Convert tools to Responses API format (flat, no function wrapper)."""
@@ -963,11 +1156,12 @@ class OpenAICompatibleProvider(LLMProvider):
 
         For gpt-5+, o3+, o4+ models. Tool calls arrive complete.
         """
+        timeout = kwargs.get("timeout")
         _, openai_messages = self.prepare_messages(messages)
         responses_input = self._convert_to_responses_input(openai_messages)
 
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ["json_mode"] and v is not None}
-        filtered_kwargs = self._filter_params_for_model(self.model, filtered_kwargs)
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ["json_mode", "timeout"] and v is not None}
+        filtered_kwargs = self._filter_params_for_model(self.model, filtered_kwargs, api="responses")
 
         request_kwargs = {"model": self.model, "input": responses_input, "stream": True, **filtered_kwargs}
 
@@ -983,35 +1177,181 @@ class OpenAICompatibleProvider(LLMProvider):
         if tools:
             request_kwargs["tools"] = self._prepare_tools_for_responses(tools)
 
-        stream = await self.client.responses.create(
-            **request_kwargs,
-            timeout=httpx.Timeout(self.DEFAULT_TIMEOUT_SECONDS),
+        # Opt in to encrypted reasoning state when it can actually be replayed.
+        # Only the Responses path can splice items back into input[], and only
+        # the terminal carrier below can recover them from a stream — so ask for
+        # them under the same conditions as _chat_via_responses: replay enabled
+        # and not already proven unsupported by this account/endpoint. Caller
+        # supplied include entries are preserved.
+        wants_include = _replay_enabled() and not self._include_unsupported
+        if wants_include:
+            existing_include = list(request_kwargs.get("include") or [])
+            if "reasoning.encrypted_content" not in existing_include:
+                request_kwargs["include"] = existing_include + ["reasoning.encrypted_content"]
+
+        try:
+            stream = await self.client.responses.create(
+                **request_kwargs,
+                timeout=httpx.Timeout(timeout or self.DEFAULT_TIMEOUT_SECONDS),
+            )
+        except BadRequestError as e:
+            # Same sticky one-shot degradation as the non-streaming path: a
+            # rejected include flag must not fail the user's turn when the
+            # account has no encrypted-reasoning access.
+            if wants_include and _looks_like_include_rejection(e):
+                logger.warning(
+                    "responses.create(stream) rejected include=reasoning.encrypted_content; falling back to summary-only reasoning capture",
+                    error=str(e),
+                )
+                self._include_unsupported = True
+                request_kwargs.pop("include", None)
+                stream = await self.client.responses.create(
+                    **request_kwargs,
+                    timeout=httpx.Timeout(timeout or self.DEFAULT_TIMEOUT_SECONDS),
+                )
+            else:
+                raise
+
+        try:
+            async for event in stream:
+                if event.type == "response.output_text.delta":
+                    yield LLMStreamChunk(type="text_delta", content=event.delta)
+
+                elif event.type == "response.output_item.done":
+                    item = event.item
+                    if getattr(item, "type", None) == "function_call":
+                        try:
+                            parsed_args = json.loads(item.arguments) if item.arguments else {}
+                        except json.JSONDecodeError:
+                            parsed_args = {}
+                        yield LLMStreamChunk(
+                            type="tool_use",
+                            tool_call={
+                                "id": item.call_id,
+                                "name": item.name,
+                                "input": parsed_args,
+                            },
+                        )
+
+                elif event.type in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
+                    # Both summary deltas (when reasoning.summary="auto") and raw reasoning
+                    # text deltas (trusted access) carry .delta strings; surface as "thinking".
+                    yield LLMStreamChunk(type="thinking", content=event.delta)
+
+                elif event.type == "response.completed":
+                    # Terminal metadata carrier. The completed event is the only place
+                    # reasoning items, the response id, and final usage appear on the
+                    # wire — none of them are expressible as deltas, so without this
+                    # the streaming path cannot preserve replay state or report real
+                    # usage. Text/tool deltas above are already emitted; this chunk
+                    # carries metadata only.
+                    completion = getattr(event, "response", None)
+                    if completion is not None:
+                        yield LLMStreamChunk(
+                            type="response",
+                            response=self._final_response_from_streamed(completion),
+                        )
+
+                elif event.type == "response.incomplete":
+                    # The provider reported a real, non-success terminal status: the
+                    # request succeeded but was cut short (max_output_tokens, content
+                    # filter, ...). It is NOT a fabricated success and MUST NOT be
+                    # reported as finish_reason="stop", but it is also not an infra
+                    # failure to retry — re-sending reproduces the same truncation.
+                    # Emit the honest terminal carrier; the consumer decides whether the
+                    # partial output is acceptable for its turn.
+                    completion = getattr(event, "response", None)
+                    if completion is not None:
+                        carrier = self._final_response_from_streamed(completion)
+                        logger.warning(
+                            "responses_stream_incomplete",
+                            model=self.model,
+                            finish_reason=carrier.finish_reason,
+                        )
+                        yield LLMStreamChunk(type="response", response=carrier)
+                    else:
+                        logger.warning("responses_stream_incomplete_without_response", model=self.model)
+
+                elif event.type == "response.failed":
+                    # A genuine turn failure. The installed SDK does not raise for this
+                    # event: iterating the stream simply stops, so without this branch a
+                    # failed turn looked like a clean short response. Raise a typed error
+                    # and carry the terminal response so the caller can still journal real
+                    # accounting instead of losing it with the exception.
+                    completion = getattr(event, "response", None)
+                    raise self._responses_stream_error(completion, "response.failed")
+
+                elif event.type == "error":
+                    # Top-level SDK service error frames do not raise automatically.
+                    raise self._responses_stream_error(
+                        None,
+                        getattr(event, "message", None) or "error",
+                        code=getattr(event, "code", None),
+                    )
+        finally:
+            # Same explicit release as _stream_chat_completions: early consumer exit
+            # must not hold the HTTP response open.
+            await self._close_stream(stream)
+
+    def _final_response_from_streamed(self, completion: Any) -> LLMResponse:
+        """Convert a streamed ``response.completed`` payload into an LLMResponse.
+
+        The streamed payload is the same object shape as the non-streaming
+        response, so the conversion helpers are shared. Streamed text/tool deltas
+        are already delivered as chunks; the returned response repeats them so a
+        consumer that only reads the carrier still sees the full turn.
+        """
+        content_parts, reasoning_parts, reasoning_items, function_call_items = _extract_responses_output(completion)
+
+        tool_calls: list = _responses_tool_calls(function_call_items)
+
+        usage, reasoning_tokens = _responses_usage(completion)
+
+        return LLMResponse(
+            content="".join(content_parts),
+            model=getattr(completion, "model", None) or self.model,
+            usage=usage,
+            finish_reason=_responses_finish_reason(completion, function_call_items),
+            tool_calls=tool_calls or None,
+            reasoning_tokens=reasoning_tokens,
+            reasoning_content="".join(reasoning_parts) or None,
+            reasoning_items=reasoning_items or None,
+            response_id=getattr(completion, "id", None),
         )
 
-        async for event in stream:
-            if event.type == "response.output_text.delta":
-                yield LLMStreamChunk(type="text_delta", content=event.delta)
+    def _responses_stream_error(self, completion: Any, fallback_message: str, code: str | None = None) -> ProviderError:
+        """Build the typed exception for a failed/errored Responses stream.
 
-            elif event.type == "response.output_item.done":
-                item = event.item
-                if getattr(item, "type", None) == "function_call":
-                    try:
-                        parsed_args = json.loads(item.arguments) if item.arguments else {}
-                    except json.JSONDecodeError:
-                        parsed_args = {}
-                    yield LLMStreamChunk(
-                        type="tool_use",
-                        tool_call={
-                            "id": item.call_id,
-                            "name": item.name,
-                            "input": parsed_args,
-                        },
-                    )
+        Maps server-side context overflow to :class:`PromptTooLongError` so the
+        caller's reactive-compaction path still runs; everything else becomes a
+        :class:`ProviderError` classified by ``LLMCaller`` (transient vs permanent)
+        from its code/message.
 
-            elif event.type in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
-                # Both summary deltas (when reasoning.summary="auto") and raw reasoning
-                # text deltas (trusted access) carry .delta strings; surface as "thinking".
-                yield LLMStreamChunk(type="thinking", content=event.delta)
+        The terminal response, when the provider supplied one, is attached to
+        ``ProviderError.terminal_response`` — a failed turn still has real usage,
+        cache counters, response id and model worth journaling.
+        """
+        err_code = code
+        err_msg = fallback_message
+        terminal: LLMResponse | None = None
+
+        if completion is not None:
+            terminal = self._final_response_from_streamed(completion)
+            error = getattr(completion, "error", None)
+            if error is not None:
+                err_code = err_code or getattr(error, "code", None)
+                err_msg = getattr(error, "message", None) or err_msg
+            incomplete_details = getattr(completion, "incomplete_details", None)
+            if incomplete_details is not None:
+                err_code = err_code or getattr(incomplete_details, "reason", None)
+
+        message = f"OpenAI-compatible stream failed: {err_code or ''} {err_msg}".strip()
+        if err_code == "context_length_exceeded":
+            # Oversized prompt → typed so LLMCaller triggers reactive compaction.
+            return PromptTooLongError(message, terminal_response=terminal)
+        # "max_output_tokens" (and anything else) is truncation/service failure, not
+        # an oversized prompt: it must not be mistaken for a compaction trigger.
+        return ProviderError(message, terminal_response=terminal)
 
     def _responses_api_supported(self) -> bool:
         """Whether the underlying endpoint exposes the Responses API at all.

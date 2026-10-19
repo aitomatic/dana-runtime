@@ -3,13 +3,29 @@ Compression engine mixin for CompressedTimeline.
 
 Provides CompressionMixin with all compression-related methods:
 needs_compression, get_entries_to_keep_and_compress, compress, compress_async,
-_apply_compression, build_compression_prompt, etc.
+reactive_compact, reactive_compact_async, _apply_compression,
+build_compression_prompt, etc.
+
+Two seams own reactive compaction state differently, and neither leaves a writer
+behind a caller that has gone away:
+
+* ``reactive_compact`` is synchronous: the caller blocks for the whole run,
+  summarizer included, so every mutation is on its own thread.
+* ``reactive_compact_async`` is for awaited callers: it mutates only on the
+  awaiting thread (the bounded drop prefix synchronously, then the commit after
+  the summarizer returns), awaits an async summarizer in place so cancellation
+  reaches the provider, and joins rather than abandons an unavoidable blocking
+  sync summarizer.
 """
 
 from __future__ import annotations
 
+import asyncio
+from collections import deque
+from collections.abc import Callable
 from datetime import datetime
-from typing import TYPE_CHECKING
+import inspect
+from typing import TYPE_CHECKING, Any
 
 from structlog import get_logger
 
@@ -18,6 +34,7 @@ from dana.core.timeline.native_message import (
     COMPRESSED_CONTEXT_KEY,
     COMPRESSED_ENTRIES_COUNT_KEY,
     COMPRESSION_TIMESTAMP_KEY,
+    NATIVE_SOURCE_ENTRY_KEY,
     NativeMessage,
 )
 from dana.core.timeline.timeline import TimelineEntry, TimelineEntryType
@@ -85,6 +102,10 @@ class CompressionMixin:
         passed at construction wins; otherwise fall back to env-resolved
         `resolve_trigger_tokens()` (default 150000, env DANA_COMPACT_TRIGGER_TOKENS).
 
+        ``messages_est`` comes from the timeline's incremental accounting
+        (``get_native_token_estimate``), so an ordinary append-only turn is
+        O(new message) here rather than a full retained-history recount.
+
         Optional `system_tokens_fn` / `tools_tokens_fn` callbacks fold system
         prompt and tools-schema size into the estimate. Callbacks are invoked
         defensively via `_safe_call_tokens_fn`.
@@ -96,7 +117,7 @@ class CompressionMixin:
         if len(self._native_messages) <= self._compressed_config.max_recent_entries_to_keep:
             return False
 
-        messages_est = self._estimate_native_messages_list_tokens(self._native_messages)
+        messages_est = self.get_native_token_estimate()
         sys_est = self._safe_call_tokens_fn(self._system_tokens_fn)
         tools_est = self._safe_call_tokens_fn(self._tools_tokens_fn)
 
@@ -262,8 +283,9 @@ class CompressionMixin:
         if len(self._native_messages) <= keep_recent:
             return False
 
-        # Pre-shrink tokens (messages only — same estimate as needs_compression).
-        pre_tokens = self._estimate_native_messages_list_tokens(self._native_messages)
+        # Pre-shrink tokens come from the incremental accounting — same estimate
+        # as needs_compression, without rescanning the retained history.
+        pre_tokens = self.get_native_token_estimate()
         if pre_tokens < trigger:
             return False
 
@@ -304,23 +326,29 @@ class CompressionMixin:
         if (pre_tokens - predicted_savings) >= trigger:
             return False
 
-        # Stub eligible TimelineEntry and matching NativeMessage in place.
-        stubbed_ids: set[str] = set()
-        for idx in eligible_indices:
-            entry = self.timeline[idx]
-            entry.content = SHRINK_STUB_CONTENT
-            if entry.tool_call_id:
-                stubbed_ids.add(entry.tool_call_id)
+        # Stub eligible TimelineEntry and matching NativeMessage in place,
+        # folding the exact token delta of each replacement into the
+        # incremental accounting (the stub is shorter than the payload).
+        with self._state_lock:
+            stubbed_ids: set[str] = set()
+            for idx in eligible_indices:
+                entry = self.timeline[idx]
+                entry.content = SHRINK_STUB_CONTENT
+                if entry.tool_call_id:
+                    stubbed_ids.add(entry.tool_call_id)
 
-        for nm in self._native_messages:
-            if nm.role == "tool" and nm.tool_call_id and nm.tool_call_id in stubbed_ids and nm.content != SHRINK_STUB_CONTENT:
-                nm.content = SHRINK_STUB_CONTENT
+            for nm in self._native_messages:
+                if nm.role == "tool" and nm.tool_call_id and nm.tool_call_id in stubbed_ids and nm.content != SHRINK_STUB_CONTENT:
+                    nm.content = SHRINK_STUB_CONTENT
+                    after = self._estimate_native_message_tokens(nm)
+                    marker_was_valid = self._token_marker_valid()
+                    self._apply_message_token_delta(nm, after, marker_was_valid=marker_was_valid)
 
-        # Pair integrity safety net — tool_call_ids preserved so this is a no-op
-        # in practice, but runs for defense in depth.
-        self._ensure_tool_pair_integrity(self.timeline)
+            # Pair integrity safety net — tool_call_ids preserved so this is a no-op
+            # in practice, but runs for defense in depth.
+            self._ensure_tool_pair_integrity(self.timeline)
 
-        post_tokens = self._estimate_native_messages_list_tokens(self._native_messages)
+        post_tokens = self.get_native_token_estimate()
         logger.info(
             "cheap_shrink_tool_results",
             entries_stubbed=len(eligible_indices),
@@ -452,16 +480,32 @@ class CompressionMixin:
         Returns:
             Prompt string for summarization, or None if compression not needed
         """
-        _, entries_to_compress = self.get_entries_to_keep_and_compress()
-
-        if not entries_to_compress:
+        plan = self._plan_compression()
+        if plan is None:
             return None
+        entries_to_compress, prompt, plan_generation = plan
 
+        # Remember what this prompt describes so a commit after the summary call
+        # (``compress_old_entries`` — the pattern used by hosts that own their own
+        # summarizer call) validates against it instead of re-partitioning a
+        # timeline that may have moved on. See ``_pending_compression_plan``.
+        with self._state_lock:
+            self._pending_compression_plan = (entries_to_compress, plan_generation)
+
+        return prompt
+
+    def _render_compression_prompt(self: CompressedTimeline, entries_to_compress: list[TimelineEntry]) -> str:
+        """Render the summarization prompt for an explicit compress partition.
+
+        Split out of ``build_compression_prompt`` so compaction can render the
+        prompt for the very partition it plans to commit, instead of
+        re-deriving (and re-scanning) the partition a second time.
+        """
         # Format entries for compression prompt
         formatted_entries = self._format_entries_for_compression(entries_to_compress)
 
         # Claude Code style compression prompt
-        prompt = f"""You are compressing conversation history to preserve important context.
+        return f"""You are compressing conversation history to preserve important context.
 
 Create a concise summary that captures:
 1. Key facts, decisions, and outcomes
@@ -478,8 +522,6 @@ Conversation history to compress:
 
 Respond with ONLY a JSON object containing the summary:
 {{"summary": "Your compressed context summary here"}}"""
-
-        return prompt
 
     def _format_entries_for_compression(self: CompressedTimeline, entries: list[TimelineEntry]) -> str:
         """
@@ -548,14 +590,24 @@ Respond with ONLY a JSON object containing the summary:
         3. Stores compressed context in metadata of oldest kept entry
         4. Removes compressed entries
 
+        The summarizer call is not made under a lock (the default call function
+        re-enters the runtime, so holding ``_compact_sync_lock`` across it could
+        self-deadlock); the commit that follows is validated against the planned
+        partition, so a concurrent mutation from another thread cannot be
+        silently dropped.
+
         Returns:
             Number of entries compressed
 
         Raises:
             RuntimeError: If LLM call function is not set and no agent runtime available
         """
-        # Use provided function or fall back to agent runtime
-        llm_call_fn = self._llm_call_fn or self._get_default_llm_call_fn()
+        # Use provided function or fall back to agent runtime. Explicit intent is
+        # ``is None``, not truthiness: a configured callable is the caller's
+        # chosen summarizer even if it happens to define a false bool.
+        llm_call_fn = self._llm_call_fn
+        if llm_call_fn is None:
+            llm_call_fn = self._get_default_llm_call_fn()
         if llm_call_fn is None:
             raise RuntimeError(
                 "LLM call function not set and no agent runtime available. "
@@ -573,17 +625,17 @@ Respond with ONLY a JSON object containing the summary:
                 if self.cheap_shrink_tool_results():
                     return 0
 
-        entries_to_keep, entries_to_compress = self.get_entries_to_keep_and_compress()
-
-        if not entries_to_compress:
+        plan = self._plan_compression()
+        if plan is None:
             return 0
 
-        # Build compression prompt
-        prompt = self.build_compression_prompt()
-        if not prompt:
-            return 0
+        entries_to_compress, prompt, plan_generation = plan
 
-        # Call LLM to get summary
+        # Call LLM to get summary. Deliberately not under a lock: the default
+        # call function re-enters the runtime (and so this timeline's
+        # compaction paths on PromptTooLongError), which a held sync lock would
+        # turn into a self-deadlock. Concurrent commits are resolved by the
+        # plan validation in ``_apply_compression`` instead.
         try:
             response = llm_call_fn(prompt)
             summary = self._extract_summary_from_response(response)
@@ -595,8 +647,13 @@ Respond with ONLY a JSON object containing the summary:
             logger.warning("LLM returned empty summary, skipping compression")
             return 0
 
-        # Store compressed context in metadata of oldest kept entry
-        compressed_count = self._apply_compression(entries_to_keep, entries_to_compress, summary)
+        # Commit against the plan, validating that nothing else mutated the
+        # model-facing state since the partition was captured.
+        compressed_count = self._apply_compression(
+            entries_to_compress,
+            summary,
+            plan_generation=plan_generation,
+        )
 
         logger.info(
             f"Compressed {compressed_count} timeline entries",
@@ -611,14 +668,23 @@ Respond with ONLY a JSON object containing the summary:
         """
         Perform compression on the timeline asynchronously.
 
+        The summarizer is awaited, so other tasks can mutate the timeline while
+        it runs. The plan captured before the await is committed afterwards
+        through the validated ``_apply_compression`` commit: entries appended
+        meanwhile are retained, and a plan whose projection was replaced
+        wholesale (hydration/load) is discarded instead of overwriting it.
+
         Returns:
             Number of entries compressed
 
         Raises:
             RuntimeError: If async LLM call function is not set and no agent runtime available
         """
-        # Use provided function or fall back to agent runtime
-        llm_call_async_fn = self._llm_call_async_fn or self._get_default_llm_call_async_fn()
+        # Use provided function or fall back to agent runtime. Explicit intent is
+        # ``is None``, not truthiness (see ``compress``).
+        llm_call_async_fn = self._llm_call_async_fn
+        if llm_call_async_fn is None:
+            llm_call_async_fn = self._get_default_llm_call_async_fn()
         if llm_call_async_fn is None:
             raise RuntimeError(
                 "Async LLM call function not set and no agent runtime available. "
@@ -634,15 +700,11 @@ Respond with ONLY a JSON object containing the summary:
                 if self.cheap_shrink_tool_results():
                     return 0
 
-        entries_to_keep, entries_to_compress = self.get_entries_to_keep_and_compress()
-
-        if not entries_to_compress:
+        plan = self._plan_compression()
+        if plan is None:
             return 0
 
-        # Build compression prompt
-        prompt = self.build_compression_prompt()
-        if not prompt:
-            return 0
+        entries_to_compress, prompt, plan_generation = plan
 
         # Call LLM to get summary
         try:
@@ -656,8 +718,13 @@ Respond with ONLY a JSON object containing the summary:
             logger.warning("LLM returned empty summary, skipping compression")
             return 0
 
-        # Store compressed context in metadata of oldest kept entry
-        compressed_count = self._apply_compression(entries_to_keep, entries_to_compress, summary)
+        # Commit under the async lock, validating the captured plan.
+        async with self._compact_lock:
+            compressed_count = self._apply_compression(
+                entries_to_compress,
+                summary,
+                plan_generation=plan_generation,
+            )
 
         logger.info(
             f"Compressed {compressed_count} timeline entries",
@@ -668,103 +735,276 @@ Respond with ONLY a JSON object containing the summary:
 
         return compressed_count
 
+    def _plan_compression(
+        self: CompressedTimeline,
+    ) -> tuple[list[TimelineEntry], str, int] | None:
+        """Capture the compress partition, its prompt, and the projection generation.
+
+        All three come from a single read of the live state, so the summary is
+        generated for exactly the entries the commit will replace, and the commit
+        can tell whether the projection it was planned against still exists.
+        Returns ``None`` when nothing should be compressed.
+
+        The retained set is deliberately *not* captured: the commit retains every
+        live entry the summarizer did not see, which is what makes entries
+        appended while the summarizer ran survive.
+        """
+        with self._state_lock:
+            _, entries_to_compress = self.get_entries_to_keep_and_compress()
+            if not entries_to_compress:
+                return None
+            prompt = self._render_compression_prompt(entries_to_compress)
+            return entries_to_compress, prompt, self._compaction_generation
+
     # ------------------------------------------------------------------
     # Apply compression & extract summary
     # ------------------------------------------------------------------
 
     def _apply_compression(
         self: CompressedTimeline,
-        entries_to_keep: list[TimelineEntry],
         entries_to_compress: list[TimelineEntry],
         summary: str,
+        *,
+        plan_generation: int | None = None,
     ) -> int:
         """
-        Apply compression by storing summary and updating timeline and native messages.
+        Commit a compaction: store the summary and install the retained projection.
 
-        This method updates both the legacy TimelineEntry list (self.timeline) and the
-        native message list (self._native_messages) to maintain consistency.
+        This method updates both the legacy TimelineEntry list (``self.timeline``)
+        and the native message list (``self._native_messages``) so the two cannot
+        drift apart.
 
-        For native messages:
-        - Creates a summary NativeMessage with role='system'
-        - Preserves recent NativeMessages (within max_recent_entries_to_keep)
-        - Removes compressed native messages
+        The commit is exact: only the entries the summarizer actually saw
+        (``entries_to_compress``, matched by object identity) are replaced by the
+        summary; every other live entry — including ones appended while an awaited
+        summarizer ran — is retained. A commit planned against a projection that
+        has since been replaced wholesale (``plan_generation`` mismatch) is
+        discarded with a warning rather than resurrecting the replaced history.
 
         Args:
-            entries_to_keep: Entries to preserve
-            entries_to_compress: Entries being compressed
+            entries_to_compress: Entries the summary was generated from; defines
+                exactly what this commit may remove.
             summary: The compressed summary
+            plan_generation: ``_compaction_generation`` observed when the partition
+                was planned. ``None`` for callers that plan and commit without
+                suspending (they get the identity check alone).
 
         Returns:
-            Number of entries compressed
+            Number of entries compressed (0 when the commit was discarded)
         """
-        compressed_count = len(entries_to_compress)
         compression_timestamp = datetime.now()
 
-        # Stamp so the next save() rolls the active snapshot to a new
-        # `timeline-after-compress-{ts}.json` file. See
-        # ``CompressedTimeline.save`` for the snapshot rollover logic.
-        self._last_compression_at = compression_timestamp
+        with self._state_lock:
+            # Any recorded prompt plan describes a partition this commit
+            # supersedes; drop it so it cannot be replayed later.
+            self._pending_compression_plan = None
 
-        # Calculate how many native messages to keep
-        # We need to keep messages corresponding to entries_to_keep
-        native_messages_to_keep_count = len(entries_to_keep)
+            if plan_generation is not None and plan_generation != self._compaction_generation:
+                # The projection was replaced wholesale (hydration/load/another
+                # commit) while this summary was being produced. Committing would
+                # resurrect the replaced history.
+                logger.warning(
+                    "compaction_commit_discarded",
+                    reason="projection_replaced",
+                    planned_entries=len(entries_to_compress),
+                    live_entries=len(self.timeline),
+                )
+                return 0
 
-        # Compose summary metadata from scratch (no reasoning_items / encrypted_content
-        # leak from compressed-away entries — those are stale state that doesn't
-        # belong in the summary anyway, and the summary text already encodes outcomes).
-        # Explicit dict construction here is the no-leak guarantee.
-        summary_metadata = {
-            COMPRESSED_CONTEXT_KEY: summary,
-            COMPRESSION_TIMESTAMP_KEY: compression_timestamp.isoformat(),
-            COMPRESSED_ENTRIES_COUNT_KEY: compressed_count,
-        }
+            # Exact by object identity, and count-aware: if the same entry object
+            # is live more than once (a caller re-adding an existing entry) only
+            # the planned occurrences are removed, so an append during the
+            # summarizer is never mistaken for a planned one.
+            planned_remaining: dict[int, int] = {}
+            for entry in entries_to_compress:
+                key = id(entry)
+                planned_remaining[key] = planned_remaining.get(key, 0) + 1
 
-        # Create summary as a NativeMessage with role='system'
-        summary_native_message = NativeMessage(
-            role="system",
-            content=f"[SUMMARY] {summary}",
-            metadata=dict(summary_metadata),
-            timestamp=compression_timestamp,
-        )
+            live = self.timeline
+            retained_flags: list[bool] = []
+            new_keep: list[TimelineEntry] = []
+            for entry in live:
+                key = id(entry)
+                if planned_remaining.get(key, 0) > 0:
+                    planned_remaining[key] -= 1
+                    retained_flags.append(False)
+                    continue
+                retained_flags.append(True)
+                new_keep.append(entry)
 
-        if not entries_to_keep:
-            # Edge case: create a summary entry if nothing to keep
-            summary_entry = TimelineEntry(
-                entry_type=TimelineEntryType.TIMELINE_SUMMARY,
-                content=summary,
-                timestamp=entries_to_compress[0].timestamp if entries_to_compress else compression_timestamp,
+            compressed_count = len(live) - len(new_keep)
+            if compressed_count == 0:
+                logger.warning(
+                    "compaction_commit_discarded",
+                    reason="planned_entries_no_longer_present",
+                    planned_entries=len(entries_to_compress),
+                    live_entries=len(live),
+                )
+                return 0
+
+            # Stamp so the next save() rolls the active snapshot to a new
+            # `timeline-after-compress-{ts}.json` file. See
+            # ``CompressedTimeline.save`` for the snapshot rollover logic.
+            self._last_compression_at = compression_timestamp
+
+            # Compose summary metadata from scratch (no reasoning_items / encrypted_content
+            # leak from compressed-away entries — those are stale state that doesn't
+            # belong in the summary anyway, and the summary text already encodes outcomes).
+            # Explicit dict construction here is the no-leak guarantee.
+            summary_metadata = {
+                COMPRESSED_CONTEXT_KEY: summary,
+                COMPRESSION_TIMESTAMP_KEY: compression_timestamp.isoformat(),
+                COMPRESSED_ENTRIES_COUNT_KEY: compressed_count,
+            }
+
+            # Create summary as a NativeMessage with role='system'
+            summary_native_message = NativeMessage(
+                role="system",
+                content=f"[SUMMARY] {summary}",
                 metadata=dict(summary_metadata),
+                timestamp=compression_timestamp,
             )
-            self.timeline = [summary_entry]
 
-            # Update native messages: only the summary
-            self._native_messages = [summary_native_message]
+            if not new_keep:
+                # Edge case: create a summary entry if nothing to keep
+                summary_entry = TimelineEntry(
+                    entry_type=TimelineEntryType.TIMELINE_SUMMARY,
+                    content=summary,
+                    timestamp=entries_to_compress[0].timestamp if entries_to_compress else compression_timestamp,
+                    metadata=dict(summary_metadata),
+                )
+                self._install_model_state([summary_entry], [summary_native_message])
+                return compressed_count
 
-            return compressed_count
+            # Store compressed context in metadata of the oldest retained entry.
+            # Ephemeral carriers are skipped: they are excluded from snapshots and
+            # the next ``set_context`` replaces them, either of which would take
+            # the marker (and so the reload cutoff) with it. Any retained entries
+            # before that carrier are ephemeral too, so cutting at the carrier on
+            # reload drops nothing that was persisted.
+            carrier_idx = self._summary_carrier_index(retained_flags, live)
+            oldest_kept = live[carrier_idx]
+            oldest_kept.metadata[COMPRESSED_CONTEXT_KEY] = summary
+            oldest_kept.metadata[COMPRESSION_TIMESTAMP_KEY] = compression_timestamp.isoformat()
+            oldest_kept.metadata[COMPRESSED_ENTRIES_COUNT_KEY] = compressed_count
 
-        # Store compressed context in metadata of the oldest kept entry
-        oldest_kept = entries_to_keep[0]
-        oldest_kept.metadata[COMPRESSED_CONTEXT_KEY] = summary
-        oldest_kept.metadata[COMPRESSION_TIMESTAMP_KEY] = compression_timestamp.isoformat()
-        oldest_kept.metadata[COMPRESSED_ENTRIES_COUNT_KEY] = compressed_count
+            # Map the retained entries onto their native mirrors by identity, not
+            # by position or tail length (see ``_rebuild_native_mirrors``). The
+            # marker then goes on the carrier's own mirror.
+            mirrors = self._rebuild_native_mirrors(live, retained_flags)
+            carrier_message = mirrors[retained_flags[: carrier_idx + 1].count(True) - 1]
 
-        # Update timeline to only contain kept entries
-        self.timeline = entries_to_keep
+            message_metadata = carrier_message.metadata
+            if message_metadata is None:
+                message_metadata = carrier_message.metadata = {}
+            message_metadata[COMPRESSED_CONTEXT_KEY] = summary
+            message_metadata[COMPRESSION_TIMESTAMP_KEY] = compression_timestamp.isoformat()
+            message_metadata[COMPRESSED_ENTRIES_COUNT_KEY] = compressed_count
 
-        # Update native messages: summary + recent messages
-        # Get the native messages corresponding to kept entries (from the end)
-        recent_native_messages = self._native_messages[-native_messages_to_keep_count:] if native_messages_to_keep_count > 0 else []
-
-        # Also update metadata on the first kept native message
-        if recent_native_messages:
-            recent_native_messages[0].metadata[COMPRESSED_CONTEXT_KEY] = summary
-            recent_native_messages[0].metadata[COMPRESSION_TIMESTAMP_KEY] = compression_timestamp.isoformat()
-            recent_native_messages[0].metadata[COMPRESSED_ENTRIES_COUNT_KEY] = compressed_count
-
-        # New native messages list: summary + kept native messages
-        self._native_messages = [summary_native_message] + recent_native_messages
+            self._install_model_state(new_keep, [summary_native_message] + mirrors)
 
         return compressed_count
+
+    @staticmethod
+    def _suffix_retention_flags(live: list[TimelineEntry], retained: list[TimelineEntry]) -> list[bool]:
+        """Which live occurrences survive a right-truncating retention step.
+
+        ``reactive_compact`` keeps a suffix of ``live`` (plus, via
+        ``_ensure_tool_pair_integrity``, a contiguous run of entries immediately
+        before it). Matching by identity *set* would wrongly mark an earlier
+        removed occurrence of an entry that is retained later as retained, and
+        that removed occurrence would then consume a mirror that belongs to the
+        retained one. Counting occurrences from the right instead marks exactly
+        the retained occurrences, without assuming the two lists are aligned.
+
+        Returns:
+            One flag per ``live`` entry, in order.
+        """
+        remaining: dict[int, int] = {}
+        for entry in retained:
+            key = id(entry)
+            remaining[key] = remaining.get(key, 0) + 1
+
+        flags: list[bool] = [False] * len(live)
+        for index in range(len(live) - 1, -1, -1):
+            key = id(live[index])
+            if remaining.get(key, 0) > 0:
+                remaining[key] -= 1
+                flags[index] = True
+        return flags
+
+    def _rebuild_native_mirrors(
+        self: CompressedTimeline,
+        live: list[TimelineEntry],
+        retained_flags: list[bool],
+    ) -> list[NativeMessage]:
+        """Replace the native projection with the mirrors of the retained entries.
+
+        The two model-facing lists cannot be assumed index-aligned: a compaction
+        prepends a summary message, ``set_context`` prepends a context entry to
+        both, and callers may inject into either. So each retained entry is mapped
+        to the message built from it (``NATIVE_SOURCE_ENTRY_KEY`` backlink, matched
+        by identity and count-aware for entries added twice), which preserves that
+        message's reasoning items, tool calls and replay state.
+
+        A retained entry with no tagged mirror (messages that never came through
+        ``_timeline_entry_to_native_message``, e.g. decoded from a snapshot that
+        dropped the backlink) is rebuilt from its entry — the conservative path:
+        nothing retained is lost, no compressed-away message is resurrected, and
+        the cost is that rebuild only.
+
+        Returns:
+            The installed mirrors, in retained-entry order. Callers hold
+            ``_state_lock`` (it is an RLock) while they replace the entry
+            projection alongside this one.
+        """
+        messages_by_entry_id: dict[int, deque[NativeMessage]] = {}
+        for message in self._native_messages:
+            source_entry = (message.metadata or {}).get(NATIVE_SOURCE_ENTRY_KEY)
+            if source_entry is None:
+                continue
+            messages_by_entry_id.setdefault(id(source_entry), deque()).append(message)
+
+        mirrors: list[NativeMessage] = []
+        rebuilt_any = False
+        for index, entry in enumerate(live):
+            # One mirror is consumed per *live occurrence*, including occurrences
+            # being compressed away: the same entry object can be live more than
+            # once (a caller re-adding it), and skipping the removed occurrences
+            # would hand a retained later occurrence the earlier, compressed-away
+            # occurrence's message.
+            queue = messages_by_entry_id.get(id(entry))
+            message = queue.popleft() if queue else None
+            if not retained_flags[index]:
+                continue
+            if message is None:
+                message = self._timeline_entry_to_native_message(entry)
+                rebuilt_any = True
+            mirrors.append(message)
+
+        if rebuilt_any:
+            logger.warning(
+                "compaction_native_mirror_rebuilt",
+                reason="retained_entry_without_mirror",
+                retained_entries=len(mirrors),
+            )
+
+        self._native_messages = mirrors
+        return mirrors
+
+    def _summary_carrier_index(self: CompressedTimeline, retained_flags: list[bool], live: list[TimelineEntry]) -> int:
+        """Index in ``live`` of the entry that carries the compaction marker.
+
+        The oldest retained entry — except that a retained ephemeral entry (the
+        runtime CONTEXT prepended by ``set_context``) is never used as the carrier:
+        ephemeral entries do not survive persistence and the next ``set_context``
+        replaces them, so a marker placed there would be silently lost.
+        """
+        for index, keep in enumerate(retained_flags):
+            if keep and not live[index].ephemeral:
+                return index
+        # Everything retained is ephemeral: fall back to the first retained entry.
+        return retained_flags.index(True)
 
     def _extract_summary_from_response(self, response: str) -> str | None:
         """
@@ -854,6 +1094,11 @@ Respond with ONLY a JSON object containing the summary:
 
         For CompressedTimeline, this method uses the same logic as _apply_compression()
         but accepts an externally provided summary (e.g., from LLM-based summarization).
+        The caller owns the summarizer call (typically ``build_compression_prompt``
+        → host LLM call → this method). It commits the partition that prompt was
+        built from, recorded by ``build_compression_prompt``, so a summary is never
+        applied to entries it did not include. Falls back to planning here when no
+        prompt was built first, and ``_apply_compression`` validates either way.
 
         Args:
             summary: The summary text to use for the compressed entries
@@ -861,13 +1106,19 @@ Respond with ONLY a JSON object containing the summary:
         Returns:
             Number of entries that were compressed
         """
-        entries_to_keep, entries_to_compress = self.get_entries_to_keep_and_compress()
+        with self._compact_sync_lock:
+            pending = self._pending_compression_plan
+            self._pending_compression_plan = None
+            if pending is not None:
+                # The recorded prompt partition is what the summary was generated
+                # from; commit exactly that.
+                entries_to_compress, plan_generation = pending
+                return self._apply_compression(entries_to_compress, summary, plan_generation=plan_generation)
 
-        if not entries_to_compress:
-            return 0
-
-        # Apply compression with the provided summary
-        return self._apply_compression(entries_to_keep, entries_to_compress, summary)
+            _, entries_to_compress = self.get_entries_to_keep_and_compress()
+            if not entries_to_compress:
+                return 0
+            return self._apply_compression(entries_to_compress, summary)
 
     # ------------------------------------------------------------------
     # Phase 3 — reactive compaction + circuit breaker
@@ -919,72 +1170,354 @@ Respond with ONLY a JSON object containing the summary:
         Drop counts: attempt 1 → 5, 2 → 10, 3 → 20. Always runs the full
         summary path (never shrink-bypass). Raises `CompactCircuitOpenError`
         when the circuit is open and cooldown not elapsed.
+
+        The caller blocks for the whole run, summarizer included, so ownership of
+        every mutation is the caller's own thread. The cancellation-capable
+        :meth:`reactive_compact_async` is the variant for awaited callers.
         """
         from dana.common.llm.types import CompactCircuitOpenError
 
         with self._compact_sync_lock:
-            self._check_circuit_and_probe()
-
-            drop_count = {1: 5, 2: 10, 3: 20}.get(attempt, 20)
-            if len(self.timeline) <= drop_count:
-                drop_count = max(0, len(self.timeline) - 1)
-
-            if drop_count <= 0:
-                # Nothing useful to drop — treat as attempt failure.
-                self._consecutive_compact_failures += 1
-                if self._consecutive_compact_failures >= 3:
-                    self._compaction_disabled = True
-                    self._circuit_opened_at = datetime.now()
-                    raise CompactCircuitOpenError(f"reactive_compact cannot drop entries; timeline={len(self.timeline)}")
-                return
-
-            # Drop oldest N kept entries, then prune forward-orphans.
-            self.timeline = self.timeline[drop_count:]
-            self.timeline = self._remove_forward_orphans(self.timeline)
-            self._ensure_tool_pair_integrity(self.timeline)
-
-            # Mirror truncation on native messages (keep tail of same length).
-            keep_n = len(self.timeline)
-            if keep_n == 0:
-                self._native_messages = []
-            else:
-                self._native_messages = self._native_messages[-keep_n:] if keep_n <= len(self._native_messages) else self._native_messages
-
-            # Re-summarize via internal primitives so failures propagate into the
-            # circuit-breaker counter (compress() swallows exceptions).
             try:
-                llm_call_fn = self._llm_call_fn or self._get_default_llm_call_fn()
-                if llm_call_fn is None:
-                    raise RuntimeError("no LLM call function available for reactive_compact")
-                entries_to_keep, entries_to_compress = self.get_entries_to_keep_and_compress()
-                n = 0
-                if entries_to_compress:
-                    prompt = self.build_compression_prompt()
-                    if prompt:
-                        response = llm_call_fn(prompt)
-                        summary = self._extract_summary_from_response(response)
-                        if not summary:
-                            raise RuntimeError("empty summary from LLM")
-                        n = self._apply_compression(entries_to_keep, entries_to_compress, summary)
-                # Success — close circuit and reset counter.
-                self._consecutive_compact_failures = 0
-                self._compaction_disabled = False
-                self._circuit_opened_at = None
-                logger.info(
-                    "reactive_compact_done",
-                    attempt=attempt,
-                    entries_dropped=drop_count,
-                    entries_compressed=n,
-                )
+                drop_count = self._begin_reactive_compact(attempt)
+                if drop_count <= 0:
+                    return
+                self._reactive_compact_summary(attempt, drop_count, mode="sync")
             except CompactCircuitOpenError:
                 raise
             except Exception as e:
-                self._consecutive_compact_failures += 1
-                if self._consecutive_compact_failures >= 3:
-                    self._compaction_disabled = True
-                    self._circuit_opened_at = datetime.now()
-                    raise CompactCircuitOpenError(f"reactive_compact failed 3x consecutive; last error: {e}") from e
+                failure = self._record_compact_failure(e)
+                if failure is e:
+                    raise
+                raise failure from e
+
+    async def reactive_compact_async(self: CompressedTimeline, attempt: int) -> None:
+        """Awaitable reactive compaction whose mutations stay on the caller's thread.
+
+        Same drop counts and circuit semantics as :meth:`reactive_compact`, but
+        every mutation of the timeline happens on the awaiting thread: the bounded
+        drop prefix runs synchronously (no suspension point inside it), the
+        summarizer is awaited in place, and the commit runs after it returns. An
+        awaiting caller that is cancelled or times out therefore cannot leave a
+        worker thread installing a projection on a timeline it no longer owns.
+
+        Summarizer ownership, in order of preference:
+
+        * an explicitly configured async summarizer (``_llm_call_async_fn``) is
+          awaited directly, so the cancellation reaches the provider, which can
+          abort the request;
+        * an explicitly configured sync summarizer (``_llm_call_fn``) is
+          unavoidable blocking physical work. It is offloaded so the event loop
+          stays responsive, and the await is *joined* rather than abandoned: if
+          this task is cancelled the join still runs to completion before the
+          cancellation is re-raised, and the worker only ever returns the
+          produced text. Cancellation therefore delays the return, it never
+          leaves the run's work unowned;
+        * only when neither callback was configured does the runtime default
+          apply, async first (``call_llm_async``) and then the sync runtime call.
+
+        Raises:
+            CompactCircuitOpenError: circuit open and cooldown unexpired, or a
+                failed run that exhausts the failure budget.
+        """
+        # Phase 1 - bounded drop and plan capture, serialized on the compaction
+        # lock. Synchronous end to end, so this task cannot be suspended between
+        # its steps, and the lock is never held across the summarizer await (an
+        # awaiting caller that is abandoned must not leave the lock held).
+        from dana.common.llm.types import CompactCircuitOpenError
+
+        try:
+            async with self._compact_lock:
+                drop_count = self._begin_reactive_compact(attempt)
+                plan = self._plan_compression() if drop_count > 0 else None
+                if drop_count > 0 and plan is None:
+                    # Nothing left to summarize: the drop is the whole run.
+                    self._close_circuit_after_success(attempt, drop_count, 0, mode="async")
+
+            if drop_count <= 0 or plan is None:
+                return
+
+            # Phase 2 - await the summarizer with no lock held. Nothing mutates
+            # here on any thread, so a cancellation at this point installs nothing.
+            summary = await self._summarize_for_plan(plan)
+
+            # Phase 3 - commit on the awaiting (owner) thread, serialized.
+            async with self._compact_lock:
+                self._commit_reactive_compact(attempt, drop_count, plan, summary, mode="async")
+        except asyncio.CancelledError:
+            # Owner cancellation is not a compaction failure: no commit ran and no
+            # thread of this run is still working, so the circuit stays untouched.
+            raise
+        except CompactCircuitOpenError:
+            raise
+        except Exception as e:
+            failure = self._record_compact_failure(e)
+            if failure is e:
                 raise
+            raise failure from e
+
+    # ------------------------------------------------------------------
+    # Reactive compaction internals (shared by the sync and async seams)
+    # ------------------------------------------------------------------
+
+    def _begin_reactive_compact(self: CompressedTimeline, attempt: int) -> int:
+        """Circuit check + bounded drop prefix. Returns the drop count (0 → done).
+
+        Fully synchronous so neither the sync nor the async seam can be cancelled
+        between its steps. Mutates only through ``_install_model_state``, which
+        takes ``_state_lock``; the caller holds the compaction lock.
+        """
+        from dana.common.llm.types import CompactCircuitOpenError
+
+        self._check_circuit_and_probe()
+
+        drop_count = {1: 5, 2: 10, 3: 20}.get(attempt, 20)
+        if len(self.timeline) <= drop_count:
+            drop_count = max(0, len(self.timeline) - 1)
+
+        if drop_count <= 0:
+            # Nothing useful to drop - treat as attempt failure.
+            self._consecutive_compact_failures += 1
+            if self._consecutive_compact_failures >= 3:
+                self._compaction_disabled = True
+                self._circuit_opened_at = datetime.now()
+                raise CompactCircuitOpenError(f"reactive_compact cannot drop entries; timeline={len(self.timeline)}")
+            return 0
+
+        # Drop the oldest entries, then prune forward-orphans. The native
+        # projection is rebuilt from the entries that actually remain - by
+        # occurrence, not by identity set - rather than by slicing a same-length
+        # tail off ``_native_messages``, which goes wrong as soon as the two lists
+        # differ in length (any prior compaction prepends a summary message).
+        with self._state_lock:
+            new_entries = self._ensure_tool_pair_integrity(self._remove_forward_orphans(self.timeline[drop_count:]))
+            mirrors = self._rebuild_native_mirrors(self.timeline, self._suffix_retention_flags(self.timeline, new_entries))
+            self._install_model_state(new_entries, mirrors)
+        return drop_count
+
+    def _reactive_compact_summary(self: CompressedTimeline, attempt: int, drop_count: int, *, mode: str) -> None:
+        """Synchronous summarizer leg: plan → call → commit → close circuit.
+
+        Used by the sync seam, whose caller blocks for the whole run. ``mode``
+        labels the log event so the two seams stay distinguishable in telemetry.
+
+        As on the async seam, an explicitly configured callback is selected by
+        ``is None``, not truthiness: a falsy callable is still the caller's
+        chosen summarizer and must not be replaced by the runtime default.
+        """
+        llm_call_fn = self._llm_call_fn
+        if llm_call_fn is None:
+            llm_call_fn = self._get_default_llm_call_fn()
+        if llm_call_fn is None:
+            raise RuntimeError("no LLM call function available for reactive_compact")
+        plan = self._plan_compression()
+        n = 0
+        if plan is not None:
+            entries_to_compress, prompt, plan_generation = plan
+            summary = self._reduce_compact_response(llm_call_fn(prompt))
+            if not summary:
+                raise RuntimeError("empty summary from LLM")
+            n = self._apply_compression(
+                entries_to_compress,
+                summary,
+                plan_generation=plan_generation,
+            )
+        self._close_circuit_after_success(attempt, drop_count, n, mode=mode)
+
+    async def _summarize_for_plan(self: CompressedTimeline, plan: tuple[list[TimelineEntry], str, int]) -> str:
+        """Produce the summary text for a captured plan, with no lock held.
+
+        Explicit configuration decides ownership before any runtime default: a
+        summarizer the caller configured is the one that runs. In order of
+        preference:
+
+        * an explicitly configured async summarizer (``_llm_call_async_fn``) is
+          awaited in place, so owner cancellation reaches the provider and
+          nothing of this run is left executing afterwards;
+        * an explicitly configured sync summarizer (``_llm_call_fn``) is
+          unavoidable blocking physical work. It is offloaded to keep the loop
+          responsive, and the await is *joined* rather than abandoned: on
+          cancellation the join still runs to completion before the cancellation
+          propagates, so no thread of this run outlives it. The caller's deadline
+          may overrun by that call's remaining duration - which is honest: a
+          thread cannot be killed, and reporting a bounded return while its work
+          ran on would not be;
+        * only when neither callback was configured does the runtime default
+          apply, async first (``call_llm_async``) and then the sync runtime call.
+
+        A callback counts as configured when it is not ``None``; truthiness is
+        never the test, so an intentionally falsy callable is still honored. An
+        explicit sync callback therefore wins over the runtime's async default
+        rather than being silently replaced by it.
+
+        The worker never touches timeline state: only the returned text crosses the
+        thread boundary, and the commit happens afterwards on the awaiting thread.
+        """
+        _, prompt, _generation = plan
+
+        async_fn = self._llm_call_async_fn
+        if async_fn is not None:
+            return self._require_summary(self._reduce_compact_response(await async_fn(prompt)))
+
+        sync_fn = self._llm_call_fn
+        if sync_fn is not None:
+            return await self._summarize_with_blocking_callback(sync_fn, prompt)
+
+        async_fn = self._get_default_llm_call_async_fn()
+        if async_fn is not None:
+            return self._require_summary(self._reduce_compact_response(await async_fn(prompt)))
+
+        sync_fn = self._get_default_llm_call_fn()
+        if sync_fn is None:
+            raise RuntimeError("no LLM call function available for reactive_compact")
+        return await self._summarize_with_blocking_callback(sync_fn, prompt)
+
+    async def _summarize_with_blocking_callback(
+        self: CompressedTimeline,
+        llm_call_fn: Callable[[str], Any],
+        prompt: str,
+    ) -> str:
+        """Run an un-abortable synchronous summarizer and join it on cancellation.
+
+        Shared by an explicitly configured sync callback and the runtime's sync
+        default, so both keep the same physical-work ownership: the call is
+        offloaded, the await is shielded, and a cancellation waits the worker out
+        before propagating instead of orphaning a thread that only produces text.
+        """
+        task = asyncio.ensure_future(asyncio.to_thread(llm_call_fn, prompt))
+        try:
+            response = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            logger.warning("reactive_compact_sync_summarizer_join", reason="cancelled_during_blocking_summarizer")
+            await self._drain_worker_after_cancel(task)
+            # The owner's cancellation is the outcome that survives: the summary
+            # the drained worker produced (or the failure it raised) is discarded,
+            # never raised in its place.
+            raise
+
+        return self._require_summary(self._reduce_compact_response(response))
+
+    @staticmethod
+    async def _drain_worker_after_cancel(task: asyncio.Task) -> None:
+        """Wait out an un-abortable summarizer worker, discarding its outcome.
+
+        ``asyncio.to_thread`` work cannot be aborted, so the only correct options
+        are to join it or to orphan it; orphan only the *value*, never the work.
+        The worker is therefore waited for to completion, and whatever it then
+        returns or raises is swallowed here.
+
+        This matters for ownership, not just tidiness: if the worker's own failure
+        (a callback raising, say, ``ValueError``) were allowed to propagate out of
+        the join, it would replace the owner's :class:`asyncio.CancelledError` and
+        be mistaken for a compaction failure, wrongly charging the circuit for a
+        run the owner abandoned. A re-cancellation during the wait (a request
+        deadline followed by an owner cancel, or a task group tearing down its
+        children) must not release the worker either, so the join keeps going.
+        """
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                # The worker failed while being joined. That is not the owner's
+                # outcome and must not be raised here.
+                break
+        # Retrieve the result/exception so asyncio does not log it as never
+        # retrieved. The value is deliberately dropped: only the owner's
+        # cancellation leaves this call. ``BaseException`` is caught because a
+        # summarizer raising ``SystemExit``/``KeyboardInterrupt`` must not escape
+        # here either: that would replace the owner's cancellation just as much.
+        if not task.cancelled():
+            try:
+                task.exception()
+            except BaseException:
+                pass
+
+    def _reduce_compact_response(self: CompressedTimeline, response: object) -> str:
+        """Reduce a summarizer result to the summary text, on both seams.
+
+        Shared so the JSON envelope the compression prompt asks for is unwrapped
+        identically whether the callable was awaited or offloaded.
+        """
+        return self._extract_summary_from_response(self._adapt_compact_response(response)) or ""
+
+    @staticmethod
+    def _require_summary(summary: str) -> str:
+        """Reject an empty summarizer result the way a failed run is rejected."""
+        if not summary:
+            raise RuntimeError("empty summary from LLM")
+        return summary
+
+    def _commit_reactive_compact(
+        self: CompressedTimeline,
+        attempt: int,
+        drop_count: int,
+        plan: tuple[list[TimelineEntry], str, int],
+        summary: str,
+        *,
+        mode: str,
+    ) -> None:
+        """Commit a produced summary for ``plan`` and close the circuit.
+
+        ``_apply_compression`` validates the captured partition against the live
+        projection (generation + live object identities) and reports 0 when it no
+        longer matches, so a plan overtaken while the summarizer ran cannot
+        resurrect replaced history.
+        """
+        entries_to_compress, _prompt, plan_generation = plan
+        n = self._apply_compression(entries_to_compress, summary, plan_generation=plan_generation)
+        self._close_circuit_after_success(attempt, drop_count, n, mode=mode)
+
+    def _close_circuit_after_success(self: CompressedTimeline, attempt: int, drop_count: int, n: int, *, mode: str) -> None:
+        """Reset the failure budget and record a completed compaction."""
+        self._consecutive_compact_failures = 0
+        self._compaction_disabled = False
+        self._circuit_opened_at = None
+        logger.info(
+            "reactive_compact_done",
+            attempt=attempt,
+            entries_dropped=drop_count,
+            entries_compressed=n,
+            mode=mode,
+        )
+
+    def _record_compact_failure(self: CompressedTimeline, error: Exception) -> Exception:
+        """Count one failed run and return the exception to raise.
+
+        Returns ``CompactCircuitOpenError`` once the failure budget is exhausted,
+        otherwise the original error, so the caller can ``raise ... from e`` and
+        preserve the cause chain.
+        """
+        from dana.common.llm.types import CompactCircuitOpenError
+
+        self._consecutive_compact_failures += 1
+        if self._consecutive_compact_failures >= 3:
+            self._compaction_disabled = True
+            self._circuit_opened_at = datetime.now()
+            return CompactCircuitOpenError(f"reactive_compact failed 3x consecutive; last error: {error}")
+        return error
+
+    @staticmethod
+    def _adapt_compact_response(response: object) -> str:
+        """Reduce a summarizer result to text without running an un-awaited coroutine.
+
+        ``_llm_call_fn`` / ``_llm_call_async_fn`` are documented as prompt → text,
+        but a callable wired straight to a runtime returns an ``LLMResponse``. Both
+        accepted shapes reduce to text here, so callers and tests that provide
+        either keep working. An awaitable reaching this point is refused rather
+        than silently flattened by ``str()``.
+        """
+        if response is None:
+            return ""
+        if isinstance(response, str):
+            return response
+        content = getattr(response, "content", None)
+        if isinstance(content, str):
+            return content
+        if inspect.isawaitable(response):
+            raise RuntimeError("async summarizer callable returned an awaitable; await it in an async seam")
+        return str(response)
 
     def get_entries_for_compression(self: CompressedTimeline) -> list[TimelineEntry]:
         """

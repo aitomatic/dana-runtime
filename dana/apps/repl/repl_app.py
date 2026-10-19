@@ -106,6 +106,7 @@ class AdanaREPLApp:
         # Initialize environment (loads .env, installs shims)
         try:
             from dana.__init__ import init_environment
+
             init_environment()
         except ImportError:
             pass
@@ -201,6 +202,7 @@ class AdanaREPLApp:
         # Also configure structlog if available
         try:
             import structlog
+
             structlog.configure(
                 wrapper_class=structlog.make_filtering_bound_logger(level),
             )

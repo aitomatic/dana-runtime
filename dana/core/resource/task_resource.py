@@ -10,6 +10,7 @@ A legacy instance registration is still accepted (wrapped as a constant
 factory) but is unsafe under concurrency and emits a ``DeprecationWarning``.
 """
 
+from asyncio import CancelledError
 from collections.abc import Callable
 from typing import Any
 import uuid
@@ -263,11 +264,13 @@ class TaskResource(BaseResource):
         # persists back to the same session_id.
         agent.resume(session_id)
 
-        # Execute the agent query. On failure, mark the session "failed" (so
-        # task_output does not report it "running" forever) and re-raise so
-        # the caller still observes the error.
+        # Publish a terminal task state before propagating failure or cancellation,
+        # so TaskOutput never leaves an exited query looking permanently running.
         try:
             result = await agent.aquery(message=prompt)
+        except CancelledError:
+            self._sessions[session_id]["status"] = "cancelled"
+            raise
         except Exception as e:
             self._sessions[session_id]["status"] = "failed"
             self._sessions[session_id]["error"] = str(e)

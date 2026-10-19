@@ -91,9 +91,9 @@ class TestToolCallErrorTimeline:
                 for k in tc.get("arguments", {}):
                     if k.startswith("-"):
                         all_bad_args.add(k)
-        assert (
-            "-i" in all_bad_args or "-n" in all_bad_args or "-C" in all_bad_args
-        ), f"Expected ripgrep-style flags in bad kwargs, got: {all_bad_args}"
+        assert "-i" in all_bad_args or "-n" in all_bad_args or "-C" in all_bad_args, (
+            f"Expected ripgrep-style flags in bad kwargs, got: {all_bad_args}"
+        )
 
     def test_act_async_preserves_tool_call_id_on_error(self):
         """When a tool call fails, _act_async must store the error with the correct tool_call_id.
@@ -190,9 +190,9 @@ class TestToolCallErrorTimeline:
             f"got role='{native_msg.role}'. "
             "Error results must use role='tool' so the LLM API can match them to their tool_calls."
         )
-        assert (
-            native_msg.tool_call_id == timeline_entry.tool_call_id
-        ), "Native message must preserve the tool_call_id from the timeline entry"
+        assert native_msg.tool_call_id == timeline_entry.tool_call_id, (
+            "Native message must preserve the tool_call_id from the timeline entry"
+        )
 
     def test_bad_kwargs_error_feeds_back_to_timeline(self):
         """When a tool call has unsupported kwargs, the error must be captured in the timeline

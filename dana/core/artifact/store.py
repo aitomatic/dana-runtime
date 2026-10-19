@@ -35,10 +35,7 @@ class ArtifactNotFound(ArtifactError):
     def __init__(self, sha256: str, owner_scope: OwnerScope) -> None:
         self.sha256 = sha256
         self.owner_scope = owner_scope
-        super().__init__(
-            f"artifact with hash {sha256!r} not found for owner "
-            f"{owner_scope.owner_id!r}/{owner_scope.workspace!r}"
-        )
+        super().__init__(f"artifact with hash {sha256!r} not found for owner {owner_scope.owner_id!r}/{owner_scope.workspace!r}")
 
 
 class ArtifactStoreError(ArtifactError):

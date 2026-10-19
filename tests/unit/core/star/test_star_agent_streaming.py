@@ -4,6 +4,7 @@ Unit tests for STARAgent streaming: call_llm_stream(), aquery_stream().
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -259,60 +260,32 @@ class TestThinkStream:
     """Tests for STARAgent._think_stream() with a mocked LLM stream."""
 
     @pytest.mark.asyncio
-    async def test_buffers_chunks_and_populates_result_holder(self):
-        """TEXT_DELTA events should contain each chunk; result_holder gets the parsed trace."""
+    async def test_provisional_text_precedes_provider_completion_and_close_releases_provider(self):
         agent = _make_agent()
+        provider_completed = asyncio.Event()
+        provider_closed = asyncio.Event()
 
-        # Mock the runtime's LLM caller stream (yields LLMStreamChunk)
-        async def _fake_call_llm_stream(messages):
-            for text in ["<done>true</done>", "<response>Hi!</response>"]:
-                yield LLMStreamChunk(type="text_delta", content=text)
+        async def provider_stream(messages):
+            try:
+                yield LLMStreamChunk(type="thinking", content="private reasoning")
+                yield LLMStreamChunk(type="text_delta", content="Visible answer")
+                await asyncio.Event().wait()
+                provider_completed.set()
+            finally:
+                provider_closed.set()
 
-        # Mock runtime to provide call_llm_stream and parse_response
-        mock_runtime = MagicMock()
-        mock_runtime.build_prompt.return_value = []
-        mock_runtime._llm_caller = MagicMock()
-        mock_runtime._llm_caller.call_llm_stream = _fake_call_llm_stream
-
-        # parse_response returns a simple ParsedResponse
-        from dana.core.runtime.protocols import ParsedResponse
-
-        mock_runtime.parse_response.return_value = ParsedResponse(
-            done=True,
-            response="Hi!",
-            reasoning=None,
-            tool_calls=[],
-            todo_list=None,
-        )
-        mock_runtime.validate_done_output.return_value = "exit"
-
-        # _record_think_results returns the expected structure
-        from dana.core.agent.base_star_agent import EXIT_STAR_LOOP_FLAG
-
-        expected_trace = {"trace_thoughts": {"response": "Hi!", "tool_calls": [], EXIT_STAR_LOOP_FLAG: True}}
-        mock_runtime_patch = patch.object(agent, "_runtime", mock_runtime)
-        record_patch = patch.object(agent, "_record_think_results", return_value=expected_trace)
-        compress_patch = patch.object(agent, "_maybe_compress_timeline_async", new=AsyncMock())
-
-        result_holder: dict = {}
-        trace_percepts = {"timeline": agent._timeline}
-
-        with mock_runtime_patch, record_patch, compress_patch:
-            delta_events = []
-            async for event in agent._think_stream(trace_percepts, result_holder):
-                delta_events.append(event)
-
-        # Text chunks emitted as THINKING during streaming (no tool calls yet)
-        # After stream ends with no tool calls, a single TEXT_DELTA with full text is emitted
-        thinking_events = [e for e in delta_events if e.event_type == StreamEventType.THINKING]
-        text_events = [e for e in delta_events if e.event_type == StreamEventType.TEXT_DELTA]
-        assert [e.data for e in thinking_events] == ["<done>true</done>", "<response>Hi!</response>"]
-        assert len(text_events) == 1
-        assert text_events[0].data == "<done>true</done><response>Hi!</response>"
-
-        # result_holder should be populated
-        assert "trace_thoughts" in result_holder
-        assert result_holder["trace_thoughts"] == expected_trace
+        runtime = MagicMock()
+        runtime.build_prompt.return_value = []
+        runtime._llm_caller.call_llm_stream = provider_stream
+        with patch.object(agent, "_runtime", runtime), patch.object(agent, "_maybe_compress_timeline_async", new=AsyncMock()):
+            stream = agent._think_stream({"timeline": agent._timeline}, {})
+            thought = await asyncio.wait_for(anext(stream), 1)
+            text = await asyncio.wait_for(anext(stream), 1)
+            assert thought.event_type == StreamEventType.THINKING
+            assert text.event_type == StreamEventType.TEXT_DELTA
+            assert not provider_completed.is_set()
+            await stream.aclose()
+            assert provider_closed.is_set()
 
     @pytest.mark.asyncio
     async def test_exits_early_on_exit_star_loop_flag(self):

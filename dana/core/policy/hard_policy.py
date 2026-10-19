@@ -81,17 +81,21 @@ def create_default_hard_policy() -> HardPolicy:
         return any(e.kind in _DESTRUCTIVE_KINDS for e in op.effects.effects)
 
     policy.deny(
-        lambda op: "hard deny: protected path"
-        if _has_destructive_effect(op)
-        and any(p in str(op.arguments.get("path", "")) or p in str(op.arguments.get("command", "")) for p in _PROTECTED_PATHS)
-        else None
+        lambda op: (
+            "hard deny: protected path"
+            if _has_destructive_effect(op)
+            and any(p in str(op.arguments.get("path", "")) or p in str(op.arguments.get("command", "")) for p in _PROTECTED_PATHS)
+            else None
+        )
     )
 
     # Block rm -rf in bash commands (defense-in-depth)
     policy.deny(
-        lambda op: "hard deny: rm -rf blocked"
-        if op.tool_identity.name == "bash__execute" and "rm -rf" in str(op.arguments.get("command", ""))
-        else None
+        lambda op: (
+            "hard deny: rm -rf blocked"
+            if op.tool_identity.name == "bash__execute" and "rm -rf" in str(op.arguments.get("command", ""))
+            else None
+        )
     )
 
     return policy

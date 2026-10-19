@@ -236,6 +236,24 @@ class TestPayloadSanitization:
         with pytest.raises(PayloadSanitizationError):
             _fact(payload={"when": datetime.now()})
 
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("prompt_tokens", "credential disguised as a count"),
+            ("reasoning_tokens", True),
+            ("cached_tokens", -1),
+            ("completion_tokens", 2.5),
+            ("access_token", 123),
+            ("custom_tokens", 123),
+        ],
+    )
+    def test_usage_counts_do_not_weaken_credential_boundary(self, key, value) -> None:
+        usage = {"prompt_tokens": 20, "completion_tokens": 5, "cached_tokens": 10, "reasoning_tokens": None}
+        fact = _fact(payload={"usage": usage})
+        assert fact.payload["usage"] == usage
+        with pytest.raises(PayloadSanitizationError, match="forbidden"):
+            _fact(payload={"usage": {**usage, key: value}})
+
 
 # ===========================================================================
 # 4. secret-redaction failures + protected-state codec

@@ -3,6 +3,7 @@
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from google.genai import types as genai_types
 import pytest
 
 from dana.common.llm.types import LLMMessage
@@ -45,14 +46,22 @@ def _make_response(parts, prompt_tokens=10, completion_tokens=5, total_tokens=15
     return response
 
 
-def _make_stream_chunk(parts):
-    """Build a mock streaming chunk."""
+def _make_stream_chunk(parts, finish_reason=None, usage_metadata=None):
+    """Build a mock streaming chunk.
+
+    ``finish_reason``/``usage_metadata`` default to None rather than auto-created
+    MagicMocks: the real API only reports them on its final frames, and a truthy
+    stand-in would make every delta look like a reported terminal.
+    """
     candidate = MagicMock()
     candidate.content = MagicMock()
     candidate.content.parts = parts
+    candidate.finish_reason = finish_reason
 
     chunk = MagicMock()
     chunk.candidates = [candidate]
+    chunk.usage_metadata = usage_metadata
+    chunk.model_version = None
     return chunk
 
 
@@ -146,7 +155,7 @@ class TestGeminiStream:
         """Test streaming text chunks."""
         chunks = [
             _make_stream_chunk([_make_text_part("Hello ")]),
-            _make_stream_chunk([_make_text_part("world!")]),
+            _make_stream_chunk([_make_text_part("world!")], finish_reason="STOP"),
         ]
         provider.client.aio.models.generate_content_stream = AsyncMock(return_value=_async_iter(chunks))
 
@@ -155,18 +164,17 @@ class TestGeminiStream:
         async for chunk in provider.stream(messages):
             collected.append(chunk)
 
-        assert len(collected) == 2
-        assert collected[0].type == "text_delta"
-        assert collected[0].content == "Hello "
-        assert collected[1].type == "text_delta"
-        assert collected[1].content == "world!"
+        text = [c for c in collected if c.type == "text_delta"]
+        assert [c.content for c in text] == ["Hello ", "world!"]
+        # The reported finish reason must reach the consumer.
+        assert collected[-1].type == "response"
 
     @pytest.mark.asyncio
     async def test_stream_tool_call(self, provider):
         """Test streaming with function call in final chunk."""
         chunks = [
             _make_stream_chunk([_make_text_part("Let me check.")]),
-            _make_stream_chunk([_make_function_call_part("search", {"q": "test"})]),
+            _make_stream_chunk([_make_function_call_part("search", {"q": "test"})], finish_reason="STOP"),
         ]
         provider.client.aio.models.generate_content_stream = AsyncMock(return_value=_async_iter(chunks))
 
@@ -175,17 +183,17 @@ class TestGeminiStream:
         async for chunk in provider.stream(messages):
             collected.append(chunk)
 
-        assert len(collected) == 2
-        assert collected[0].type == "text_delta"
-        assert collected[1].type == "tool_use"
-        assert collected[1].tool_call["name"] == "search"
-        assert collected[1].tool_call["input"] == {"q": "test"}
+        deltas = [c for c in collected if c.type != "response"]
+        assert [c.type for c in deltas] == ["text_delta", "tool_use"]
+        assert deltas[1].tool_call["name"] == "search"
+        assert deltas[1].tool_call["input"] == {"q": "test"}
 
     @pytest.mark.asyncio
     async def test_stream_empty_candidates_skipped(self, provider):
         """Test that chunks with no candidates are skipped."""
         empty_chunk = MagicMock()
         empty_chunk.candidates = []
+        empty_chunk.usage_metadata = None
         text_chunk = _make_stream_chunk([_make_text_part("Hello")])
 
         provider.client.aio.models.generate_content_stream = AsyncMock(return_value=_async_iter([empty_chunk, text_chunk]))
@@ -195,8 +203,11 @@ class TestGeminiStream:
         async for chunk in provider.stream(messages):
             collected.append(chunk)
 
-        assert len(collected) == 1
-        assert collected[0].content == "Hello"
+        text = [c for c in collected if c.type == "text_delta"]
+        assert len(text) == 1
+        assert text[0].content == "Hello"
+        # No finish reason or usage was reported, so no terminal may be fabricated.
+        assert not [c for c in collected if c.type == "response"]
 
     @pytest.mark.asyncio
     async def test_stream_error(self, provider):
@@ -212,6 +223,135 @@ class TestGeminiStream:
         with pytest.raises(Exception, match="Stream interrupted"):
             async for _ in provider.stream(messages):
                 pass
+
+
+class TestGeminiStreamTeardown:
+    """S5: an abandoned SDK stream must be closed, both on cancel and on error."""
+
+    @pytest.mark.asyncio
+    async def test_cancellation_closes_the_sdk_stream(self, provider):
+        closed = {"n": 0}
+
+        class _SdkStream:
+            def __init__(self):
+                self._n = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self._n += 1
+                if self._n > 4:
+                    raise StopAsyncIteration
+                return _make_stream_chunk([_make_text_part(f"c{self._n}")])
+
+            async def aclose(self):
+                closed["n"] += 1
+
+        provider.client.aio.models.generate_content_stream = AsyncMock(return_value=_SdkStream())
+
+        agen = provider.stream([LLMMessage(role="user", content="hi")])
+        first = await agen.__anext__()
+        assert first.type == "text_delta"
+        await agen.aclose()
+
+        assert closed["n"] == 1, "a consumer that stops early must release the SDK stream"
+
+    @pytest.mark.asyncio
+    async def test_mid_stream_error_closes_the_sdk_stream(self, provider):
+        closed = {"n": 0}
+
+        class _SdkStream:
+            def __init__(self):
+                self._n = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self._n += 1
+                if self._n == 1:
+                    return _make_stream_chunk([_make_text_part("start")])
+                raise RuntimeError("Stream interrupted")
+
+            async def aclose(self):
+                closed["n"] += 1
+
+        provider.client.aio.models.generate_content_stream = AsyncMock(return_value=_SdkStream())
+
+        with pytest.raises(RuntimeError, match="Stream interrupted"):
+            async for _ in provider.stream([LLMMessage(role="user", content="hi")]):
+                pass
+
+        assert closed["n"] == 1, "teardown must not mask the error, but must still close"
+
+    @pytest.mark.asyncio
+    async def test_sync_close_shape_is_supported(self, provider):
+        """google-genai gives an async generator; a sync ``close()`` SDK shape works too."""
+        closed = {"n": 0}
+
+        class _SdkStream:
+            def __init__(self):
+                self._n = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self._n += 1
+                if self._n > 1:
+                    raise StopAsyncIteration
+                return _make_stream_chunk([_make_text_part("only")], finish_reason="STOP")
+
+            def close(self):
+                closed["n"] += 1
+
+        provider.client.aio.models.generate_content_stream = AsyncMock(return_value=_SdkStream())
+
+        chunks = [c async for c in provider.stream([LLMMessage(role="user", content="hi")])]
+
+        assert chunks[-1].type == "response"
+        assert closed["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_request_failure_before_a_stream_exists_is_not_retried_into_a_close(self, provider):
+        """No stream object: teardown must be a no-op, not an AttributeError."""
+        provider.client.aio.models.generate_content_stream = AsyncMock(side_effect=RuntimeError("connect failed"))
+
+        with pytest.raises(RuntimeError, match="connect failed"):
+            async for _ in provider.stream([LLMMessage(role="user", content="hi")]):
+                pass
+
+
+class TestGeminiSdkFinishReasons:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("streaming", [False, True])
+    @pytest.mark.parametrize(
+        "finish_reason",
+        [genai_types.FinishReason.MAX_TOKENS, genai_types.FinishReason.SAFETY, genai_types.FinishReason.STOP],
+    )
+    async def test_sdk_enum_uses_wire_value(self, provider, streaming, finish_reason):
+        terminal = genai_types.GenerateContentResponse(
+            candidates=[genai_types.Candidate(content=genai_types.Content(parts=[]), finish_reason=finish_reason)],
+            usage_metadata=genai_types.GenerateContentResponseUsageMetadata(
+                prompt_token_count=11, candidates_token_count=4, total_token_count=15
+            ),
+        )
+        messages = [LLMMessage(role="user", content="hi")]
+        if streaming:
+            delta = genai_types.GenerateContentResponse(
+                candidates=[genai_types.Candidate(content=genai_types.Content(parts=[genai_types.Part(text="partial")]))]
+            )
+            provider.client.aio.models.generate_content_stream = AsyncMock(return_value=_async_iter([delta, terminal]))
+            chunks = [chunk async for chunk in provider.stream(messages)]
+            assert [chunk.type for chunk in chunks] == ["text_delta", "response"]
+            assert chunks[0].content == "partial"
+            response = chunks[-1].response
+        else:
+            provider.client.aio.models.generate_content = AsyncMock(return_value=terminal)
+            response = await provider.chat(messages)
+        assert response.finish_reason == finish_reason.value
+        assert response.usage == {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15}
 
 
 # --- Message conversion tests ---

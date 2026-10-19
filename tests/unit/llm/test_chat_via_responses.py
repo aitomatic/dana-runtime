@@ -30,6 +30,7 @@ def _make_provider(model="gpt-5", use_responses_api=None):
 def _make_output_item(item_type, **fields):
     item = MagicMock()
     item.type = item_type
+    item.status = None
     for k, v in fields.items():
         setattr(item, k, v)
     return item

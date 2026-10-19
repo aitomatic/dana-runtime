@@ -8,18 +8,20 @@ These tests use real LLM providers to stress test STARAgent behavior.
 
 from __future__ import annotations
 
-import time
-import pytest
 from dataclasses import dataclass, field
-from typing import Any
+import time
+
+import pytest
 
 from dana.core.agent.star_agent import STARAgent
+
 
 try:
     from dana.core.resource.todo import ToDoResource
 except ImportError:
     ToDoResource = None
 from dana.lib.resources.ping import PingResource
+
 
 pytestmark = pytest.mark.skipif(ToDoResource is None, reason="ToDoResource has been removed")
 
@@ -285,21 +287,21 @@ class TestMultiTurnScenarios:
         agent.with_resources(ToDoResource(auto_register=False))
 
         # Turn 1: Create task list
-        result1 = harness.run_scenario(
+        harness.run_scenario(
             name="Incremental T1: Create tasks",
             agent=agent,
             message="Create a todo list with tasks: 'Research topic', 'Write outline', 'Draft document'",
         )
 
         # Turn 2: Update task
-        result2 = harness.run_scenario(
+        harness.run_scenario(
             name="Incremental T2: Update task",
             agent=agent,
             message="Mark 'Research topic' as complete",
         )
 
         # Turn 3: Report progress
-        result3 = harness.run_scenario(
+        harness.run_scenario(
             name="Incremental T3: Report progress",
             agent=agent,
             message="What tasks remain?",
@@ -428,7 +430,7 @@ class TestStressEdgeCases:
 
         for i, q in enumerate(queries):
             result = harness.run_scenario(
-                name=f"Rapid Query {i+1}",
+                name=f"Rapid Query {i + 1}",
                 agent=agent,
                 message=q,
             )
@@ -513,6 +515,7 @@ class TestWebResearchScenarios:
     def agent_with_search(self):
         """Create agent with SearchResource for web searches."""
         import os
+
         from dana.lib.resources.web_research import SearchResource
 
         # Skip if no Google API credentials
@@ -532,7 +535,8 @@ class TestWebResearchScenarios:
     def agent_with_full_research(self):
         """Create agent with full web research capabilities."""
         import os
-        from dana.lib.resources.web_research import FetchResource, SearchResource, ExtractResource
+
+        from dana.lib.resources.web_research import ExtractResource, FetchResource, SearchResource
 
         agent = STARAgent(
             agent_type="web_research_test",
@@ -770,7 +774,7 @@ class TestRealWorldTopicResearch:
     @pytest.fixture
     def research_agent(self):
         """Create agent with web research capabilities."""
-        from dana.lib.resources.web_research import FetchResource, ExtractResource
+        from dana.lib.resources.web_research import ExtractResource, FetchResource
 
         agent = STARAgent(
             agent_type="topic_research",
@@ -810,7 +814,7 @@ class TestRealWorldTopicResearch:
         assert result.response_length > 100, "Response too short"
 
         # Validate answer quality
-        quality = self._validate_answer_quality(
+        self._validate_answer_quality(
             str(result.response_length),  # We don't have the actual response text in harness
             expected_keywords=["list", "comprehension"],
             min_length=100,
@@ -1031,8 +1035,8 @@ class TestRealWorldQualityEfficiency:
     @pytest.fixture
     def harness_agent(self):
         """Create HarnessAgent with codec system and FetchResource."""
-        from tests.harness.harness_agent import HarnessAgent
         from dana.lib.resources.web_research import FetchResource
+        from tests.harness.harness_agent import HarnessAgent
 
         agent = HarnessAgent(
             agent_type="quality_test",
@@ -1196,9 +1200,9 @@ def test_comprehensive_quality_efficiency_suite():
     This test runs all real-world scenarios and produces a summary report
     with quality scores and efficiency metrics.
     """
-    from tests.harness.harness_agent import HarnessAgent
-    from dana.lib.resources.web_research import FetchResource
     from dana.core.timeline.timeline import TimelineEntryType
+    from dana.lib.resources.web_research import FetchResource
+    from tests.harness.harness_agent import HarnessAgent
 
     print("\n" + "=" * 70)
     print("COMPREHENSIVE QUALITY & EFFICIENCY TEST SUITE")
@@ -1236,7 +1240,7 @@ def test_comprehensive_quality_efficiency_suite():
 
     results = []
 
-    for name, message, validator, max_time in tests:
+    for name, message, validator, _max_time in tests:
         print(f"\nRunning: {name}...")
 
         # Fresh agent for each test
@@ -1295,7 +1299,7 @@ def test_comprehensive_quality_efficiency_suite():
     total_time = sum(r["elapsed"] for r in results)
     print(f"Quality: {passed}/{len(results)} passed")
     print(f"Total time: {total_time:.1f}s")
-    print(f"Average time: {total_time/len(results):.1f}s")
+    print(f"Average time: {total_time / len(results):.1f}s")
     print("=" * 70)
 
     # Assert success rate
@@ -1320,9 +1324,9 @@ class TestSubAgentDelegation:
 
     def test_delegate_to_fetch_specialist(self):
         """Test: Main agent delegates URL fetching to a specialist subagent."""
-        from tests.harness.harness_agent import HarnessAgent
-        from dana.lib.resources.web_research import FetchResource
         from dana.core.timeline.timeline import TimelineEntryType
+        from dana.lib.resources.web_research import FetchResource
+        from tests.harness.harness_agent import HarnessAgent
 
         # Create specialist subagent with FetchResource
         fetch_specialist = HarnessAgent(
@@ -1369,7 +1373,6 @@ class TestSubAgentDelegation:
     def test_delegate_to_math_specialist(self):
         """Test: Main agent delegates math to a specialist subagent."""
         from tests.harness.harness_agent import HarnessAgent
-        from dana.core.timeline.timeline import TimelineEntryType
 
         # Create math specialist (no resources needed, just LLM)
         math_specialist = HarnessAgent(
@@ -1408,9 +1411,8 @@ class TestSubAgentDelegation:
 
     def test_multi_agent_collaboration(self):
         """Test: Main agent orchestrates multiple subagents."""
-        from tests.harness.harness_agent import HarnessAgent
         from dana.lib.resources.web_research import FetchResource
-        from dana.core.timeline.timeline import TimelineEntryType
+        from tests.harness.harness_agent import HarnessAgent
 
         # Create two specialists
         fetch_agent = HarnessAgent(
@@ -1474,9 +1476,9 @@ class TestPlanningBehavior:
 
     def test_llm_creates_todos_for_multistep_task(self):
         """Test: LLM should create a todo list when given a multi-step task."""
-        from tests.harness.harness_agent import HarnessAgent
-        from dana.lib.resources.web_research import FetchResource
         from dana.core.timeline.timeline import TimelineEntryType
+        from dana.lib.resources.web_research import FetchResource
+        from tests.harness.harness_agent import HarnessAgent
 
         agent = HarnessAgent(
             agent_type="planner",
@@ -1531,9 +1533,9 @@ Create a todo list to track these, then work through them one at a time and repo
 
     def test_llm_updates_todo_status(self):
         """Test: LLM should update todo status as tasks complete."""
-        from tests.harness.harness_agent import HarnessAgent
-        from dana.lib.resources.web_research import FetchResource
         from dana.core.timeline.timeline import TimelineEntryType
+        from dana.lib.resources.web_research import FetchResource
+        from tests.harness.harness_agent import HarnessAgent
 
         agent = HarnessAgent(
             agent_type="tracker",
@@ -1584,8 +1586,8 @@ Report the results when done."""
 
     def test_planning_with_explicit_todo_instruction(self):
         """Test: When explicitly told to use todos, LLM should comply."""
-        from tests.harness.harness_agent import HarnessAgent
         from dana.core.timeline.timeline import TimelineEntryType
+        from tests.harness.harness_agent import HarnessAgent
 
         agent = HarnessAgent(
             agent_type="explicit_planner",
@@ -1633,9 +1635,9 @@ Then work through each todo, updating status as you go. Show me the final answer
 
     def test_sequential_task_execution(self):
         """Test: Tasks should be executed in order, not skipped."""
-        from tests.harness.harness_agent import HarnessAgent
-        from dana.lib.resources.web_research import FetchResource
         from dana.core.timeline.timeline import TimelineEntryType
+        from dana.lib.resources.web_research import FetchResource
+        from tests.harness.harness_agent import HarnessAgent
 
         agent = HarnessAgent(
             agent_type="sequential",
@@ -1681,8 +1683,6 @@ You must complete Step 1 before Step 2, and Step 2 before Step 3."""
         print(f"Fetched IP: {has_ip_fetch}, Fetched UUID: {has_uuid_fetch}")
 
         # Response should contain results from both
-        has_ip_result = "." in response and any(c.isdigit() for c in response)
-        has_uuid_result = "-" in response
 
         assert has_ip_fetch or has_uuid_fetch, "Should fetch at least one URL"
         assert elapsed < 60, f"Should complete within 60s, took {elapsed:.1f}s"
@@ -1706,9 +1706,9 @@ class TestTimelineCompression:
 
     def test_compression_triggers_on_long_conversation(self):
         """Test: Timeline should compress when it gets too long."""
-        from tests.harness.harness_agent import HarnessAgent
-        from dana.lib.resources.web_research import FetchResource
         from dana.core.timeline.timeline import TimelineConfig, TimelineEntryType
+        from dana.lib.resources.web_research import FetchResource
+        from tests.harness.harness_agent import HarnessAgent
 
         # Create agent with low compression threshold for testing
         agent = HarnessAgent(
@@ -1733,7 +1733,7 @@ class TestTimelineCompression:
         print("\n=== COMPRESSION TEST ===")
 
         # First query - should not compress yet
-        result1 = agent.query(message="Fetch https://httpbin.org/ip and tell me the IP.")
+        agent.query(message="Fetch https://httpbin.org/ip and tell me the IP.")
         entries_after_1 = len(agent._timeline.timeline)
         print(f"After query 1: {entries_after_1} entries")
 
@@ -1742,7 +1742,7 @@ class TestTimelineCompression:
         print(f"Has summary after query 1: {has_summary}")
 
         # Second query - may trigger compression
-        result2 = agent.query(message="Now fetch https://httpbin.org/uuid and tell me the UUID.")
+        agent.query(message="Now fetch https://httpbin.org/uuid and tell me the UUID.")
         entries_after_2 = len(agent._timeline.timeline)
         print(f"After query 2: {entries_after_2} entries")
 

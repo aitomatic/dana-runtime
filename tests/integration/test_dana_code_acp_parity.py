@@ -293,8 +293,7 @@ class TestParityTextTurn:
         assert "world!" in agent_texts
         assert prompt_resp.stop_reason == "end_turn"
 
-        if agent._repository is not None:
-            await agent._repository.close()
+        await agent.aclose()
 
 
 # ===========================================================================
@@ -307,22 +306,54 @@ class TestParityToolCallTurn:
 
     @pytest.mark.asyncio
     async def test_tool_call_turn_equivalence(self, repo, tmp_path):
-        script = [
-            (StreamEventType.TEXT_DELTA, "Let me check. "),
-            (
-                StreamEventType.TOOL_CALL_START,
-                [{"id": "tc-1", "name": "todo_write", "input": {"items": []}}],
-            ),
-            (StreamEventType.TOOL_RESULT, [{"tool_call_id": "tc-1", "result": {"success": True}}]),
-            (StreamEventType.TEXT_DELTA, "Done."),
-        ]
+        from dana.core.resource.file_io_resource import FileIOResource
+        from dana.core.tool.tool_executor import ToolExecutor
 
-        cli_session, _ = await build_cli_session(repo, scripted_factory(script=script), session_id="parity-tool")
-        cli_events = await capture_hostevents(cli_session, text="add a todo")
+        source = tmp_path / "parity-read.txt"
+        source.write_text("parity tool result")
+        call = {
+            "function": "Read",
+            "arguments": {"file_path": str(source)},
+            "tool_call_id": "tc-1",
+        }
 
-        agent, conn = await build_acp_agent(tmp_path, scripted_factory(script=script))
+        class ReadingAgent(ScriptedAgent):
+            def __init__(self):
+                super().__init__()
+                resource = FileIOResource(resource_id="parity-io", base_path=str(tmp_path))
+                self._runtime = SimpleNamespace(
+                    _native_tools=[
+                        {
+                            "type": "function",
+                            "function": {"name": "Read", "parameters": {"type": "object"}},
+                        }
+                    ],
+                    _tool_executor=ToolExecutor(tool_name_registry_getter=lambda: {"Read": (resource, "read")}),
+                )
+
+            async def aquery_stream(self, **kwargs):
+                yield StreamEvent(event_type=StreamEventType.TEXT_DELTA, data="Let me check. ", iteration=0)
+                yield StreamEvent(
+                    event_type=StreamEventType.TOOL_CALL_START,
+                    data=[{"id": "tc-1", "name": "Read", "input": call["arguments"]}],
+                    iteration=0,
+                )
+                results = await self._runtime._tool_executor.execute_tools_async(self, [call])
+                assert results[0]["success"], results
+                assert "parity tool result" in results[0]["result"]
+                yield StreamEvent(event_type=StreamEventType.TOOL_RESULT, data=results, iteration=0)
+                yield StreamEvent(event_type=StreamEventType.TEXT_DELTA, data="Done.", iteration=0)
+                yield StreamEvent(event_type=StreamEventType.DONE, data=None, iteration=0)
+
+            async def aclose(self):
+                await self._runtime._tool_executor.aclose()
+
+        cli_session, _ = await build_cli_session(repo, ReadingAgent, session_id="parity-tool")
+        cli_events = await capture_hostevents(cli_session, text="read the fixture")
+
+        agent, conn = await build_acp_agent(tmp_path, ReadingAgent)
         new_resp = await agent.new_session(cwd="/tmp")
-        await agent.prompt(prompt=[{"type": "text", "text": "add a todo"}], session_id=new_resp.session_id)
+        await agent.prompt(prompt=[{"type": "text", "text": "read the fixture"}], session_id=new_resp.session_id)
 
         types = hostevent_types(cli_events)
         assert HostEventType.TOOL_REQUESTED in types
@@ -334,9 +365,8 @@ class TestParityToolCallTurn:
         kinds = acp_kinds(conn)
         assert "tool_call" in kinds
         assert "tool_call_update" in kinds
-
-        if agent._repository is not None:
-            await agent._repository.close()
+        await cli_session.aclose()
+        await agent.aclose()
 
 
 # ===========================================================================
@@ -368,8 +398,7 @@ class TestParityThoughtTurn:
         assert acp_kinds(conn) == expected_acp_kinds(cli_events)
         assert "agent_thought_chunk" in acp_kinds(conn)
 
-        if agent._repository is not None:
-            await agent._repository.close()
+        await agent.aclose()
 
 
 # ===========================================================================
@@ -430,8 +459,7 @@ class TestParityCancellation:
         assert session.last_terminal is not None
         assert session.last_terminal.fact_type is FactType.TURN_CANCELLED
 
-        if agent._repository is not None:
-            await agent._repository.close()
+        await agent.aclose()
 
 
 # ===========================================================================
@@ -478,8 +506,7 @@ class TestParityModelSwitch:
         assert model_changes[0].payload["provider"] == "anthropic"
         assert model_changes[0].payload["model"] == "claude-sonnet-4"
 
-        if agent._repository is not None:
-            await agent._repository.close()
+        await agent.aclose()
 
     @pytest.mark.asyncio
     async def test_model_switch_busy_reject_cli(self, repo):
@@ -517,8 +544,7 @@ class TestParityModelSwitch:
         gate.set()
         await prompt_task
 
-        if agent._repository is not None:
-            await agent._repository.close()
+        await agent.aclose()
 
 
 # ===========================================================================
@@ -621,8 +647,7 @@ class TestParityPermission:
         assert resp.outcome.outcome == "cancelled"
         assert "hard deny" in (resp.field_meta or {}).get("denied_reason", "")
 
-        if agent._repository is not None:
-            await agent._repository.close()
+        await agent.aclose()
 
     @pytest.mark.asyncio
     async def test_permission_acp_allow_parity(self, tmp_path):
@@ -661,11 +686,7 @@ class TestParityPermission:
         # No matched_grant_id on the mock → allow_once.
         assert resp.outcome.option_id == "opt-ao"
 
-        if agent._repository is not None:
-            await agent._repository.close()
-
-        if agent._repository is not None:
-            await agent._repository.close()
+        await agent.aclose()
 
 
 # ===========================================================================

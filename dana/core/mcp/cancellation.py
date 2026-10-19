@@ -43,10 +43,32 @@ class MCPCancellationTracker:
         """Track a new in-flight MCP call.
 
         Args:
-            tool_call_id: The tool_call_id from the request.
-            mcp_request_id: The MCP protocol request ID.
+            tool_call_id: The harness tool_call_id from the request (the stable
+                per-call key — never the tool name, so concurrent same-name calls
+                stay distinct).
+            mcp_request_id: The MCP protocol JSON-RPC request ID, or a provisional
+                marker when the transport id is not yet observable.
         """
         self._tracked[tool_call_id] = mcp_request_id
+
+    def request_id_for(self, tool_call_id: str) -> int | str | None:
+        """The recorded MCP JSON-RPC request id for a call, or ``None`` if unknown.
+
+        Returns ``None`` for an untracked call and for a provisional marker, so a
+        caller records an *unknown disposition* instead of collapsing the harness
+        id into the transport id.
+        """
+        value = self._tracked.get(tool_call_id)
+        if value is None:
+            return None
+        if isinstance(value, str) and value.startswith("pending:"):
+            return None
+        return value
+
+    def record_request_id(self, tool_call_id: str, mcp_request_id: int | str) -> None:
+        """Attach the transport's JSON-RPC request id to an already-tracked call."""
+        if tool_call_id in self._tracked:
+            self._tracked[tool_call_id] = mcp_request_id
 
     def request_cancellation(self, tool_call_id: str) -> None:
         """Record a cancellation request for a tool call.

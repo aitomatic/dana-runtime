@@ -1,0 +1,262 @@
+{
+  "schema": "dana.pr32-original-summary/1",
+  "scope": "Historical original measurements at 07b9037439dd81e45ec1862fce0d3850ec152bd8; not repaired-head performance.",
+  "raw_artifact": {
+    "url": "https://raw.githubusercontent.com/aitomatic/dana-runtime/a0da647/benchmarks/results/pr32-original-measurements.json",
+    "sha256": "5d42b5f43423629dcbe34333f9fab77fff05da1000a7bd4553b9af720f9aa64f",
+    "bytes": 503360,
+    "paired_attempts": 144,
+    "startup_observations": 240
+  },
+  "source_digests": {
+    "B1": "79067fc6b397a5a5471506338e9d12378e3c0e49a6d1c8e356b9a028540df183",
+    "B2": "6aab20ca30cc7e4a0015266f5c76dd76cc768250783e29a39d7894fd6dd0b3dc"
+  },
+  "local": {
+    "B1": {
+      "warm_turns": {
+        "isolated": {
+          "n": 100,
+          "min": 2.2877,
+          "median": 4.8771,
+          "max": 7.2159,
+          "mean": 4.7991,
+          "p95": 6.9987
+        },
+        "production": {
+          "n": 100,
+          "min": 2.0388,
+          "median": 5.2209,
+          "max": 43.4275,
+          "mean": 5.4899,
+          "p95": 7.7105
+        }
+      },
+      "matched_forwarding": {
+        "first_fragment_summary_ms": {
+          "n": 100,
+          "min": 42.4061,
+          "median": 44.2309,
+          "max": 47.0865,
+          "mean": 44.2596,
+          "p95": 45.2418
+        },
+        "chunk_gap_seconds": 0.02,
+        "first_host_before_last_provider_count": 0
+      },
+      "history_delta": [
+        {
+          "turns": 10,
+          "warmups": 1,
+          "repetitions": 100,
+          "new_facts_per_sample": 4,
+          "external_writer": "independent SQLite connection",
+          "median_ms": 2.2939585,
+          "p95_ms": 4.986458,
+          "new_turn_context_correct": true,
+          "reopen_context_equal": true,
+          "provider_entries": 0
+        },
+        {
+          "turns": 100,
+          "warmups": 1,
+          "repetitions": 100,
+          "new_facts_per_sample": 4,
+          "external_writer": "independent SQLite connection",
+          "median_ms": 5.7173955,
+          "p95_ms": 7.617958,
+          "new_turn_context_correct": true,
+          "reopen_context_equal": true,
+          "provider_entries": 0
+        },
+        {
+          "turns": 1000,
+          "warmups": 1,
+          "repetitions": 100,
+          "new_facts_per_sample": 4,
+          "external_writer": "independent SQLite connection",
+          "median_ms": 40.345937500000005,
+          "p95_ms": 77.841584,
+          "new_turn_context_correct": true,
+          "reopen_context_equal": true,
+          "provider_entries": 0
+        },
+        {
+          "turns": 5000,
+          "warmups": 1,
+          "repetitions": 100,
+          "new_facts_per_sample": 4,
+          "external_writer": "independent SQLite connection",
+          "median_ms": 231.713479,
+          "p95_ms": 279.248042,
+          "new_turn_context_correct": true,
+          "reopen_context_equal": true,
+          "provider_entries": 0
+        }
+      ]
+    },
+    "B2": {
+      "warm_turns": {
+        "isolated": {
+          "n": 100,
+          "min": 1.8612,
+          "median": 2.2018,
+          "max": 5.6304,
+          "mean": 2.3684,
+          "p95": 4.2095
+        },
+        "production": {
+          "n": 100,
+          "min": 1.9587,
+          "median": 2.4842,
+          "max": 4.3219,
+          "mean": 2.4704,
+          "p95": 2.8065
+        }
+      },
+      "matched_forwarding": {
+        "first_fragment_summary_ms": {
+          "n": 100,
+          "min": 0.0848,
+          "median": 0.1364,
+          "max": 0.3346,
+          "mean": 0.1468,
+          "p95": 0.2472
+        },
+        "chunk_gap_seconds": 0.02,
+        "first_host_before_last_provider_count": 100
+      },
+      "history_delta": [
+        {
+          "turns": 10,
+          "warmups": 1,
+          "repetitions": 100,
+          "new_facts_per_sample": 4,
+          "external_writer": "independent SQLite connection",
+          "median_ms": 0.27875,
+          "p95_ms": 0.31025,
+          "new_turn_context_correct": true,
+          "reopen_context_equal": true,
+          "provider_entries": 0
+        },
+        {
+          "turns": 100,
+          "warmups": 1,
+          "repetitions": 100,
+          "new_facts_per_sample": 4,
+          "external_writer": "independent SQLite connection",
+          "median_ms": 0.281854,
+          "p95_ms": 0.305083,
+          "new_turn_context_correct": true,
+          "reopen_context_equal": true,
+          "provider_entries": 0
+        },
+        {
+          "turns": 1000,
+          "warmups": 1,
+          "repetitions": 100,
+          "new_facts_per_sample": 4,
+          "external_writer": "independent SQLite connection",
+          "median_ms": 0.290479,
+          "p95_ms": 0.329709,
+          "new_turn_context_correct": true,
+          "reopen_context_equal": true,
+          "provider_entries": 0
+        },
+        {
+          "turns": 5000,
+          "warmups": 1,
+          "repetitions": 100,
+          "new_facts_per_sample": 4,
+          "external_writer": "independent SQLite connection",
+          "median_ms": 0.33735400000000004,
+          "p95_ms": 0.508167,
+          "new_turn_context_correct": true,
+          "reopen_context_equal": true,
+          "provider_entries": 0
+        }
+      ]
+    }
+  },
+  "paired_by_provider": {
+    "azure": {
+      "n": 36,
+      "candidate_faster_n": 18,
+      "paired_ratio_median": 0.9961144497896065,
+      "paired_ratio_range": [
+        0.541540060164911,
+        5.044596041489484
+      ],
+      "paired_difference_median_s": -0.0486476455,
+      "paired_difference_range_s": [
+        -6.8631741250000005,
+        32.164546543
+      ],
+      "both_successful_n": 35,
+      "both_successful_ratio_median": 1.0502786442079024
+    },
+    "openai": {
+      "n": 36,
+      "candidate_faster_n": 15,
+      "paired_ratio_median": 1.0537744858770002,
+      "paired_ratio_range": [
+        0.5212084126765323,
+        1.9850440652310255
+      ],
+      "paired_difference_median_s": 0.2234008125,
+      "paired_difference_range_s": [
+        -3.7372446250000007,
+        6.850494
+      ],
+      "both_successful_n": 35,
+      "both_successful_ratio_median": 1.0526434644038232
+    }
+  },
+  "historical_verification": {
+    "first_repair": "https://github.com/aitomatic/dana-runtime/blob/6eaebb5/benchmarks/results/pr32-review-verification.json",
+    "second_repair": "https://github.com/aitomatic/dana-runtime/blob/522ab49/benchmarks/results/pr32-rereview-verification.json",
+    "current_validation": "https://github.com/aitomatic/dana-runtime/pull/32",
+    "interpretation": "Immutable records prove only the revisions and paths they name. The earlier 1.557/0.527 ms comparison omitted argument size and does not establish a general I14 result."
+  },
+  "accounting_observation": {
+    "source_baseline": "522ab49; accounting code unchanged by third-review repairs",
+    "scope": "Offline single-head local observation, not an end-to-end or paired-head speedup",
+    "python": "3.12.11",
+    "platform": "Darwin/arm64",
+    "repetitions": 50,
+    "warmups": 5,
+    "turn_shape": "One tool call, its result body, and one follow-up user message; no mutation between reads; message objects not publicly escaped",
+    "small_arguments": "query='site {index}', limit=index+1; JSON UTF-8 size varies with index",
+    "large_arguments": "One dictionary with one immutable ASCII string; json.dumps UTF-8 encoding exactly 2048 bytes",
+    "plain_baseline": "Sum _estimate_native_message_tokens over retained native messages, without snapshots",
+    "snapshot_baseline": "_recompute_token_total: full counting, fresh dependency snapshots and cache anchoring",
+    "rows": [
+      {
+        "turns": 100, "messages": 300, "argument_bytes_min": 31, "argument_bytes_max": 34,
+        "incremental_read_median_ms": 0.1138125,
+        "plain_full_count_median_ms": 0.052542,
+        "full_recount_with_snapshots_median_ms": 0.5500625
+      },
+      {
+        "turns": 100, "messages": 300, "argument_bytes_min": 2048, "argument_bytes_max": 2048,
+        "incremental_read_median_ms": 0.1025005,
+        "plain_full_count_median_ms": 0.365854,
+        "full_recount_with_snapshots_median_ms": 0.849458
+      },
+      {
+        "turns": 1000, "messages": 3000, "argument_bytes_min": 31, "argument_bytes_max": 36,
+        "incremental_read_median_ms": 1.2308335,
+        "plain_full_count_median_ms": 0.5585835,
+        "full_recount_with_snapshots_median_ms": 6.123833
+      },
+      {
+        "turns": 1000, "messages": 3000, "argument_bytes_min": 2048, "argument_bytes_max": 2048,
+        "incremental_read_median_ms": 1.0540005,
+        "plain_full_count_median_ms": 3.8668955,
+        "full_recount_with_snapshots_median_ms": 9.0427915
+      }
+    ],
+    "all_token_totals_equal": true,
+    "costs": "Append snapshots deep-copy mutable arguments. Retained argument state can roughly double for mutable-heavy payloads, but immutable string leaves may remain shared. Comparisons remain linear in retained dependency state."
+  }
+}

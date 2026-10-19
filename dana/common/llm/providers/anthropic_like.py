@@ -52,9 +52,12 @@ class AnthropicLikeProvider(AnthropicProvider):
             base_url_env = config.get("base_url_env") if config else "ANTHROPIC_LIKE_BASE_URL"
             raise ValueError(f"Anthropic-Like base URL not found. Set {base_url_env} environment variable.")
 
-        # Use Anthropic client pointed at the custom endpoint
+        # Use Anthropic client pointed at the custom endpoint.
+        # max_retries=0: retry ownership lives in LLMCaller, which has the
+        # request deadline and the partial-output awareness the SDK lacks.
         self.client = anthropic.AsyncAnthropic(
             api_key=self.api_key,
             base_url=self.base_url,
             default_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+            max_retries=0,
         )

@@ -1,7 +1,5 @@
 """Unit tests for PythonSandbox."""
 
-import pytest
-
 from dana.core.agent.components.python_sandbox import PythonSandbox
 
 

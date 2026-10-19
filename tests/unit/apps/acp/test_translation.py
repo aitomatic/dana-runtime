@@ -1,8 +1,9 @@
-"""
-Unit tests for ACP translation — HostEvent → ACP SessionUpdate mapping.
+"""Unit tests for ACP translation: HostEvent to ACP SessionUpdate mapping.
 
-Covers D2 tool lifecycle states: thought, tool-call, tool-update, result,
-and cancellation states.
+Covers D2 tool lifecycle states (thought, tool-call, tool-update, result,
+cancellation) and the lifecycle contract: most ``TURN_*`` / ``SESSION_*``
+events are silent, while ``TURN_ERROR`` surfaces exactly one visible
+``agent_message_chunk`` on an otherwise successful prompt response.
 """
 
 from __future__ import annotations
@@ -58,16 +59,44 @@ class TestD1TextEvents:
         event = _make_event(HostEventType.ASSISTANT_CONTENT_FINAL, text="full")
         assert host_event_to_acp_update(event) is None
 
-    def test_turn_lifecycle_returns_none(self) -> None:
+
+class TestLifecycleEvents:
+    """Lifecycle events carry the turn outcome, not a transcript delta.
+
+    ``TURN_STARTED`` / ``TURN_COMPLETED`` / ``TURN_CANCELLED`` and every
+    ``SESSION_*`` event translate to ``None``: the ``PromptResponse`` /
+    ``LoadSessionResponse`` signals completion. ``TURN_ERROR`` is the one
+    exception: the failure must be visible in the transcript, so it becomes a
+    single ``agent_message_chunk``.
+    """
+
+    def test_silent_lifecycle_events_return_none(self) -> None:
         for typ in (
             HostEventType.TURN_STARTED,
             HostEventType.TURN_COMPLETED,
             HostEventType.TURN_CANCELLED,
-            HostEventType.TURN_ERROR,
+            HostEventType.TURN_INTERRUPTED,
             HostEventType.SESSION_CREATED,
             HostEventType.SESSION_LOADED,
+            HostEventType.SESSION_RESUMED,
         ):
-            assert host_event_to_acp_update(_make_event(typ)) is None
+            assert host_event_to_acp_update(_make_event(typ)) is None, typ
+
+    def test_turn_error_returns_one_visible_agent_message_chunk(self) -> None:
+        event = _make_event(
+            HostEventType.TURN_ERROR,
+            metadata={"error": "provider exploded", "error_type": "RuntimeError"},
+        )
+        update = host_event_to_acp_update(event)
+        assert update is not None
+        assert update.session_update == "agent_message_chunk"
+        assert "provider exploded" in update.content.text
+
+    def test_turn_error_without_error_metadata_still_notifies(self) -> None:
+        update = host_event_to_acp_update(_make_event(HostEventType.TURN_ERROR))
+        assert update is not None
+        assert update.session_update == "agent_message_chunk"
+        assert update.content.text.strip()
 
 
 # ===========================================================================

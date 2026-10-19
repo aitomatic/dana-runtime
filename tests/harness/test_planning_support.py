@@ -9,14 +9,13 @@ from __future__ import annotations
 
 import pytest
 
+
 try:
     from dana.core.resource.todo import ToDoResource
 except ImportError:
     ToDoResource = None
 
-from .mocks.llm_client import MockLLMClient, LLMResponseScenario
-from .mocks.resources import MockResource
-from .harness_agent import HarnessAgent
+from .mocks.llm_client import LLMResponseScenario, MockLLMClient
 
 
 @pytest.mark.skipif(ToDoResource is None, reason="ToDoResource has been removed")
@@ -40,10 +39,12 @@ class TestToDoResourceBehavior:
 
         assert todo_resource is not None
 
-        result = todo_resource.write(todos=[
-            {"content": "Task 1", "status": "pending"},
-            {"content": "Task 2", "status": "in_progress"},
-        ])
+        result = todo_resource.write(
+            todos=[
+                {"content": "Task 1", "status": "pending"},
+                {"content": "Task 2", "status": "in_progress"},
+            ]
+        )
 
         # Should return success message (the "placebo" response)
         assert "Todos have been modified successfully" in result
@@ -98,7 +99,7 @@ class TestToDoResourceInvocation:
         mock_llm.queue_response(LLMResponseScenario(content=f"Let me track my tasks.\n{todo_tool_call}"))
         mock_llm.queue_response(MockLLMClient.simple_response("Done with task tracking"))
 
-        result = harness_agent.query(message="Help me with a complex task")
+        harness_agent.query(message="Help me with a complex task")
 
         # Should complete successfully
         harness_agent.assert_no_errors()
@@ -112,15 +113,9 @@ class TestMultiStepTaskTracking:
         mock_llm = harness_agent_with_resource._mock_llm
 
         # Multi-step interaction
-        mock_llm.queue_response(MockLLMClient.well_formed_tool_call(
-            target_id="mock-resource", method="query", message="step 1"
-        ))
-        mock_llm.queue_response(MockLLMClient.well_formed_tool_call(
-            target_id="mock-resource", method="query", message="step 2"
-        ))
-        mock_llm.queue_response(MockLLMClient.well_formed_tool_call(
-            target_id="mock-resource", method="query", message="step 3"
-        ))
+        mock_llm.queue_response(MockLLMClient.well_formed_tool_call(target_id="mock-resource", method="query", message="step 1"))
+        mock_llm.queue_response(MockLLMClient.well_formed_tool_call(target_id="mock-resource", method="query", message="step 2"))
+        mock_llm.queue_response(MockLLMClient.well_formed_tool_call(target_id="mock-resource", method="query", message="step 3"))
         mock_llm.queue_response(MockLLMClient.simple_response("All steps complete"))
 
         result = harness_agent_with_resource.query(message="Do a 3-step task")
@@ -128,7 +123,7 @@ class TestMultiStepTaskTracking:
         # Check timeline has entries (structure may vary)
         timeline = harness_agent_with_resource._timeline
         # Timeline may have entries in _entries or accessible via other means
-        has_entries = hasattr(timeline, '_entries') and len(timeline._entries) > 0
+        has_entries = hasattr(timeline, "_entries") and len(timeline._entries) > 0
         # If _entries doesn't exist, just verify the query completed
         assert result is not None or has_entries
 
@@ -136,9 +131,7 @@ class TestMultiStepTaskTracking:
         """Timeline should have correct entry types for different interactions."""
         mock_llm = harness_agent_with_resource._mock_llm
 
-        mock_llm.queue_response(MockLLMClient.well_formed_tool_call(
-            target_id="mock-resource", method="query", message="test"
-        ))
+        mock_llm.queue_response(MockLLMClient.well_formed_tool_call(target_id="mock-resource", method="query", message="test"))
         mock_llm.queue_response(MockLLMClient.simple_response("Done"))
 
         result = harness_agent_with_resource.query(message="Test task")
@@ -148,7 +141,7 @@ class TestMultiStepTaskTracking:
 
         # Timeline entry types depend on implementation
         timeline = harness_agent_with_resource._timeline
-        if hasattr(timeline, '_entries') and timeline._entries:
+        if hasattr(timeline, "_entries") and timeline._entries:
             entry_types = [e.entry_type.value for e in timeline._entries]
             # Should have some entries
             assert len(entry_types) > 0
@@ -164,7 +157,6 @@ class TestTimelinePersistence:
 
         # Track if save was called
         save_called = [False]
-        original_save = harness_agent._timeline.save
 
         def mock_save(*args, **kwargs):
             save_called[0] = True
@@ -187,12 +179,8 @@ class TestPlanStateAcrossLoops:
         mock_llm = harness_agent_with_resource._mock_llm
 
         # Set up multi-turn interaction
-        mock_llm.queue_response(MockLLMClient.well_formed_tool_call(
-            target_id="mock-resource", method="query", message="first"
-        ))
-        mock_llm.queue_response(MockLLMClient.well_formed_tool_call(
-            target_id="mock-resource", method="query", message="second"
-        ))
+        mock_llm.queue_response(MockLLMClient.well_formed_tool_call(target_id="mock-resource", method="query", message="first"))
+        mock_llm.queue_response(MockLLMClient.well_formed_tool_call(target_id="mock-resource", method="query", message="second"))
         mock_llm.queue_response(MockLLMClient.simple_response("Complete"))
 
         harness_agent_with_resource.query(message="Multi-step task")
@@ -251,15 +239,15 @@ class TestPlanningWithoutRealStorage:
         assert not hasattr(todo_resource, "get")
         assert not hasattr(todo_resource, "list")
 
-    def test_agent_can_complete_complex_task_without_persistence(
-        self, harness_agent_with_resource, mock_resource
-    ):
+    def test_agent_can_complete_complex_task_without_persistence(self, harness_agent_with_resource, mock_resource):
         """Agent should complete complex tasks even without real todo persistence."""
         mock_llm = harness_agent_with_resource._mock_llm
 
         # Simulate a complex multi-step task
         # Step 1: Plan
-        mock_llm.queue_response(LLMResponseScenario(content="""
+        mock_llm.queue_response(
+            LLMResponseScenario(
+                content="""
 I'll track this complex task.
 <tool_call>
 <target id="todo-resource"/>
@@ -272,21 +260,17 @@ I'll track this complex task.
 </todos>
 </arguments>
 </tool_call>
-"""))
+"""
+            )
+        )
 
         # Step 2: Execute first step
-        mock_llm.queue_response(MockLLMClient.well_formed_tool_call(
-            target_id="mock-resource", method="query", message="research query"
-        ))
+        mock_llm.queue_response(MockLLMClient.well_formed_tool_call(target_id="mock-resource", method="query", message="research query"))
 
         # Step 3: Mark complete and proceed
-        mock_llm.queue_response(MockLLMClient.simple_response(
-            "Research complete. Moving to implementation."
-        ))
+        mock_llm.queue_response(MockLLMClient.simple_response("Research complete. Moving to implementation."))
 
-        result = harness_agent_with_resource.query(
-            message="Complete a complex 3-step task for me"
-        )
+        harness_agent_with_resource.query(message="Complete a complex 3-step task for me")
 
         # Should complete successfully
         harness_agent_with_resource.assert_no_errors()

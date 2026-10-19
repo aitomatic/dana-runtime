@@ -80,19 +80,16 @@ class TestWorkflowDefaultMethod:
         """Workflow call with explicit 'execute' method should work."""
         mock_llm = harness_agent_with_workflow._mock_llm
 
-        content = """<tool_call>
-<target type="workflow" id="mock-workflow"/>
-<method>execute</method>
-<arguments>
-<input>test</input>
-</arguments>
-</tool_call>"""
+        content = """<function_call><invoke name="mock-workflow:execute">
+<parameter name="input">test</parameter>
+</invoke></function_call>"""
         mock_llm.queue_response(LLMResponseScenario(content=content))
         mock_llm.queue_response(MockLLMClient.simple_response("Done"))
 
         result = harness_agent_with_workflow.query(message="Execute workflow explicitly")
 
         assert result is not None
+        assert mock_workflow.call_history == [{"kwargs": {"input": "test"}}]
 
 
 class TestAsyncResourceHandling:
@@ -122,6 +119,7 @@ class TestAsyncResourceHandling:
         try:
             result = agent.query(message="Call async resource")
             assert result is not None
+            assert len(async_mock_resource.call_history) == 1
         except RuntimeError as e:
             # If it fails due to nested event loop, that's the bug we're documenting
             if "cannot be called from a running event loop" in str(e):
@@ -140,21 +138,16 @@ class TestAsyncWorkflowHandling:
             auto_register=False,
         )
         agent.with_workflows(async_mock_workflow)
+        async_mock_workflow.set_delay(1)
 
-        content = """<tool_call>
-<target type="workflow" id="async-mock-workflow"/>
-<method>execute</method>
-</tool_call>"""
+        content = """<function_call><invoke name="async-mock-workflow:execute">
+</invoke></function_call>"""
         mock_llm.queue_response(LLMResponseScenario(content=content))
         mock_llm.queue_response(MockLLMClient.simple_response("Done"))
 
-        try:
-            result = agent.query(message="Execute async workflow")
-            assert result is not None
-        except RuntimeError as e:
-            if "cannot be called from a running event loop" in str(e):
-                pytest.skip("Known issue: asyncio.run() in sync context causes deadlock")
-            raise
+        result = agent.query(message="Execute async workflow")
+        assert result is not None
+        assert async_mock_workflow.call_history == [{"kwargs": {}}]
 
 
 class TestErrorHandlingSymmetry:
@@ -176,6 +169,7 @@ class TestErrorHandlingSymmetry:
 
         # Should complete without crashing
         assert result is not None
+        assert failing_resource.call_count == 1
 
     def test_failing_workflow_error_format(self, mock_llm, failing_workflow):
         """Failing workflow should produce consistent error format."""
@@ -186,10 +180,8 @@ class TestErrorHandlingSymmetry:
         )
         agent.with_workflows(failing_workflow)
 
-        content = """<tool_call>
-<target type="workflow" id="failing-workflow"/>
-<method>execute</method>
-</tool_call>"""
+        content = """<function_call><invoke name="failing-workflow:execute">
+</invoke></function_call>"""
         mock_llm.queue_response(LLMResponseScenario(content=content))
         mock_llm.queue_response(MockLLMClient.simple_response("Error handled"))
 
@@ -197,6 +189,7 @@ class TestErrorHandlingSymmetry:
 
         # Should complete without crashing
         assert result is not None
+        assert failing_workflow.call_count == 1
 
 
 class TestReturnValueHandling:
@@ -224,16 +217,15 @@ class TestReturnValueHandling:
         mock_llm = harness_agent_with_workflow._mock_llm
         mock_workflow.default_result = {"status": "success", "data": [1, 2, 3]}
 
-        content = """<tool_call>
-<target type="workflow" id="mock-workflow"/>
-<method>execute</method>
-</tool_call>"""
+        content = """<function_call><invoke name="mock-workflow:execute">
+</invoke></function_call>"""
         mock_llm.queue_response(LLMResponseScenario(content=content))
         mock_llm.queue_response(MockLLMClient.simple_response("Done"))
 
         result = harness_agent_with_workflow.query(message="Get dict result")
 
         assert result is not None
+        assert mock_workflow.call_history == [{"kwargs": {}}]
 
 
 class TestIdKeyConsistency:
@@ -244,32 +236,30 @@ class TestIdKeyConsistency:
         mock_llm = harness_agent_with_resource._mock_llm
 
         # Use resource_id in tool call
-        content = """<tool_call>
-<target type="resource" id="mock-resource"/>
-<method>query</method>
-<arguments><message>test</message></arguments>
-</tool_call>"""
+        content = """<function_call><invoke name="mock-resource:query">
+<parameter name="message">test</parameter>
+</invoke></function_call>"""
         mock_llm.queue_response(LLMResponseScenario(content=content))
         mock_llm.queue_response(MockLLMClient.simple_response("Done"))
 
         result = harness_agent_with_resource.query(message="Use resource_id")
 
         assert result is not None
+        assert len(mock_resource.call_history) == 1
 
     def test_workflow_uses_workflow_id(self, harness_agent_with_workflow, mock_workflow):
         """Workflows should be identified by workflow_id."""
         mock_llm = harness_agent_with_workflow._mock_llm
 
-        content = """<tool_call>
-<target type="workflow" id="mock-workflow"/>
-<method>execute</method>
-</tool_call>"""
+        content = """<function_call><invoke name="mock-workflow:execute">
+</invoke></function_call>"""
         mock_llm.queue_response(LLMResponseScenario(content=content))
         mock_llm.queue_response(MockLLMClient.simple_response("Done"))
 
         result = harness_agent_with_workflow.query(message="Use workflow_id")
 
         assert result is not None
+        assert mock_workflow.call_history == [{"kwargs": {}}]
 
     def test_generic_object_id_works_for_both(self, harness_agent, mock_resource, mock_workflow):
         """Generic object_id lookup should work for both types."""
@@ -309,10 +299,8 @@ class TestMixedResourceWorkflowCalls:
             )
         )
         # Second: workflow call
-        workflow_call = """<tool_call>
-<target type="workflow" id="mock-workflow"/>
-<method>execute</method>
-</tool_call>"""
+        workflow_call = """<function_call><invoke name="mock-workflow:execute">
+</invoke></function_call>"""
         mock_llm.queue_response(LLMResponseScenario(content=workflow_call))
         # Final response
         mock_llm.queue_response(MockLLMClient.simple_response("Both completed"))
@@ -321,3 +309,4 @@ class TestMixedResourceWorkflowCalls:
 
         assert result is not None
         assert len(mock_resource.call_history) >= 1
+        assert mock_workflow.call_history == [{"kwargs": {}}]

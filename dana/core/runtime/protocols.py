@@ -71,6 +71,7 @@ class StreamEventType(Enum):
     TEXT_DELTA = "text_delta"
     TOOL_CALL_START = "tool_call_start"
     TOOL_RESULT = "tool_result"
+    PROVIDER_RESPONSE = "provider_response"
     DONE = "done"
     ERROR = "error"
 
