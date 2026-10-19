@@ -359,6 +359,186 @@ async def test_async_seam_uses_the_runtime_async_provider_and_reads_response_tex
     assert tl.get_compressed_context() == "from runtime"
 
 
+class _RuntimeProbe:
+    """Runtime double that records which runtime default, if any, was used."""
+
+    def __init__(self, reply: str = '{"summary": "from runtime"}') -> None:
+        self.async_calls: list[str] = []
+        self.sync_calls: list[str] = []
+        self._reply = reply
+
+    async def call_llm_async(self, messages, messages_fn=None):
+        self.async_calls.append(messages[0].content)
+        return LLMResponse(content=self._reply, model="m", usage=None)
+
+    def call_llm(self, messages, messages_fn=None):
+        self.sync_calls.append(messages[0].content)
+        return LLMResponse(content=self._reply, model="m", usage=None)
+
+
+class _AgentWithRuntime:
+    """Agent double exposing ``_runtime`` the way a consumer attaches a timeline."""
+
+    def __init__(self, runtime: _RuntimeProbe) -> None:
+        self._runtime = runtime
+
+
+@pytest.mark.asyncio
+async def test_explicit_sync_callback_is_honored_even_with_a_runtime_async_default():
+    """An explicitly configured sync summarizer is the caller's chosen ownership.
+
+    With a runtime attached, the async seam must still run the configured sync
+    callback (off-loop and joined), never substitute the runtime's async call.
+    """
+    tl = _build()
+    recorder = _ProjectionRecorder(tl)
+    runtime = _RuntimeProbe(reply='{"summary": "runtime should not run"}')
+    tl._agent = _AgentWithRuntime(runtime)
+    loop_thread = threading.get_ident()
+    sync_threads: list[int] = []
+    sync_prompts: list[str] = []
+
+    def summarizer(prompt: str) -> str:
+        sync_threads.append(threading.get_ident())
+        sync_prompts.append(prompt)
+        return '{"summary": "explicit sync"}'
+
+    tl._llm_call_fn = summarizer
+    await asyncio.wait_for(tl.reactive_compact_async(1), timeout=5.0)
+
+    assert len(sync_threads) == 1, "the configured sync callback must run exactly once"
+    assert sync_prompts and sync_prompts[0], "the compression prompt must be handed to the configured callback"
+    assert sync_threads[0] != loop_thread, "the blocking callback runs off-loop"
+    assert recorder.commits == [loop_thread], "the commit stays on the awaiting thread, never the worker"
+    assert all(thread == loop_thread for _e, _m, thread in recorder.installs)
+    assert tl.get_compressed_context() == "explicit sync"
+    assert runtime.async_calls == [], "the runtime async default must not replace the explicit callback"
+    assert runtime.sync_calls == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_async_callback_wins_when_both_callbacks_are_configured():
+    """Both configured → async wins, and the sync callback is never called."""
+    tl = _build()
+    runtime = _RuntimeProbe(reply='{"summary": "runtime should not run"}')
+    tl._agent = _AgentWithRuntime(runtime)
+    loop_thread = threading.get_ident()
+    async_threads: list[int] = []
+    sync_calls: list[str] = []
+
+    async def summarizer(prompt: str) -> str:
+        async_threads.append(threading.get_ident())
+        return '{"summary": "explicit async"}'
+
+    def sync_summarizer(prompt: str) -> str:  # pragma: no cover - must not be used
+        sync_calls.append(prompt)
+        return '{"summary": "explicit sync"}'
+
+    tl._llm_call_async_fn = summarizer
+    tl._llm_call_fn = sync_summarizer
+    await asyncio.wait_for(tl.reactive_compact_async(1), timeout=5.0)
+
+    assert async_threads == [loop_thread], "the async callback is awaited in place"
+    assert sync_calls == [], "the sync callback must not run when an async one is configured"
+    assert tl.get_compressed_context() == "explicit async"
+    assert runtime.async_calls == [], "an explicit callback must win over the runtime default"
+    assert runtime.sync_calls == []
+
+
+@pytest.mark.asyncio
+async def test_falsy_explicit_sync_callback_is_still_the_configured_summarizer():
+    """Callback intent is ``is None``, not truthiness: a falsy callable still runs."""
+    tl = _build()
+    runtime = _RuntimeProbe(reply='{"summary": "runtime should not run"}')
+    tl._agent = _AgentWithRuntime(runtime)
+    calls: list[str] = []
+
+    class _FalsySummarizer:
+        def __bool__(self) -> bool:
+            return False
+
+        def __call__(self, prompt: str) -> str:
+            calls.append(prompt)
+            return '{"summary": "falsy callable"}'
+
+    tl._llm_call_fn = _FalsySummarizer()
+    await asyncio.wait_for(tl.reactive_compact_async(1), timeout=5.0)
+
+    assert len(calls) == 1, "the configured falsy callable must run exactly once"
+    assert tl.get_compressed_context() == "falsy callable"
+    assert runtime.async_calls == []
+    assert runtime.sync_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sync_seam_honors_a_falsy_explicit_callback_over_the_runtime_default():
+    """The blocking seam applies the same ``is None`` callback contract."""
+    tl = _build()
+    runtime = _RuntimeProbe(reply='{"summary": "runtime should not run"}')
+    tl._agent = _AgentWithRuntime(runtime)
+    calls: list[str] = []
+
+    class _FalsySummarizer:
+        def __bool__(self) -> bool:
+            return False
+
+        def __call__(self, prompt: str) -> str:
+            calls.append(prompt)
+            return '{"summary": "falsy sync"}'
+
+    tl._llm_call_fn = _FalsySummarizer()
+    tl.reactive_compact(1)
+
+    assert len(calls) == 1, "the configured falsy callable must run exactly once"
+    assert tl.get_compressed_context() == "falsy sync"
+    assert runtime.async_calls == []
+    assert runtime.sync_calls == [], "the runtime default must not replace a configured callback"
+
+
+@pytest.mark.asyncio
+async def test_proactive_compress_honors_falsy_explicit_callbacks():
+    """``compress``/``compress_async`` keep the same ``is None`` contract."""
+    sync_tl = _build()
+    sync_runtime = _RuntimeProbe(reply='{"summary": "runtime should not run"}')
+    sync_tl._agent = _AgentWithRuntime(sync_runtime)
+    sync_calls: list[str] = []
+
+    class _FalsySyncSummarizer:
+        def __bool__(self) -> bool:
+            return False
+
+        def __call__(self, prompt: str) -> str:
+            sync_calls.append(prompt)
+            return '{"summary": "falsy compress"}'
+
+    sync_tl._llm_call_fn = _FalsySyncSummarizer()
+    assert sync_tl.compress() > 0
+    assert len(sync_calls) == 1, "the configured falsy callable must run exactly once"
+    assert sync_tl.get_compressed_context() == "falsy compress"
+    assert sync_runtime.async_calls == []
+    assert sync_runtime.sync_calls == []
+
+    async_tl = _build()
+    async_runtime = _RuntimeProbe(reply='{"summary": "runtime should not run"}')
+    async_tl._agent = _AgentWithRuntime(async_runtime)
+    async_calls: list[str] = []
+
+    class _FalsyAsyncSummarizer:
+        def __bool__(self) -> bool:
+            return False
+
+        async def __call__(self, prompt: str) -> str:
+            async_calls.append(prompt)
+            return '{"summary": "falsy compress async"}'
+
+    async_tl._llm_call_async_fn = _FalsyAsyncSummarizer()
+    assert await async_tl.compress_async() > 0
+    assert len(async_calls) == 1, "the configured falsy callable must run exactly once"
+    assert async_tl.get_compressed_context() == "falsy compress async"
+    assert async_runtime.async_calls == []
+    assert async_runtime.sync_calls == []
+
+
 @pytest.mark.asyncio
 async def test_sync_seam_still_commits_fully_through_the_shared_internals():
     """Parity guard: the refactor must not weaken ``reactive_compact``."""

@@ -211,5 +211,52 @@
       "both_successful_n": 35,
       "both_successful_ratio_median": 1.0526434644038232
     }
+  },
+  "historical_verification": {
+    "first_repair": "https://github.com/aitomatic/dana-runtime/blob/6eaebb5/benchmarks/results/pr32-review-verification.json",
+    "second_repair": "https://github.com/aitomatic/dana-runtime/blob/522ab49/benchmarks/results/pr32-rereview-verification.json",
+    "current_validation": "https://github.com/aitomatic/dana-runtime/pull/32",
+    "interpretation": "Immutable records prove only the revisions and paths they name. The earlier 1.557/0.527 ms comparison omitted argument size and does not establish a general I14 result."
+  },
+  "accounting_observation": {
+    "source_baseline": "522ab49; accounting code unchanged by third-review repairs",
+    "scope": "Offline single-head local observation, not an end-to-end or paired-head speedup",
+    "python": "3.12.11",
+    "platform": "Darwin/arm64",
+    "repetitions": 50,
+    "warmups": 5,
+    "turn_shape": "One tool call, its result body, and one follow-up user message; no mutation between reads; message objects not publicly escaped",
+    "small_arguments": "query='site {index}', limit=index+1; JSON UTF-8 size varies with index",
+    "large_arguments": "One dictionary with one immutable ASCII string; json.dumps UTF-8 encoding exactly 2048 bytes",
+    "plain_baseline": "Sum _estimate_native_message_tokens over retained native messages, without snapshots",
+    "snapshot_baseline": "_recompute_token_total: full counting, fresh dependency snapshots and cache anchoring",
+    "rows": [
+      {
+        "turns": 100, "messages": 300, "argument_bytes_min": 31, "argument_bytes_max": 34,
+        "incremental_read_median_ms": 0.1138125,
+        "plain_full_count_median_ms": 0.052542,
+        "full_recount_with_snapshots_median_ms": 0.5500625
+      },
+      {
+        "turns": 100, "messages": 300, "argument_bytes_min": 2048, "argument_bytes_max": 2048,
+        "incremental_read_median_ms": 0.1025005,
+        "plain_full_count_median_ms": 0.365854,
+        "full_recount_with_snapshots_median_ms": 0.849458
+      },
+      {
+        "turns": 1000, "messages": 3000, "argument_bytes_min": 31, "argument_bytes_max": 36,
+        "incremental_read_median_ms": 1.2308335,
+        "plain_full_count_median_ms": 0.5585835,
+        "full_recount_with_snapshots_median_ms": 6.123833
+      },
+      {
+        "turns": 1000, "messages": 3000, "argument_bytes_min": 2048, "argument_bytes_max": 2048,
+        "incremental_read_median_ms": 1.0540005,
+        "plain_full_count_median_ms": 3.8668955,
+        "full_recount_with_snapshots_median_ms": 9.0427915
+      }
+    ],
+    "all_token_totals_equal": true,
+    "costs": "Append snapshots deep-copy mutable arguments. Retained argument state can roughly double for mutable-heavy payloads, but immutable string leaves may remain shared. Comparisons remain linear in retained dependency state."
   }
 }

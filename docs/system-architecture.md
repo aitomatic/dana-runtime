@@ -515,9 +515,18 @@ an escaped public message reference also requires attribute-change checks.
 Retained dependency comparisons can still scale with mutable history size.
 This is incremental token estimation, not a constant-time guarantee for
 arbitrary caller-mutated histories.
-Snapshot retention also consumes memory proportional to aliased payloads.
-Preserving public mutation visibility can cost more than recounting on some
-workloads; plain-history benchmark gains must not be generalized to this path.
+Snapshots add append-time `deepcopy` work and retain another representation of
+mutable tool arguments. For predominantly mutable payloads this can roughly
+double the retained argument state; it is not a universal 2x resident-memory
+claim because immutable leaves such as strings can be shared by `deepcopy`.
+Whether dependency comparison beats a plain recount depends on argument size
+and shape, retained turn count, and the comparison baseline. Small argument
+dictionaries can make incremental reads slower than plain full counting; larger
+arguments can reverse that result. Rebuilding full-count dependency snapshots
+is a different, more expensive baseline. See the explicitly parameterized
+single-head observations in the [bounded benchmark summary](../benchmarks/results/pr32-original-summary.json).
+Neither those observations nor plain-history gains establish an end-to-end
+speedup for arbitrary caller-mutated histories.
 
 Runtime-context replacement, hydration, shrink, and compaction keep the message
 cache aligned with the live projection. Hydrating caller-owned dictionaries
@@ -554,10 +563,23 @@ OpenClaude-style engines:
    cooldown `DANA_CIRCUIT_COOLDOWN_SECONDS` (default 300s) plus half-open
    probe provide automatic recovery. Kill switch via
    `DANA_DISABLE_REACTIVE_COMPACT=1`.
+   Async summarizer precedence is explicit async callback, explicit sync
+   callback, runtime async default, then runtime sync default. An attached
+   runtime never replaces an explicitly configured callback; configured means
+   non-`None`, not truthy.
    Async compaction propagates cancellation to the awaited summarizer rather
    than abandoning a worker that can later overwrite the timeline. A sync-only
    callback must be joined before ownership releases, so its remaining physical
    duration can overrun the logical request deadline.
+   Mixed sync/async calls on one timeline still use separate gates. Shipped
+   hosts serialize turns or use separate agents; no concurrent mixed-mode
+   driver on one timeline was found. Direct embedding can invoke `query` and
+   `aquery` concurrently with a normal runtime, however, and those entry points
+   have no shared turn guard. Generation checks reject stale plans but do not
+   prove serialized drop/circuit transitions.
+   [Issue #34](https://github.com/aitomatic/dana-runtime/issues/34) tracks that
+   deferred ownership contract and regression; this is not a general
+   thread-safety guarantee for direct embedding.
 
 **Provider PTL mapping:**
 | Provider | Detection |
@@ -639,14 +661,26 @@ the repository it opens. ACP and CLI close sessions before host-owned storage.
   run in the bounded worker pool. Unmarked synchronous Python stays on the
   event loop; it is not assumed thread-safe. Async file tools may explicitly
   offload their blocking cores through `run_blocking`; async signatures do not
-  imply inline disk I/O. Cancellation signals cooperative waits and retains
-  admission/effect ownership until physical work exits. A non-cooperative
-  callable can therefore delay cancellation; Python threads cannot safely be
-  forcibly terminated.
+  imply inline disk I/O. For explicitly offloaded synchronous dispatch,
+  cancellation signals cooperative waits and retains admission/effect ownership
+  until physical work exits. A non-cooperative callable can therefore delay
+  cancellation; Python threads cannot safely be forcibly terminated.
+  Self-offloading coroutine tools have a known ownership gap: cancelling an
+  `Edit` dispatch can release admission while its nested worker continues.
+  [Issue #33](https://github.com/aitomatic/dana-runtime/issues/33) tracks that
+  deferred fix and the audit of other coroutine resources.
   Root executors close only their owned pool; a direct-call fallback pool lives
-  until process exit. Awaited worker joins run off-loop. File-edit path locks
-  are weakly indexed, with strong ownership through each holder or waiter, so
-  completed paths do not accumulate registry entries.
+  until process exit. Pool close atomically stops submission and snapshots live
+  claims from both async `run` and legacy `run_sync`, signals every claim before
+  joining, and logs each still-running callable with monotonic physical elapsed
+  time, never arguments or output. Queued work is not reported as running;
+  a worker starting from the queue after its close signal reports that start
+  separately, so it cannot become an undiagnosed join blocker.
+  Awaited worker joins run off-loop with no join timeout. Physical completion,
+  queued cancellation or rejection settles a claim; waiter cancellation does
+  not settle running work. File-edit path locks are weakly indexed, with strong
+  ownership through each holder or waiter, so completed paths do not accumulate
+  registry entries.
 - **Bash pipe ownership**: Process exit and output completion are separate.
   Descendants may keep inherited pipes open after the shell exits. Status stays
   `running` until output drains, while `exit_code` can report the terminal process.

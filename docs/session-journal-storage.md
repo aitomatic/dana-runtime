@@ -142,6 +142,13 @@ rollback. Cancellation joins the shielded transaction before releasing the
 connection lock. Reads cannot observe another operation's uncommitted
 transaction on that connection.
 
+Cancellation is not proof that a write rolled back. If cancellation arrives
+during COMMIT, the shielded transaction may already be durable before the caller
+receives `CancelledError`. Direct repository callers must reload the journal
+version before retrying. A retry using the old expected version must handle
+`JournalConflict` by reloading and reconciling the committed facts, not blindly
+appending the same logical operation again.
+
 Cancelling the caller task propagates `CancelledError` after owned producer,
 tool, and required terminal-write cleanup. Explicit `session.cancel()` and an
 internally cancelled producer yield a normal cancellation terminal event without

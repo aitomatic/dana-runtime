@@ -86,29 +86,28 @@ quality preservation.
 Do not quote these numbers as post-review performance. Re-measure affected paths
 with pinned source and unchanged workloads before making new speed claims.
 
-## Review-repair verification
+## Verification evidence and accounting limits
 
-[`results/pr32-review-verification.json`](results/pr32-review-verification.json)
-records the first repair pass over 31 review items and bounded actual-path checks.
-It is historical evidence, not a claim that subsequent review found no defects.
-Checks include crash recovery, commit-boundary cancellation, physical worker
-ownership, real local MCP servers, policy/admission isolation, tool-using timeline
-accounting and SQLite/PostgreSQL reopen fidelity.
+The bounded summary is the only retained result artifact in the current tree.
+Its immutable links preserve the [first repair verification](https://github.com/aitomatic/dana-runtime/blob/6eaebb5/benchmarks/results/pr32-review-verification.json)
+and [second repair verification](https://github.com/aitomatic/dana-runtime/blob/522ab49/benchmarks/results/pr32-rereview-verification.json).
+Those records describe their stated revisions, not current-head acceptance.
+Current validation and CI belong to [PR #32](https://github.com/aitomatic/dana-runtime/pull/32).
 
-[`results/pr32-rereview-verification.json`](results/pr32-rereview-verification.json)
-records the second-pass cancellation, pipe-drain, sampling-intent and lifecycle
-repairs, including defects caught during integration review. It also reports
-the remaining mutable-alias accounting cost rather than claiming a speedup.
+The summary also records an offline, single-head I14 observation: 100 and 1,000
+tool turns, each comprising a call, result and follow-up message; 31-36-byte
+or exactly 2,048-byte JSON argument dictionaries; 50 repetitions after five
+warmups. Incremental reads, plain full counting, and full recounting with fresh
+dependency snapshots are separate measurements. Small arguments favored plain
+counting; 2,048-byte arguments favored incremental reads. Append-time copying
+and proportional snapshot memory remain costs, not silently disabled behavior.
+The earlier 1.557/0.527 ms comparison did not record argument size, so it cannot
+support a general performance conclusion.
 
-In the first repair pass, the CI benchmark step was executed with an independent network
-guard: five entry points exited zero and all seven JSON assertions passed.
-Two tools-history observations remain observations, not defects or hidden passes.
-These small runs are correctness smokes, not a new speed comparison.
-
-The two separately authorized Azure streaming requests returned HTTP 200 and
-streamed text on the old default and recent API versions. The probe's final
-assertion used the wrong terminal-chunk name, so live terminal-carrier and usage
-receipt remain unverified. No additional paid request was sent.
+Historical live evaluation and two Azure compatibility requests do not validate
+the repaired head's production latency or model quality. The Azure requests
+established HTTP 200 and streamed text, not terminal-carrier or usage receipt.
+No new provider request is authorized by these records.
 
 ## Paid runs
 

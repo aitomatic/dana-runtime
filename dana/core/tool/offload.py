@@ -45,6 +45,16 @@ admission permit while its offloaded call is still running, and must not park a
 worker thread for a long timeout either. A dispatch that offloads binds a
 :class:`PhysicalWorkClaim`: the pool marks ``done`` when the call returns, and
 dispatch asks cooperative callables to stop waiting by setting ``cancel``.
+
+The pool itself also has to account for every physical call, not only the ones a
+dispatch happens to watch. Each call started through the async
+:meth:`BlockingIOPool.run` or the legacy :meth:`BlockingIOPool.run_sync` is
+registered with its pool for as long as its physical work is live. Registration,
+the closed check and the shutdown snapshot all happen under the pool's lock, so
+a submission and a concurrent close cannot interleave into an unowned worker.
+Shutdown asks every live claim to stop waiting *before* it joins the workers,
+without a join time box, and then reports each claim that is still executing,
+naming the callable and how long its body has actually run.
 """
 
 from __future__ import annotations
@@ -84,6 +94,10 @@ PHYSICAL_DRAIN_POLL_INTERVAL_S = 0.02
 #: ``ThreadPoolExecutor`` guidance for I/O-bound work without unbounded fan-out.
 MAX_BLOCKING_WORKERS = min(32, (os.cpu_count() or 1) + 4)
 
+#: Bound on the callable name carried by a claim. Diagnostics name *what* is
+#: stuck, so the name must stay short and carry no arguments or output.
+MAX_CLAIM_NAME_CHARS = 120
+
 
 class BlockingIOShutdown(RuntimeError):
     """Raised when an offload is requested on a pool that was already closed."""
@@ -96,7 +110,7 @@ class BlockingIOShutdown(RuntimeError):
 _physical_claim: contextvars.ContextVar[PhysicalWorkClaim | None] = contextvars.ContextVar("dana_physical_claim", default=None)
 
 
-@dataclass
+@dataclass(eq=False)
 class PhysicalWorkClaim:
     """Ownership of one offloaded call: is its physical work still running?
 
@@ -105,20 +119,60 @@ class PhysicalWorkClaim:
     waiting early by setting :attr:`cancel`, and (b) observe :attr:`done`, which the
     pool sets when the call actually returned. Both are thread-safe: ``cancel`` is
     a :class:`threading.Event` set from the loop thread and read from the worker.
+
+    :attr:`started_at` is the monotonic instant at which the *body* began
+    executing, published by the worker itself (never the submission instant): a
+    call that waited in the queue must not be reported as having run. It stays
+    ``None`` until then. :attr:`name` is a bounded, non-sensitive callable label
+    used only by shutdown diagnostics.
     """
 
     cancel: threading.Event = field(default_factory=threading.Event)
     done: threading.Event = field(default_factory=threading.Event)
     submitted: bool = False
+    name: str = ""
+    started_at: float | None = None
+    #: Installed by the owning pool under its lock at registration; discards the
+    #: claim from that pool's live-work registry. Cleared on settle so a late
+    #: duplicate notification cannot reach a pool that already dropped the claim
+    #: (the discard itself is idempotent, so an interleaved race is harmless).
+    _release: Callable[[PhysicalWorkClaim], None] | None = field(default=None, repr=False, compare=False)
 
     @property
     def finished(self) -> bool:
         """Whether the physical call has returned (or was dropped unstarted)."""
         return self.done.is_set()
 
+    def mark_started(self) -> None:
+        """Record the monotonic instant the physical body began (worker side)."""
+        self.started_at = time.monotonic()
+
+    def settle(self) -> None:
+        """Record that no physical work is owed and leave the pool's registry.
+
+        Called on every honest outcome: the worker body returned (or raised), the
+        queued work was cancelled before a worker picked it up, or submission was
+        refused. A cancelled *waiter* must not call this while its work runs.
+        The release hook is cleared on the first call, so a worker completion and
+        a cancellation notification can race without keeping the claim registered;
+        the registry discard is idempotent either way.
+        """
+        self.done.set()
+        release = self._release
+        self._release = None
+        if release is not None:
+            release(self)
+
     def request_cancel(self) -> None:
         """Ask the callable to stop waiting (cooperative callables only)."""
         self.cancel.set()
+
+    def running_for(self) -> float | None:
+        """Seconds the body has actually run, or ``None`` while it has not begun."""
+        started_at = self.started_at
+        if started_at is None:
+            return None
+        return max(0.0, time.monotonic() - started_at)
 
     async def drain(self, timeout: float | None = PHYSICAL_DRAIN_TIMEOUT_S) -> bool:
         """Wait (never blocking the loop) for the physical call to finish.
@@ -176,12 +230,31 @@ def current_physical_work() -> PhysicalWorkClaim | None:
     return _physical_claim.get()
 
 
+def _claim_name(func: Callable[..., Any]) -> str:
+    """A bounded, non-sensitive label for ``func`` (never its arguments/output).
+
+    A qualified name is used for methods and module-level callables so a stuck
+    shutdown says which class or module owns the blocking work; a closure falls
+    back to its plain name, since ``<locals>`` adds noise without identity. The
+    label passes through :data:`MAX_CLAIM_NAME_CHARS` because a generated
+    callable can have an arbitrarily long name, and this string ends up in log
+    records.
+    """
+    target = getattr(func, "__func__", func)
+    qualname = getattr(target, "__qualname__", "") or ""
+    name = qualname if qualname and "<locals>" not in qualname else getattr(target, "__name__", "")
+    if not name:
+        name = type(target).__name__
+    return str(name)[:MAX_CLAIM_NAME_CHARS]
+
+
 def _run_claimed(
     ctx: contextvars.Context,
     func: Callable[..., Any],
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     claim: PhysicalWorkClaim,
+    pool: BlockingIOPool,
 ) -> Any:
     """Worker body: publish ``claim`` for this call, then run it in ``ctx``.
 
@@ -191,14 +264,21 @@ def _run_claimed(
 
     Always marks the claim done — including when the callable raises — so a
     cancelled dispatch stops holding an admission permit for work that is over.
+    The start instant is published here, not at submission: a claim that waited
+    in the queue has not physically run and must not be reported as if it had.
     """
 
     def _body() -> Any:
         _physical_claim.set(claim)
+        claim.mark_started()
         try:
+            # A queued call can start after close's diagnostic snapshot and then
+            # become the join blocker. Diagnose that transition without polling.
+            if pool.closed and claim.cancel.is_set():
+                pool._log_running_claims(claim)
             return func(*args, **kwargs)
         finally:
-            claim.done.set()
+            claim.settle()
 
     return ctx.run(_body)
 
@@ -239,6 +319,18 @@ class BlockingIOPool:
         self._pool: ThreadPoolExecutor | None = None
         self._closed = False
         self._lock = threading.Lock()
+        #: Guards ``_claims`` only. Kept separate from ``_lock`` on purpose: a
+        #: cancelled concurrent future settles its claim from inside
+        #: ``shutdown(cancel_futures=True)``, which already holds the underlying
+        #: executor's shutdown lock. If settlement needed ``_lock`` (held across
+        #: ``executor.submit``), a submission and a close could deadlock. The only
+        #: lock order ever taken is ``_lock`` then ``_claims_lock``.
+        self._claims_lock = threading.Lock()
+        #: Every claim whose physical work may still be owed to this pool. Added
+        #: under the submission critical section, removed when the work settles.
+        #: Not cleared by shutdown: a non-cooperative worker that outlives the
+        #: close keeps its ownership visible until it really returns.
+        self._claims: set[PhysicalWorkClaim] = set()
 
     @property
     def max_workers(self) -> int:
@@ -255,8 +347,21 @@ class BlockingIOPool:
         """Whether a worker thread has been requested yet."""
         return self._pool is not None
 
-    def _executor(self) -> ThreadPoolExecutor:
-        """Lazily create (once) and return the underlying executor.
+    @staticmethod
+    def _watch_dropped(claim: PhysicalWorkClaim, concurrent: Any) -> None:
+        """Settle ``claim`` if the concurrent future is cancelled before starting.
+
+        A cancelled concurrent future is the only honest proof that the worker body
+        never began. When the work is already running, ``cancel()`` fails, so the
+        future is never cancelled and the claim stays open for ``_run_claimed``'s
+        own completion to settle. The callback runs in whichever thread cancelled
+        the future (a cancelled waiter, or shutdown dropping queued work), so
+        cleanup never depends on the event loop still running.
+        """
+        concurrent.add_done_callback(lambda settled: claim.settle() if settled.cancelled() else None)
+
+    def _started_executor_locked(self) -> ThreadPoolExecutor:
+        """Caller must hold ``self._lock``. Refuse when closed, else create once.
 
         The closed check is made *under* the lock: ``shutdown`` takes the same
         lock to set ``_closed``, so a concurrent close cannot land between the
@@ -265,11 +370,6 @@ class BlockingIOPool:
         the pool reported itself closed while a fresh worker thread (which
         nothing would ever join) was started behind it.
         """
-        with self._lock:
-            return self._started_executor_locked()
-
-    def _started_executor_locked(self) -> ThreadPoolExecutor:
-        """Caller must hold ``self._lock``. Refuse when closed, else create once."""
         if self._closed:
             raise BlockingIOShutdown("blocking I/O pool was shut down; no new offloads are accepted")
         if self._pool is None:
@@ -277,18 +377,42 @@ class BlockingIOPool:
             logger.info("blocking_io_pool_started", max_workers=self._max_workers, name=self._name)
         return self._pool
 
-    def _submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
-        """Submit ``fn(*args, **kwargs)`` to this pool, refusing to race a close.
+    def _settle_claim(self, claim: PhysicalWorkClaim) -> None:
+        """Discard ``claim`` from the live registry (idempotent).
 
-        Submission happens *inside* the lock so a concurrent :meth:`shutdown`
-        can neither drop the submission as "after shutdown" (the raw executor's
-        own ``RuntimeError``) nor lose the worker it started. Either this call
-        gets a bounded, owned worker that ``shutdown`` will account for, or it
-        fails with the documented :class:`BlockingIOShutdown` - never a
-        half-closed pool with an unjoinable thread behind it.
+        Takes only ``_claims_lock``: a worker or a dropped-future callback can
+        settle while a submission holds ``_lock`` or a close holds the executor's
+        own lock, and neither may be blocked on the other through this path.
+        """
+        with self._claims_lock:
+            self._claims.discard(claim)
+
+    def _submit_claimed(self, claim: PhysicalWorkClaim, call: Callable[[], Any], *, name: str) -> Any:
+        """Register ``claim`` and submit ``call``, all under the pool lock.
+
+        Registration, the closed check and the executor's own submit share one
+        critical section, so a concurrent :meth:`shutdown` either sees this claim
+        in its snapshot (and signals/joins its work) or refuses the submission
+        outright. There is no window in which a worker starts behind a close with
+        nothing owning it, and no window in which shutdown's snapshot misses work
+        that was accepted. A failed submit removes the claim again: refused work
+        owes nothing.
         """
         with self._lock:
-            return self._started_executor_locked().submit(fn, *args, **kwargs)
+            executor = self._started_executor_locked()
+            claim.name = claim.name or name
+            claim.submitted = True
+            claim._release = self._settle_claim
+            with self._claims_lock:
+                self._claims.add(claim)
+            try:
+                return executor.submit(call)
+            except BaseException:
+                with self._claims_lock:
+                    self._claims.discard(claim)
+                claim._release = None
+                claim.submitted = False
+                raise
 
     async def run(self, func: Callable[..., Any], *args: Any, _claim: PhysicalWorkClaim | None = None, **kwargs: Any) -> Any:
         """Run ``func(*args, **kwargs)`` on this pool and await the result.
@@ -308,42 +432,52 @@ class BlockingIOPool:
         claim stays unsettled until the callable really returns. Callers that do not
         pass a claim get an internal one, so a marked callable can always read its
         cancellation request.
+
+        The claim is registered with this pool in the same critical section as the
+        acceptance check, so a concurrent :meth:`shutdown` snapshots it and asks it
+        to stop waiting before it joins. A cancelled *waiter* does not settle the
+        claim while the worker still owns physical work: only a call whose future
+        never started does.
         """
         loop = asyncio.get_running_loop()
         handle = _claim if _claim is not None else PhysicalWorkClaim()
-        handle.submitted = True
         # Copy the caller's context on the loop side: ``run_in_executor`` alone
         # leaves the worker in an empty context, so the bound offload pool (and a
         # nested offload's cancellation request) must travel with the call.
         ctx = contextvars.copy_context()
-        call = functools.partial(_run_claimed, ctx, func, args, kwargs, handle)
+        call = functools.partial(_run_claimed, ctx, func, args, kwargs, handle, self)
         # Submit directly (not via ``run_in_executor``) so the underlying concurrent
         # future is in hand: its ``cancel()`` result is the only honest signal that
         # the work never started.
         try:
-            concurrent = self._submit(call)
+            concurrent = self._submit_claimed(handle, call, name=_claim_name(func))
         except BaseException:
-            handle.done.set()
+            handle.settle()
             raise
-        future = asyncio.wrap_future(concurrent, loop=loop)
-
-        def _settle_if_dropped(settled: asyncio.Future) -> None:
-            # Only a call whose worker body never began owes nothing. When the work
-            # is already running, ``cancel()`` fails and the claim is left open for
-            # ``_run_claimed``'s own completion to settle.
-            if settled.cancelled() and concurrent.cancel():
-                handle.done.set()
-
-        future.add_done_callback(_settle_if_dropped)
-        return await future
+        self._watch_dropped(handle, concurrent)
+        return await asyncio.wrap_future(concurrent, loop=loop)
 
     def run_sync(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Submit ``func`` from a synchronous caller and wait for the result.
 
         Used by the legacy synchronous dispatch path, which has no loop to stall
         but still wants bounded, lifecycle-owned execution. Exceptions propagate.
+
+        The call is registered with this pool exactly like an async one, so a
+        concurrent :meth:`shutdown` can signal it too. A queued call that the
+        close dropped settles its claim; a running call keeps its claim until the
+        worker body returns, and the shutdown log names it if it survives.
         """
-        return self._submit(_run_claimed, contextvars.copy_context(), func, args, kwargs, PhysicalWorkClaim()).result()
+        claim = PhysicalWorkClaim()
+        ctx = contextvars.copy_context()
+        call = functools.partial(_run_claimed, ctx, func, args, kwargs, claim, self)
+        try:
+            concurrent = self._submit_claimed(claim, call, name=_claim_name(func))
+        except BaseException:
+            claim.settle()
+            raise
+        self._watch_dropped(claim, concurrent)
+        return concurrent.result()
 
     def shutdown(self, wait: bool = False) -> None:
         """Close this pool (idempotent). Affects only this pool's own threads.
@@ -353,6 +487,15 @@ class BlockingIOPool:
                 queued-but-unstarted work is dropped and already-running work is
                 allowed to finish on its threads. Shutdown never pretends
                 in-flight non-cooperative work was rolled back.
+
+        Every live claim is asked to stop waiting *before* any join, so a
+        cooperative body - including queued work that has not started yet - exits
+        instead of making the join wait out its own timeout. The join itself is
+        not time-boxed: a non-cooperative worker is joined for as long as it runs,
+        and its ownership stays visible rather than being reported as cancelled.
+        Each claim still executing at that point is logged with its bounded
+        callable name and how long its body has actually run, so a join that does
+        not return is diagnosable from the log.
         """
         with self._lock:
             if self._closed:
@@ -360,9 +503,42 @@ class BlockingIOPool:
             self._closed = True
             pool = self._pool
             self._pool = None
+            with self._claims_lock:
+                claims = tuple(self._claims)
+        # Signal before joining: a cooperative callable only returns early once it
+        # observes the request, and joining first would wait for work that could
+        # have stopped immediately. Done outside the lock so a settling claim never
+        # blocks on a shutdown that is joining its own worker.
+        for claim in claims:
+            claim.request_cancel()
+        self._log_running_claims()
         if pool is not None:
             pool.shutdown(wait=wait, cancel_futures=not wait)
         logger.info("blocking_io_pool_stopped", waited=wait, name=self._name)
+
+    def _log_running_claims(self, claim: PhysicalWorkClaim | None = None) -> None:
+        """Log every claim whose physical body is still executing.
+
+        The registry snapshot, the finished check and the elapsed measurement are
+        taken under the registry lock so the report is consistent: a claim that had
+        already settled is not described as running, and a claim that settles
+        during the join was genuinely running at diagnosis time. Queued claims
+        (no body start yet) and finished ones are skipped - neither is a stuck
+        join. Only the bounded callable name and the elapsed physical runtime are
+        logged, never arguments or output.
+        A worker starting after its close signal also reports just its own claim;
+        it may overlap the close snapshot, but neither path repeats or polls.
+        """
+        with self._claims_lock:
+            claims = self._claims if claim is None else (claim,)
+            running = [(claim.name, claim.running_for()) for claim in claims if not claim.done.is_set() and claim.started_at is not None]
+        for name, running_for in running:
+            logger.warning(
+                "blocking_io_pool_claim_still_running",
+                pool=self._name,
+                callable=name,
+                running_s=round(running_for or 0.0, 3),
+            )
 
     async def ashutdown(self, wait: bool = False) -> None:
         """Await :meth:`shutdown` without parking the event loop.

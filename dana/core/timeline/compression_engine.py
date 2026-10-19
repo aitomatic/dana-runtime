@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import Callable
 from datetime import datetime
 import inspect
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from structlog import get_logger
 
@@ -601,8 +602,12 @@ Respond with ONLY a JSON object containing the summary:
         Raises:
             RuntimeError: If LLM call function is not set and no agent runtime available
         """
-        # Use provided function or fall back to agent runtime
-        llm_call_fn = self._llm_call_fn or self._get_default_llm_call_fn()
+        # Use provided function or fall back to agent runtime. Explicit intent is
+        # ``is None``, not truthiness: a configured callable is the caller's
+        # chosen summarizer even if it happens to define a false bool.
+        llm_call_fn = self._llm_call_fn
+        if llm_call_fn is None:
+            llm_call_fn = self._get_default_llm_call_fn()
         if llm_call_fn is None:
             raise RuntimeError(
                 "LLM call function not set and no agent runtime available. "
@@ -675,8 +680,11 @@ Respond with ONLY a JSON object containing the summary:
         Raises:
             RuntimeError: If async LLM call function is not set and no agent runtime available
         """
-        # Use provided function or fall back to agent runtime
-        llm_call_async_fn = self._llm_call_async_fn or self._get_default_llm_call_async_fn()
+        # Use provided function or fall back to agent runtime. Explicit intent is
+        # ``is None``, not truthiness (see ``compress``).
+        llm_call_async_fn = self._llm_call_async_fn
+        if llm_call_async_fn is None:
+            llm_call_async_fn = self._get_default_llm_call_async_fn()
         if llm_call_async_fn is None:
             raise RuntimeError(
                 "Async LLM call function not set and no agent runtime available. "
@@ -1193,17 +1201,20 @@ Respond with ONLY a JSON object containing the summary:
         awaiting caller that is cancelled or times out therefore cannot leave a
         worker thread installing a projection on a timeline it no longer owns.
 
-        Summarizer ownership:
+        Summarizer ownership, in order of preference:
 
-        * an async summarizer (``_llm_call_async_fn``, or the runtime's
-          ``call_llm_async``) is awaited directly, so the cancellation reaches the
-          provider, which can abort the request;
-        * a sync-only summarizer is unavoidable blocking physical work. It is
-          offloaded so the event loop stays responsive, and the await is *joined*
-          rather than abandoned: if this task is cancelled the join still runs to
-          completion before the cancellation is re-raised, and the worker only
-          ever returns the produced text. Cancellation therefore delays the
-          return, it never leaves the run's work unowned.
+        * an explicitly configured async summarizer (``_llm_call_async_fn``) is
+          awaited directly, so the cancellation reaches the provider, which can
+          abort the request;
+        * an explicitly configured sync summarizer (``_llm_call_fn``) is
+          unavoidable blocking physical work. It is offloaded so the event loop
+          stays responsive, and the await is *joined* rather than abandoned: if
+          this task is cancelled the join still runs to completion before the
+          cancellation is re-raised, and the worker only ever returns the
+          produced text. Cancellation therefore delays the return, it never
+          leaves the run's work unowned;
+        * only when neither callback was configured does the runtime default
+          apply, async first (``call_llm_async``) and then the sync runtime call.
 
         Raises:
             CompactCircuitOpenError: circuit open and cooldown unexpired, or a
@@ -1289,8 +1300,14 @@ Respond with ONLY a JSON object containing the summary:
 
         Used by the sync seam, whose caller blocks for the whole run. ``mode``
         labels the log event so the two seams stay distinguishable in telemetry.
+
+        As on the async seam, an explicitly configured callback is selected by
+        ``is None``, not truthiness: a falsy callable is still the caller's
+        chosen summarizer and must not be replaced by the runtime default.
         """
-        llm_call_fn = self._llm_call_fn or self._get_default_llm_call_fn()
+        llm_call_fn = self._llm_call_fn
+        if llm_call_fn is None:
+            llm_call_fn = self._get_default_llm_call_fn()
         if llm_call_fn is None:
             raise RuntimeError("no LLM call function available for reactive_compact")
         plan = self._plan_compression()
@@ -1310,32 +1327,63 @@ Respond with ONLY a JSON object containing the summary:
     async def _summarize_for_plan(self: CompressedTimeline, plan: tuple[list[TimelineEntry], str, int]) -> str:
         """Produce the summary text for a captured plan, with no lock held.
 
-        Two ownership shapes, in order of preference:
+        Explicit configuration decides ownership before any runtime default: a
+        summarizer the caller configured is the one that runs. In order of
+        preference:
 
-        * an async summarizer (``_llm_call_async_fn``, or the runtime's
-          ``call_llm_async``) is awaited in place, so owner cancellation reaches
-          the provider and nothing of this run is left executing afterwards;
-        * a sync-only summarizer is unavoidable blocking physical work. It is
-          offloaded to keep the loop responsive, and the await is *joined* rather
-          than abandoned: on cancellation the join still runs to completion before
-          the cancellation propagates, so no thread of this run outlives it. The
-          caller's deadline may overrun by that call's remaining duration - which
-          is honest: a thread cannot be killed, and reporting a bounded return
-          while its work ran on would not be.
+        * an explicitly configured async summarizer (``_llm_call_async_fn``) is
+          awaited in place, so owner cancellation reaches the provider and
+          nothing of this run is left executing afterwards;
+        * an explicitly configured sync summarizer (``_llm_call_fn``) is
+          unavoidable blocking physical work. It is offloaded to keep the loop
+          responsive, and the await is *joined* rather than abandoned: on
+          cancellation the join still runs to completion before the cancellation
+          propagates, so no thread of this run outlives it. The caller's deadline
+          may overrun by that call's remaining duration - which is honest: a
+          thread cannot be killed, and reporting a bounded return while its work
+          ran on would not be;
+        * only when neither callback was configured does the runtime default
+          apply, async first (``call_llm_async``) and then the sync runtime call.
+
+        A callback counts as configured when it is not ``None``; truthiness is
+        never the test, so an intentionally falsy callable is still honored. An
+        explicit sync callback therefore wins over the runtime's async default
+        rather than being silently replaced by it.
 
         The worker never touches timeline state: only the returned text crosses the
         thread boundary, and the commit happens afterwards on the awaiting thread.
         """
         _, prompt, _generation = plan
 
-        async_fn = self._llm_call_async_fn or self._get_default_llm_call_async_fn()
+        async_fn = self._llm_call_async_fn
         if async_fn is not None:
             return self._require_summary(self._reduce_compact_response(await async_fn(prompt)))
 
-        llm_call_fn = self._llm_call_fn or self._get_default_llm_call_fn()
-        if llm_call_fn is None:
-            raise RuntimeError("no LLM call function available for reactive_compact")
+        sync_fn = self._llm_call_fn
+        if sync_fn is not None:
+            return await self._summarize_with_blocking_callback(sync_fn, prompt)
 
+        async_fn = self._get_default_llm_call_async_fn()
+        if async_fn is not None:
+            return self._require_summary(self._reduce_compact_response(await async_fn(prompt)))
+
+        sync_fn = self._get_default_llm_call_fn()
+        if sync_fn is None:
+            raise RuntimeError("no LLM call function available for reactive_compact")
+        return await self._summarize_with_blocking_callback(sync_fn, prompt)
+
+    async def _summarize_with_blocking_callback(
+        self: CompressedTimeline,
+        llm_call_fn: Callable[[str], Any],
+        prompt: str,
+    ) -> str:
+        """Run an un-abortable synchronous summarizer and join it on cancellation.
+
+        Shared by an explicitly configured sync callback and the runtime's sync
+        default, so both keep the same physical-work ownership: the call is
+        offloaded, the await is shielded, and a cancellation waits the worker out
+        before propagating instead of orphaning a thread that only produces text.
+        """
         task = asyncio.ensure_future(asyncio.to_thread(llm_call_fn, prompt))
         try:
             response = await asyncio.shield(task)
